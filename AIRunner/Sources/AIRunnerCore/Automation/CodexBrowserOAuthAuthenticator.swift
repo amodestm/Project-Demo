@@ -18,9 +18,12 @@ public enum CodexBrowserOAuthError: Error, LocalizedError, Sendable, Equatable {
     case codexLoginControlNotFound
     case codexLoginControlAmbiguous
     case codexLoginControlPressFailed
+    case codexLoginControlDidNotDismiss
+    case profileNotLoggedIn(String)
     case codexLogoutConfirmationNotFound
     case codexLogoutConfirmationAmbiguous
     case codexLogoutConfirmationPressFailed
+    case codexLogoutConfirmationDidNotDismiss
     case codexLogoutDidNotComplete
     case codexLogoutCommandNotFound
     case codexLogoutCommandAmbiguous
@@ -50,27 +53,33 @@ public enum CodexBrowserOAuthError: Error, LocalizedError, Sendable, Equatable {
             return "Codex 登录界面出现多个“使用 ChatGPT 账号登录”候选，已停止以避免误点。"
         case .codexLoginControlPressFailed:
             return "已经找到 Codex 的“使用 ChatGPT 账号登录”，但没有成功按下。"
+        case .codexLoginControlDidNotDismiss:
+            return "已经点击 Codex 的“继续登录”，但登录入口在 30 秒内仍未消失；未继续路由，账号未切换。"
+        case .profileNotLoggedIn(let profileLabel):
+            return "Chrome Profile「\(profileLabel)」没有可用的 ChatGPT 登录会话。请先在这个 Profile 登录 chatgpt.com，或在设置中取消选择它。"
         case .codexLogoutConfirmationNotFound:
-            return "Codex 收到退出请求，但没有出现唯一的“退出登录？”确认框。账号未切换。"
+            return "AIRunner 已尝试点击账号菜单中的“退出登录”，但没有出现唯一的“退出登录？”确认框。账号未切换。"
         case .codexLogoutConfirmationAmbiguous:
             return "Codex 出现多个退出确认候选，AIRunner 已停止以避免误点。"
         case .codexLogoutConfirmationPressFailed:
             return "已经找到 Codex 的“退出登录”确认按钮，但没有成功按下。"
+        case .codexLogoutConfirmationDidNotDismiss:
+            return "已经找到“要退出登录？”确认框，但点击红色“退出登录”后确认框仍然可见。账号尚未退出，也没有开始切换。"
         case .codexLogoutDidNotComplete:
-            return "已确认退出 Codex，但没有在规定时间内看到登录界面。"
+            return "Codex 的退出确认框已经消失，但没有在规定时间内看到登录界面。账号切换没有开始。"
         case .codexLogoutCommandNotFound:
-            return "没有在 Codex 原生菜单中找到唯一的“注销/Log Out”命令。账号未切换。"
+            return "没有在 Codex 左下角个人资料菜单或兼容菜单中找到唯一的“退出登录/Log Out”。账号未切换。"
         case .codexLogoutCommandAmbiguous:
-            return "Codex 原生菜单出现多个退出命令候选，AIRunner 已停止以避免误点。"
+            return "Codex 出现多个退出入口候选，AIRunner 已停止以避免误点。"
         case .codexLogoutCommandPressFailed:
-            return "已经找到 Codex 原生“注销/Log Out”命令，但没有成功发起退出。"
+            return "已经找到 Codex 的“退出登录/Log Out”，但没有成功发起退出。"
         }
     }
 }
 
 /// 用 Codex 原生登录入口和官方浏览器 OAuth 完成账号切换。
 ///
-/// AIRunner 通过 Codex 原生菜单发起注销并处理确认框。退出完成后从 Codex 窗口
+/// AIRunner 通过 Codex 左下角个人资料菜单发起退出并处理确认框。退出完成后从 Codex 窗口
 /// 按下“使用 ChatGPT 账号登录”，让官方流程在目标 Chrome Profile 中继续。
 /// AIRunner 不读取、不复制 ChatGPT Cookie，也不注入 session token。
 public actor CodexBrowserOAuthAuthenticator: CodexBrowserOAuthAuthenticating {
@@ -116,15 +125,22 @@ public actor CodexBrowserOAuthAuthenticator: CodexBrowserOAuthAuthenticating {
         }
         await browserAutomation.reset()
 
-        // 退出完全走 Codex 桌面原生 UI：注销命令 → 确认框 → 登录页。独立
+        // 退出完全走 Codex 桌面 UI：个人资料菜单 → 退出登录 → 确认框 → 登录页。独立
         // app-server 的 auth 状态可能与桌面窗口不同步，因此不再用它发起退出。
         try await nativeLogout.logoutAndWaitForLoginScreen()
 
-        // 确认框完成且登录页已经出现后，按真实 UI 流程从“使用 ChatGPT
-        // 账号登录”开始；目标 Profile 由 nativeLogin 激活。
+        // 确认框完成且登录页已经出现后，按真实 UI 流程从“继续登录”开始；
+        // 目标 Profile 由 nativeLogin 激活。
         try await nativeLogin.startChatGPTLogin(using: profile)
 
-        let completion = try await waitForNativeLoginCompletion(timeout: timeout)
+        let completion: Bool
+        do {
+            completion = try await waitForNativeLoginCompletion(timeout: timeout)
+        } catch CodexOAuthBrowserAutomationError.profileNotLoggedIn {
+            // 把失败的目标 profile 带回设置页，避免只显示“当前 Profile”这种
+            // 无法定位的提示；也让用户知道应修正的是哪一个 profile。
+            throw CodexBrowserOAuthError.profileNotLoggedIn(profile.label)
+        }
         guard completion else {
             throw CodexBrowserOAuthError.loginNotConfirmed
         }

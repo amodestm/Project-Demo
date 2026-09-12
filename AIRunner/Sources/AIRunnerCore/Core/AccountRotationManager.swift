@@ -67,8 +67,11 @@ public actor AccountRotationManager {
     private let codexAccountVault: CodexAccountVaulting
     /// 使用独立 Chrome Profile 完成 Codex 官方浏览器 OAuth。
     private let codexBrowserOAuth: CodexBrowserOAuthAuthenticating
-    /// 设置页连续测试时使用的进程内指针；认证失败时不会推进。
+    /// 设置页连续测试时使用的进程内指针。
     private var settingsTestCurrentProfileDirectory: String?
+    /// 测试指针需要跨 AIRunner 重启保存，否则每次都会重新选中 Default。
+    private let loadSettingsTestProfileDirectory: @Sendable () -> String?
+    private let saveSettingsTestProfileDirectory: @Sendable (String) -> Void
 
     public init(
         profiles: ChromeProfileScanner = ChromeProfileScanner(),
@@ -80,7 +83,17 @@ public actor AccountRotationManager {
         codexLogin: CodexLoginAutomating = CodexLoginAutomator(),
         codexAccountVault: CodexAccountVaulting = InMemoryCodexAccountVault(),
         codexBrowserOAuth: CodexBrowserOAuthAuthenticating = FakeCodexBrowserOAuthAuthenticator(),
-        settleDelay: Duration = .seconds(2)
+        settleDelay: Duration = .seconds(2),
+        loadSettingsTestProfileDirectory: @escaping @Sendable () -> String? = {
+            UserDefaults.standard.string(
+                forKey: "AIRunnerOAuthSettingsTestLastProfileDirectory"
+            )
+        },
+        saveSettingsTestProfileDirectory: @escaping @Sendable (String) -> Void = { directory in
+            UserDefaults.standard.set(
+                directory, forKey: "AIRunnerOAuthSettingsTestLastProfileDirectory"
+            )
+        }
     ) {
         self.profiles = profiles
         self.windows = windows
@@ -92,6 +105,8 @@ public actor AccountRotationManager {
         self.codexAccountVault = codexAccountVault
         self.codexBrowserOAuth = codexBrowserOAuth
         self.settleDelay = settleDelay
+        self.loadSettingsTestProfileDirectory = loadSettingsTestProfileDirectory
+        self.saveSettingsTestProfileDirectory = saveSettingsTestProfileDirectory
     }
 
     // MARK: - 查询
@@ -251,6 +266,24 @@ public actor AccountRotationManager {
         return pool[(index + 1) % pool.count]
     }
 
+    /// 从指定起点开始按轮换顺序列出候选 Profile。
+    ///
+    /// 某个 Profile 可能只创建了浏览器环境，却没有登录 ChatGPT。OAuth 自动机
+    /// 能明确识别这种情况，因此这里允许安全地跳过该 Profile，继续尝试池中的
+    /// 下一个已配置环境；只有最终成功才推进任务/测试指针。
+    public static func oauthCandidates(
+        startingWith first: ChromeProfile?,
+        in pool: [ChromeProfile]
+    ) -> [ChromeProfile] {
+        guard !pool.isEmpty else { return [] }
+        let startIndex = first.flatMap { candidate in
+            pool.firstIndex { $0.directoryName == candidate.directoryName }
+        } ?? 0
+        return (0..<pool.count).map { offset in
+            pool[(startIndex + offset) % pool.count]
+        }
+    }
+
     /// 列出所有浏览器里的 profile (设置页展示用)。
     public func availableProfiles() -> [(browser: ChromeProfileScanner.ChromeKind, profiles: [ChromeProfile])] {
         profiles.availableProfilesAcrossBrowsers()
@@ -285,8 +318,23 @@ public actor AccountRotationManager {
                     "浏览器 OAuth 轮换需要至少一个已登录 ChatGPT 的 Chrome Profile。"
                 )
             }
-            try await codexBrowserOAuth.reauthenticate(using: selected)
-            return selected.displayName.isEmpty ? selected.directoryName : selected.displayName
+            var lastProfileError: CodexBrowserOAuthError?
+            for candidate in Self.oauthCandidates(startingWith: selected, in: pool) {
+                do {
+                    try await codexBrowserOAuth.reauthenticate(using: candidate)
+                    return candidate.displayName.isEmpty
+                        ? candidate.directoryName : candidate.displayName
+                } catch let error as CodexBrowserOAuthError {
+                    guard case .profileNotLoggedIn = error else { throw error }
+                    lastProfileError = error
+                    logger.warning(
+                        .accountRotationFailed,
+                        "Chrome Profile「\(candidate.label)」没有 ChatGPT 会话，继续尝试下一个 Profile"
+                    )
+                }
+            }
+            if let lastProfileError { throw lastProfileError }
+            throw AppError.invalidRequest("浏览器 OAuth 轮换池为空")
         }
 
         let ids = settingsBox().codexAccountRotationIDs
@@ -423,7 +471,9 @@ public actor AccountRotationManager {
 
         let recentAccount = (try? repository.mostRecentChatGPTAccount()) ?? nil
         let recentDirectory = recentAccount.flatMap(Self.profileDirectory(fromAccountPointer:))
-        let current = settingsTestCurrentProfileDirectory ?? recentDirectory
+        let current = settingsTestCurrentProfileDirectory
+            ?? loadSettingsTestProfileDirectory()
+            ?? recentDirectory
         guard let next = Self.nextProfile(after: current, in: pool) else {
             throw AppError.invalidRequest("Chrome Profile 轮换池为空")
         }
@@ -437,22 +487,49 @@ public actor AccountRotationManager {
             ])
         )
 
-        try await codexBrowserOAuth.reauthenticate(using: next)
+        var lastProfileError: CodexBrowserOAuthError?
+        let candidates = Self.oauthCandidates(startingWith: next, in: pool)
+            .filter { candidate in
+                guard let current else { return true }
+                return candidate.directoryName != current
+            }
+        for candidate in candidates {
+            // 保存“本次已经尝试过”的 Profile。即使测试中途失败或 AIRunner 更新
+            // 重启，下一次也会继续轮换，不会永远回到 Default。
+            settingsTestCurrentProfileDirectory = candidate.directoryName
+            saveSettingsTestProfileDirectory(candidate.directoryName)
+            do {
+                try await codexBrowserOAuth.reauthenticate(using: candidate)
 
-        // 只有 Codex 已确认重新登录成功后才推进测试指针。
-        settingsTestCurrentProfileDirectory = next.directoryName
-        logger.info(
-            .accountRotationCompleted,
-            "设置页安全测试成功：Codex 已通过 Chrome Profile「\(next.label)」重新登录；未发送任务消息",
-            metadata: .object([
-                "kind": .string("codex_oauth_settings_test"),
-                "profile": .string(next.directoryName),
-            ])
-        )
-        return ChatGPTAccountSwitchOutcome(
-            accountLabel: next.displayName.isEmpty ? next.directoryName : next.displayName,
-            pageReloaded: true
-        )
+                logger.info(
+                    .accountRotationCompleted,
+                    "设置页安全测试成功：Codex 已通过 Chrome Profile「\(candidate.label)」重新登录；未发送任务消息",
+                    metadata: .object([
+                        "kind": .string("codex_oauth_settings_test"),
+                        "profile": .string(candidate.directoryName),
+                    ])
+                )
+                return ChatGPTAccountSwitchOutcome(
+                    accountLabel: candidate.displayName.isEmpty
+                        ? candidate.directoryName : candidate.displayName,
+                    pageReloaded: true
+                )
+            } catch let error as CodexBrowserOAuthError {
+                guard case .profileNotLoggedIn = error else { throw error }
+                lastProfileError = error
+                logger.warning(
+                    .accountRotationFailed,
+                    "设置页安全测试跳过没有 ChatGPT 会话的 Profile「\(candidate.label)" 
+                    + "」，继续尝试下一个 Profile",
+                    metadata: .object([
+                        "kind": .string("codex_oauth_settings_test"),
+                        "profile": .string(candidate.directoryName),
+                    ])
+                )
+            }
+        }
+        if let lastProfileError { throw lastProfileError }
+        throw AppError.invalidRequest("Chrome Profile 轮换池为空")
     }
 
     private static func profileDirectory(fromAccountPointer pointer: String) -> String? {
@@ -487,31 +564,54 @@ public actor AccountRotationManager {
             metadata: .object(["kind": .string("codex_browser_oauth")])
         )
 
-        let urlText = settingsBox().chatGPTURL
-        let chatGPTURL = URL(string: urlText) ?? URL(string: "https://chatgpt.com/")!
-        guard profiles.open(url: chatGPTURL, profile: next, newWindow: true) else {
-            throw AppError.invalidRequest("无法打开 Chrome Profile「\(next.label)」")
+        // 不在退出前额外打开普通 ChatGPT 标签页。那会制造一个无法确认归属的
+        // Chrome 窗口，并可能让系统把 OAuth 链接送到错误的 Profile。真正的目标
+        // 窗口由 CodexNativeLoginStarter 在“继续登录”之前创建、标记并聚焦。
+        var lastProfileError: CodexBrowserOAuthError?
+        let candidates = Self.oauthCandidates(startingWith: next, in: pool)
+            .filter { candidate in
+                guard let current else { return true }
+                return candidate.directoryName != current
+            }
+        for candidate in candidates {
+            do {
+                try await codexBrowserOAuth.reauthenticate(using: candidate)
+
+                try repository.update(taskID: taskID, currentProfile: candidate.directoryName)
+                try repository.recordChatGPTAccount(
+                    taskID: taskID, account: "profile:\(candidate.directoryName)"
+                )
+
+                logger.info(
+                    .accountRotationCompleted,
+                    "Codex 已通过 Chrome Profile「\(candidate.label)」完成浏览器授权",
+                    taskID: taskID,
+                    metadata: .object([
+                        "kind": .string("codex_browser_oauth"),
+                        "profile": .string(candidate.directoryName),
+                    ])
+                )
+                return ChatGPTAccountSwitchOutcome(
+                    accountLabel: candidate.displayName.isEmpty
+                        ? candidate.directoryName : candidate.displayName,
+                    pageReloaded: true
+                )
+            } catch let error as CodexBrowserOAuthError {
+                guard case .profileNotLoggedIn = error else { throw error }
+                lastProfileError = error
+                logger.warning(
+                    .accountRotationFailed,
+                    "跳过没有 ChatGPT 会话的 Profile「\(candidate.label)」，继续尝试下一个 Profile",
+                    taskID: taskID,
+                    metadata: .object([
+                        "kind": .string("codex_browser_oauth"),
+                        "profile": .string(candidate.directoryName),
+                    ])
+                )
+            }
         }
-        try? await Task.sleep(for: settleDelay)
-
-        try await codexBrowserOAuth.reauthenticate(using: next)
-
-        try repository.update(taskID: taskID, currentProfile: next.directoryName)
-        try repository.recordChatGPTAccount(taskID: taskID, account: "profile:\(next.directoryName)")
-
-        logger.info(
-            .accountRotationCompleted,
-            "Codex 已通过 Chrome Profile「\(next.label)」完成浏览器授权",
-            taskID: taskID,
-            metadata: .object([
-                "kind": .string("codex_browser_oauth"),
-                "profile": .string(next.directoryName),
-            ])
-        )
-        return ChatGPTAccountSwitchOutcome(
-            accountLabel: next.displayName.isEmpty ? next.directoryName : next.displayName,
-            pageReloaded: true
-        )
+        if let lastProfileError { throw lastProfileError }
+        throw AppError.invalidRequest("Chrome Profile 轮换池为空")
     }
 
     /// 旧头像菜单模式的账号切换 (兜底): 从配置列表或网页菜单枚举账号, 选下一个, 调 switcher。
