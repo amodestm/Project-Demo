@@ -1,0 +1,13 @@
+# SwiftPM build artifacts
+.build/
+
+# Packaged .app produced by Scripts/make_app.sh
+dist/
+
+# macOS
+.DS_Store
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+*.xcuserstate

@@ -1,0 +1,8 @@
+#!/bin/bash
+# 清算瀑布收割策略 + 对冲交易平台 — 一键启动
+export BINANCE_API_KEY="YOUR_BINANCE_API_KEY"
+export BINANCE_API_SECRET="YOUR_BINANCE_API_SECRET"
+export PYTHONUNBUFFERED=1
+
+cd "$(dirname "$0")/.."
+exec /Users/<YOUR_USER>/miniforge3/bin/python3 -u -m binance_liq_harvest.main

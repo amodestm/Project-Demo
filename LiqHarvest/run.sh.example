@@ -1,0 +1,19 @@
+#!/bin/bash
+# 策略引擎 — 一键启动模板
+#
+# 用法:
+#   1. cp run.sh.example run.sh
+#   2. 编辑 run.sh 填入自己的 API Key（run.sh 已在 .gitignore 中，不会被提交）
+#   3. bash run.sh
+#
+# 也可以用环境变量方式，不改脚本:
+#   export BINANCE_API_KEY="..."
+#   export BINANCE_API_SECRET="..."
+#   PYTHONUNBUFFERED=1 python3 -u -m binance_liq_harvest.main
+
+export BINANCE_API_KEY="YOUR_BINANCE_API_KEY"
+export BINANCE_API_SECRET="YOUR_BINANCE_API_SECRET"
+export PYTHONUNBUFFERED=1
+
+cd "$(dirname "$0")/.."
+exec /Users/<YOUR_USER>/miniforge3/bin/python3 -u -m binance_liq_harvest.main

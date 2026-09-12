@@ -1,0 +1,33 @@
+{
+  "scalp": {
+    "ENTRY_THRESHOLD_PCT": 0.13,
+    "LEVERAGE": 20,
+    "MAX_6M_CHANGE_PCT": 3,
+    "MAX_DAILY_LOSS_USDT": 20,
+    "MAX_HOLD_SECONDS": 180,
+    "MAX_POSITIONS": 2,
+    "MEAN_REVERSION_PCT": 0.35,
+    "MIN_24H_VOLUME_USDT": 20000000,
+    "POSITION_PCT": 0.45,
+    "SL_MA7_DEVIATION_PCT": 0.5,
+    "TP_MARGIN_PCT": 2.35,
+    "TREND_WINDOW_TICKS": 2400,
+    "USE_KLINE_FILTER": true,
+    "USE_MA7_FILTER": true,
+    "USE_MEAN_REVERSION": true,
+    "USE_TREND_FILTER": true,
+    "enabled": false
+  },
+  "bottom": {
+    "LEVERAGE": 20,
+    "LOOKBACK_MINUTES": 90,
+    "MAX_DAILY_LOSS_USDT": 20,
+    "MIN_24H_VOLUME_USDT": 20000000,
+    "POSITION_PCT": 0.45,
+    "SCAN_INTERVAL": 30,
+    "SL_MARGIN_PCT": 15,
+    "TP_MARGIN_PCT": 50,
+    "TRIGGER_DISCOUNT": 0.95,
+    "enabled": false
+  }
+}
