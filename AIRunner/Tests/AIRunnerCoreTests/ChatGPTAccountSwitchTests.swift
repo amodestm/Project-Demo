@@ -1,11 +1,225 @@
 import XCTest
 @testable import AIRunnerCore
 
+private actor OAuthFlowRecorder {
+    private var callsStorage: [String] = []
+    func append(_ value: String) { callsStorage.append(value) }
+    var calls: [String] { callsStorage }
+}
+
+private struct RecordingNativeLogout: CodexNativeLogoutConfirming {
+    let recorder: OAuthFlowRecorder
+    func logoutAndWaitForLoginScreen() async throws {
+        await recorder.append("logout-confirmed")
+    }
+}
+
+private struct RecordingNativeLogin: CodexNativeLoginStarting {
+    let recorder: OAuthFlowRecorder
+    func startChatGPTLogin(using profile: ChromeProfile) async throws {
+        await recorder.append("login:\(profile.directoryName)")
+    }
+}
+
+private actor ImmediateOAuthBrowserAutomation: CodexOAuthBrowserAutomating {
+    func reset() async {}
+    func advance() async throws -> Bool { false }
+}
+
 /// ChatGPT 网页内账号自动切换的核心逻辑测试。
 ///
 /// AX 真实点击不在单测范围 (需真机 + 辅助功能权限 + Chrome 开着 ChatGPT);
 /// 这里锁死**轮换数学**、**指针落盘**、**迁移**、**switcher 编排**。
 final class ChatGPTAccountSwitchTests: XCTestCase {
+
+    func testOAuthAuthenticatorCompletesNativeLogoutBeforeStartingLogin() async throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("airunner-oauth-flow-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory, withIntermediateDirectories: true
+        )
+        let executable = temporaryDirectory.appendingPathComponent("codex-status")
+        try "#!/bin/sh\necho 'Logged in using ChatGPT'\nexit 0\n"
+            .write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700], ofItemAtPath: executable.path
+        )
+
+        let recorder = OAuthFlowRecorder()
+        let authenticator = CodexBrowserOAuthAuthenticator(
+            executableURL: executable,
+            timeout: 2,
+            relaunchCodexApplication: false,
+            browserAutomation: ImmediateOAuthBrowserAutomation(),
+            nativeLogout: RecordingNativeLogout(recorder: recorder),
+            nativeLogin: RecordingNativeLogin(recorder: recorder)
+        )
+        let profile = ChromeProfile(
+            directoryName: "Profile 2", displayName: "测试账号"
+        )
+
+        try await authenticator.reauthenticate(using: profile)
+
+        let calls = await recorder.calls
+        XCTAssertEqual(calls, ["logout-confirmed", "login:Profile 2"])
+    }
+
+    func testNativeCodexLoginMatcherAcceptsObservedAccountLabels() {
+        XCTAssertTrue(CodexNativeLoginStarter.isChatGPTLoginControl(
+            role: "AXButton", text: "使用 ChatGPT 账号进行登录"
+        ))
+        XCTAssertTrue(CodexNativeLoginStarter.isChatGPTLoginControl(
+            role: "AXStaticText", text: "使用 GPT 账号进行登录"
+        ))
+        XCTAssertTrue(CodexNativeLoginStarter.isChatGPTLoginControl(
+            role: "AXLink", text: "Continue with ChatGPT"
+        ))
+        XCTAssertFalse(CodexNativeLoginStarter.isChatGPTLoginControl(
+            role: "AXButton", text: "使用 API Key 登录"
+        ))
+        XCTAssertFalse(CodexNativeLoginStarter.isChatGPTLoginControl(
+            role: "AXMenuItem", text: "使用 ChatGPT 账号进行登录"
+        ))
+    }
+
+    func testNativeCodexLoginMatcherRejectsConversationTextContainingLoginPhrase() {
+        XCTAssertFalse(CodexNativeLoginStarter.isChatGPTLoginControl(
+            role: "AXStaticText", text: "退出后点击使用 GPT 账号进行登录就行了"
+        ))
+    }
+
+    func testFakeNativeCodexLoginStarterRecordsTargetProfile() async throws {
+        let starter = FakeCodexNativeLoginStarter()
+        let profile = ChromeProfile(
+            directoryName: "Profile 2", displayName: "测试账号"
+        )
+
+        try await starter.startChatGPTLogin(using: profile)
+
+        let usedProfiles = await starter.usedProfiles
+        XCTAssertEqual(usedProfiles, [profile])
+    }
+
+    func testPasswordLoginMethodHintsCoverOpenAIOTPFallback() {
+        XCTAssertTrue(CodexLoginAutomator.matchesPasswordMethodText("使用密码登录"))
+        XCTAssertTrue(CodexLoginAutomator.matchesPasswordMethodText("Continue with password"))
+        XCTAssertFalse(CodexLoginAutomator.matchesPasswordMethodText("发送验证码"))
+    }
+
+    func testCodexOAuthParserAcceptsOnlyOfficialAuthorizationURL() {
+        let official = "https://auth.openai.com/oauth/authorize?client_id=test&state=short-lived"
+        XCTAssertEqual(
+            CodexBrowserOAuthAuthenticator.authorizationURL(
+                in: "If the browser did not open, use \(official)"
+            )?.host,
+            "auth.openai.com"
+        )
+        XCTAssertNil(
+            CodexBrowserOAuthAuthenticator.authorizationURL(
+                in: "https://example.com/oauth/authorize?state=wrong"
+            )
+        )
+        XCTAssertEqual(
+            CodexBrowserOAuthAuthenticator.authorizationURL(
+                in: "https://chatgpt.com/codex/desktop-auth?state=short-lived"
+            )?.host,
+            "chatgpt.com"
+        )
+        XCTAssertNil(
+            CodexBrowserOAuthAuthenticator.authorizationURL(
+                in: "https://evil.chatgpt.com/codex/desktop-auth?state=wrong"
+            )
+        )
+        XCTAssertNil(
+            CodexBrowserOAuthAuthenticator.authorizationURL(
+                in: "http://auth.openai.com/oauth/authorize?state=insecure"
+            )
+        )
+    }
+
+    func testOAuthBrowserAutomatorChoosesTheOnlyCachedAccount() throws {
+        let url = try XCTUnwrap(URL(string: "https://auth.openai.com/choose-an-account"))
+        let controls = [
+            CodexOAuthBrowserAutomator.Control(text: "选择账户 Example User"),
+            CodexOAuthBrowserAutomator.Control(text: "移除账户 Example User"),
+        ]
+
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.intendedAction(
+                url: url, controls: controls, pageText: "欢迎回来"
+            ),
+            .chooseAccount(0)
+        )
+    }
+
+    func testOAuthBrowserAutomatorRefusesAmbiguousAccounts() throws {
+        let url = try XCTUnwrap(URL(string: "https://auth.openai.com/choose-an-account"))
+        let controls = [
+            CodexOAuthBrowserAutomator.Control(text: "Select account A"),
+            CodexOAuthBrowserAutomator.Control(text: "Select account B"),
+        ]
+
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.intendedAction(
+                url: url, controls: controls, pageText: "Welcome back"
+            ),
+            .ambiguousAccounts
+        )
+    }
+
+    func testOAuthBrowserAutomatorWaitsWhileAccountChooserIsRendering() throws {
+        let url = try XCTUnwrap(URL(string: "https://auth.openai.com/choose-an-account"))
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.intendedAction(
+                url: url, controls: [], pageText: "欢迎回来"
+            ),
+            .wait
+        )
+    }
+
+    func testOAuthBrowserAutomatorContinuesCodexConsent() throws {
+        let url = try XCTUnwrap(
+            URL(string: "https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
+        )
+        let controls = [
+            CodexOAuthBrowserAutomator.Control(text: "取消"),
+            CodexOAuthBrowserAutomator.Control(text: "继续"),
+        ]
+
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.intendedAction(
+                url: url, controls: controls, pageText: "使用 ChatGPT 登录到 Codex"
+            ),
+            .continueConsent(1)
+        )
+    }
+
+    func testOAuthBrowserAutomatorStopsForLoginOrSecurityChallenge() throws {
+        let loginURL = try XCTUnwrap(
+            URL(string: "https://auth.openai.com/log-in-or-create-account")
+        )
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.intendedAction(
+                url: loginURL,
+                controls: [.init(role: "AXTextField", text: "Email address")],
+                pageText: "Log in"
+            ),
+            .profileNotLoggedIn
+        )
+
+        let consentURL = try XCTUnwrap(
+            URL(string: "https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
+        )
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.intendedAction(
+                url: consentURL,
+                controls: [.init(text: "Continue")],
+                pageText: "Verify you are human"
+            ),
+            .securityChallenge
+        )
+    }
 
     // MARK: - 纯函数: nextAccount
 
@@ -46,6 +260,7 @@ final class ChatGPTAccountSwitchTests: XCTestCase {
 
         try repo.recordChatGPTAccount(taskID: task.id, account: "b@x.com")
         XCTAssertEqual(try repo.currentChatGPTAccount(taskID: task.id), "b@x.com")
+        XCTAssertEqual(try repo.mostRecentChatGPTAccount(), "b@x.com")
     }
 
     func testRepositoryChatGPTPointerSurvivesReopen() throws {
@@ -96,11 +311,13 @@ final class ChatGPTAccountSwitchTests: XCTestCase {
         var settings = AppSettings.default
         settings.codexAccountRotationIDs = ["account-id-a", "account-id-b"]
         settings.autoLoginNextChatGPTAccountOnHandoff = false
+        settings.useCodexBrowserOAuthRotation = true
 
         let text = try JSONCoding.encodeToString(settings)
         let decoded = try JSONCoding.decode(AppSettings.self, from: text)
         XCTAssertEqual(decoded.codexAccountRotationIDs, ["account-id-a", "account-id-b"])
         XCTAssertFalse(decoded.autoLoginNextChatGPTAccountOnHandoff)
+        XCTAssertTrue(decoded.useCodexBrowserOAuthRotation)
     }
 
     func testLegacySettingsDecodeWithoutAccountList() throws {
@@ -111,6 +328,7 @@ final class ChatGPTAccountSwitchTests: XCTestCase {
         XCTAssertEqual(decoded.chatGPTAccountList, [])
         XCTAssertEqual(decoded.codexAccountRotationIDs, [])
         XCTAssertTrue(decoded.autoLoginNextChatGPTAccountOnHandoff)
+        XCTAssertFalse(decoded.useCodexBrowserOAuthRotation)
     }
 
     func testCredentialVaultRoundTripUpdateAndDelete() throws {
@@ -232,6 +450,129 @@ final class ChatGPTAccountSwitchTests: XCTestCase {
         } catch {
             XCTAssertEqual(try services.accountRotationRepo.currentChatGPTAccount(taskID: task.id), a.id)
         }
+    }
+
+    @MainActor
+    func testTaskHandoffAutomaticallyLogsInAndResumesFromCheckpoint() async throws {
+        let vault = InMemoryCodexAccountVault()
+        let a = try vault.save(label: "账号 A", email: "a@x.com", password: "secret-a")
+        let b = try vault.save(label: "账号 B", email: "b@x.com", password: "secret-b")
+        var settings = TestSupport.mockSettings()
+        settings.codexAccountRotationIDs = [a.id, b.id]
+        settings.autoLoginNextChatGPTAccountOnHandoff = true
+        let login = FakeCodexLoginAutomator()
+        let services = try AppServices(
+            database: try Database.inMemory(),
+            keychain: InMemoryKeychain(),
+            settingsStore: SettingsStore(defaults: AppServices.ephemeralDefaults()),
+            settingsOverride: settings,
+            codexAccountVault: vault,
+            codexLogin: login,
+            echoLogsToConsole: false
+        )
+        let task = try TestSupport.makeTask(
+            services, name: "自动账号交接", steps: 2, executionMode: .chatGPTWeb
+        )
+        await services.runner.start(taskID: task.id)
+        let waiting = try await TestSupport.waitUntilSettled(services, taskID: task.id)
+        XCTAssertEqual(waiting.status, .waitingForUser)
+        let checkpointBefore = try services.checkpoints.latest(taskID: task.id)
+
+        let manager = TaskManager(services: services)
+        manager.pauseForAccountSwitch(waiting)
+
+        var completed = false
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let current = try services.tasks.fetch(id: task.id)
+            let pointer = try services.accountRotationRepo.currentChatGPTAccount(taskID: task.id)
+            completed = login.logins.count == 1
+                && current?.status == .waitingForUser
+                && pointer == a.id
+            if completed { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(completed)
+        XCTAssertEqual(login.logins.first?.email, "a@x.com")
+        XCTAssertEqual(try services.checkpoints.latest(taskID: task.id), checkpointBefore)
+    }
+
+    @MainActor
+    func testCreatingWebTaskOnlyQueuesUntilUserStartsIt() async throws {
+        let vault = InMemoryCodexAccountVault()
+        let account = try vault.save(
+            label: "待命账号", email: "queued@x.com", password: "queued-secret"
+        )
+        var settings = TestSupport.mockSettings()
+        settings.defaultExecutionMode = .chatGPTWeb
+        settings.codexAccountRotationIDs = [account.id]
+        let login = FakeCodexLoginAutomator()
+        let services = try AppServices(
+            database: try Database.inMemory(),
+            keychain: InMemoryKeychain(),
+            settingsStore: SettingsStore(defaults: AppServices.ephemeralDefaults()),
+            settingsOverride: settings,
+            codexAccountVault: vault,
+            codexLogin: login,
+            echoLogsToConsole: false
+        )
+        let manager = TaskManager(services: services)
+
+        let task = try manager.createTask(
+            name: "只创建不启动", goal: "等待用户点击开始", numberOfSteps: 1
+        )
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(try services.tasks.fetch(id: task.id)?.status, .queued)
+        XCTAssertEqual(login.logoutCalls, 0)
+        XCTAssertTrue(login.logins.isEmpty)
+        XCTAssertNil(try services.accountRotationRepo.currentChatGPTAccount(taskID: task.id))
+        XCTAssertNil(try services.steps.awaitingResultStep(taskID: task.id))
+    }
+
+    @MainActor
+    func testNewWebTaskLogsInBeforeOpeningPromptWorkflow() async throws {
+        let vault = InMemoryCodexAccountVault()
+        let first = try vault.save(
+            label: "首次账号", email: "first@x.com", password: "first-secret"
+        )
+        let backup = try vault.save(
+            label: "备用账号", email: "backup@x.com", password: "backup-secret"
+        )
+        var settings = TestSupport.mockSettings()
+        settings.defaultExecutionMode = .chatGPTWeb
+        settings.codexAccountRotationIDs = [first.id, backup.id]
+        let login = FakeCodexLoginAutomator()
+        let services = try AppServices(
+            database: try Database.inMemory(),
+            keychain: InMemoryKeychain(),
+            settingsStore: SettingsStore(defaults: AppServices.ephemeralDefaults()),
+            settingsOverride: settings,
+            codexAccountVault: vault,
+            codexLogin: login,
+            echoLogsToConsole: false
+        )
+        let manager = TaskManager(services: services)
+        let task = try manager.createTask(name: "首次自动登录", goal: "验证首次登录", numberOfSteps: 1)
+
+        manager.start(task)
+
+        var ready = false
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let current = try services.tasks.fetch(id: task.id)
+            ready = login.logins.count == 1 && current?.status == .waitingForUser
+            if ready { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(ready)
+        XCTAssertEqual(login.logoutCalls, 1)
+        XCTAssertEqual(login.logins.first?.email, "first@x.com")
+        XCTAssertEqual(login.logins.first?.password, "first-secret")
+        XCTAssertEqual(
+            try services.accountRotationRepo.currentChatGPTAccount(taskID: task.id), first.id
+        )
+        XCTAssertNotNil(try services.steps.awaitingResultStep(taskID: task.id))
     }
 
     // MARK: - 错误文案

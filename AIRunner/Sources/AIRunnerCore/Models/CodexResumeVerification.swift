@@ -102,6 +102,39 @@ public enum CodexBusyState: String, Sendable, Equatable, CaseIterable {
     public var isSafeToSend: Bool { self == .idle }
 }
 
+/// Codex 当前会话里需要账号交接的明确异常信号。
+///
+/// 只有额度耗尽或登录会话失效才允许上层进入账号轮换；普通的“任务已停止”
+/// 只记录并等待下一次明确的额度/认证信号，避免把用户主动停止误当成切号条件。
+public enum CodexAccountIssue: String, Sendable, Equatable, CaseIterable {
+    case quotaExhausted
+    case authenticationRequired
+    case taskStopped
+
+    public var displayName: String {
+        switch self {
+        case .quotaExhausted: return "额度或用量上限"
+        case .authenticationRequired: return "登录会话失效"
+        case .taskStopped: return "任务已停止"
+        }
+    }
+
+    public var eventName: String {
+        switch self {
+        case .quotaExhausted: return "CODEX_QUOTA_EXHAUSTED"
+        case .authenticationRequired: return "CODEX_AUTHENTICATION_REQUIRED"
+        case .taskStopped: return "CODEX_TASK_STOPPED"
+        }
+    }
+
+    public var requiresAccountRotation: Bool {
+        switch self {
+        case .quotaExhausted, .authenticationRequired: return true
+        case .taskStopped: return false
+        }
+    }
+}
+
 /// 发送之后观察到的确认信号。
 public enum SendConfirmation: String, Sendable, Equatable {
     case composerCleared

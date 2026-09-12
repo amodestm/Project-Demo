@@ -20,6 +20,17 @@ struct TaskDetailView: View {
     private var steps: [TaskStep] { manager.steps(for: task) }
     private var latestCheckpoint: Checkpoint? { manager.latestCheckpoint(for: task) }
     private var counts: [StepStatus: Int] { manager.stepStatusCounts(for: task) }
+    private var usesBrowserOAuth: Bool { services.settings.useCodexBrowserOAuthRotation }
+    private var accountRotationCaption: String {
+        usesBrowserOAuth
+            ? "Codex 退出 → 指定 Chrome Profile 授权 → 回到 Codex"
+            : "从 macOS 钥匙串自动登录下一个账号 · 不读取 Cookie"
+    }
+    private var accountRotationHelp: String {
+        usesBrowserOAuth
+            ? "退出当前 Codex 账号，使用下一个 Chrome Profile 中已登录的 ChatGPT 会话完成官方授权；成功后回到 Codex 并从检查点恢复。"
+            : "退出当前 ChatGPT 账号，从 macOS 钥匙串读取下一个账号并输入邮箱和密码登录；成功后从检查点恢复。"
+    }
 
     private var displayedSteps: [TaskStep] {
         showingAllSteps ? steps : Array(steps.suffix(40))
@@ -158,7 +169,7 @@ struct TaskDetailView: View {
                         .background(.teal.opacity(0.18), in: Capsule())
                         .foregroundStyle(.teal)
                     Spacer()
-                    Text("从 macOS 钥匙串自动登录下一个账号 · 不读取 Cookie")
+                    Text(accountRotationCaption)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -242,7 +253,7 @@ struct TaskDetailView: View {
                     .buttonStyle(.borderedProminent)
                     .tint(.purple)
                     .disabled(task.status.isTerminal || manager.isRotatingAccount)
-                    .help("退出当前 ChatGPT 账号，从 macOS 钥匙串读取下一个账号并输入邮箱和密码登录；成功后从检查点恢复。验证码、两步验证或安全挑战需要你处理。")
+                    .help(accountRotationHelp + "验证码、两步验证或安全挑战需要你处理。")
 
                     if let account = manager.currentChatGPTAccountName(for: task) {
                         Text("当前账号: \(account)")
@@ -303,7 +314,9 @@ struct TaskDetailView: View {
                         .background(.indigo.opacity(0.18), in: Capsule())
                         .foregroundStyle(.indigo)
                     Spacer()
-                    Text("只发「继续」· 不碰 Cookie / token / 登录")
+                    Text(usesBrowserOAuth
+                         ? "绑定线程只发「继续」· 账号由 Codex 官方浏览器授权处理"
+                         : "绑定线程只发「继续」· 账号登录由钥匙串模块处理")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -493,8 +506,17 @@ struct TaskDetailView: View {
                     }
                     .controlSize(.small)
                 }
+
+                Button {
+                    manager.simulateCodexQuotaHandoff(task)
+                } label: {
+                    Label("安全模拟额度耗尽", systemImage: "testtube.2")
+                }
+                .controlSize(.small)
+                .disabled(task.status.isTerminal || manager.isRotatingAccount)
+                .help("先确认绑定线程没有生成内容，再走真实的 Codex 退出、Profile 轮换、OAuth 登录和自动恢复流程")
             }
-            Text("开启后: 你在浏览器里完成账号切换/重新认证, AIRunner 检测到 Codex 恢复可用会自动发送一次「\(binding.resumeMessage)」。")
+            Text("开启后，AIRunner 会持续检测额度耗尽或登录失效。只有任务已停止生成、页面处于空闲且异常连续确认后，才会自动退出当前 Codex 账号并切换下一个；切换完成后会自动发送一次「\(binding.resumeMessage)」。")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -588,16 +610,18 @@ struct TaskDetailView: View {
                 Text("Waiting for account switch").font(.callout.bold())
                 Spacer()
             }
-            Text("""
+            Text(usesBrowserOAuth ? """
             任务已安全保存检查点 (共完成 \(completedCount) 步)。
 
-            ★ 自动方式: 若设置已开启，进入此状态时程序会退出当前账号，从 macOS
-            钥匙串读取下一个账号并输入邮箱和密码登录，然后自动恢复执行。
+            ★ 自动方式: 程序调用 Codex 官方登出，轮换到下一个 Chrome Profile，自动选择该 Profile 的唯一账号并确认授权，验证 Codex 重新登录后恢复执行。
             也可以点上方「自动登录下一个账号」立即重试。
 
-            手动方式 (备用):
-            1. 在浏览器里完成验证码、两步验证或其他安全挑战。
-            2. 回到这里点「我已完成账号切换」。
+            若出现多个候选账号、验证码、两步验证或安全检查，程序会停止，不会推进轮换指针。
+            """ : """
+            任务已安全保存检查点 (共完成 \(completedCount) 步)。
+
+            ★ 自动方式: 程序退出当前账号，从 macOS 钥匙串读取下一个账号并输入邮箱和密码登录，然后自动恢复执行。
+            也可以点上方「自动登录下一个账号」立即重试。
             """)
             .font(.callout)
             .foregroundStyle(.secondary)
@@ -651,7 +675,7 @@ struct TaskDetailView: View {
                        symbol: task.executionMode == .chatGPTWeb ? "safari" : "server.rack")
 
             if task.executionMode == .chatGPTWeb {
-                MetricCard(title: "账号", value: "钥匙串自动轮换", symbol: "person.crop.circle")
+                MetricCard(title: "账号", value: usesBrowserOAuth ? "Chrome Profile OAuth 轮换" : "钥匙串自动轮换", symbol: "person.crop.circle")
                 MetricCard(title: "结果来源", value: "剪贴板回填", symbol: "doc.on.clipboard")
             } else {
                 MetricCard(title: "主力 Provider", value: task.primaryProvider,

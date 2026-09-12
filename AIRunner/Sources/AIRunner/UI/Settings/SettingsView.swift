@@ -60,7 +60,7 @@ struct ChatGptWebSettingsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("执行通道").font(.headline)
                     Text("新建任务默认使用哪种方式执行。ChatGPT Web 是主流程 —— "
-                         + "账号受限时可用 macOS 钥匙串中的凭据自动登录下一个账号; API 是可选的直连后端。")
+                         + "启动时可通过独立 Chrome Profile 和 Codex 浏览器授权切换账号; API 是可选的直连后端。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
@@ -101,13 +101,14 @@ struct ChatGptWebSettingsView: View {
                 Divider()
 
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("能力边界").font(.headline)
+                    Text("自动登录与续跑").font(.headline)
                     Text("""
-                    AIRunner 只做这些:
+                    AIRunner 会:
                      · 保存任务状态、已完成步骤与检查点
                      · 根据检查点生成自包含的续跑 prompt
-                     · 检测到无法继续时暂停, 并提示你切换账号
-                     · 你切换完成后从检查点继续, 不重复已完成的工作
+                     · 用户从任务详情点击开始后，才按需完成 Codex 浏览器授权
+                     · 账号受限时切换 Profile，并从检查点续跑
+                     · 遇到验证码、两步验证或安全挑战时停止并提示你处理
                     """)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -463,6 +464,13 @@ struct CodexSettingsView: View {
     @State private var preferredBundleID = ""
     @State private var autoResumeAfterManualAuthentication = true
     @State private var autoLoginNextChatGPTAccountOnHandoff = true
+    @State private var useCodexBrowserOAuthRotation = false
+    @State private var availableChromeProfiles: [ChromeProfile] = []
+    @State private var selectedChromeProfileDirectories: Set<String> = []
+    @State private var profileScanMessage: String?
+    @State private var isTestingOAuthLogin = false
+    @State private var oauthTestMessage: String?
+    @State private var oauthTestIsError = false
     @State private var statusMessage: String?
     @State private var statusIsError = false
 
@@ -473,9 +481,9 @@ struct CodexSettingsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Codex 自动恢复").font(.headline)
                     Text("""
-                    当任务需要换账号时，AIRunner 会先保存检查点，再退出当前 ChatGPT 账号，从 macOS 钥匙串读取下一个账号并输入邮箱和密码登录，最后继续任务。
+                    当任务需要换账号时，AIRunner 会先保存检查点，再选择下一个独立 Chrome Profile，通过 Codex 官方浏览器授权切换账号，最后继续任务。
 
-                    你只需在下方一次性录入账号。普通账号密码登录无需介入；验证码、两步验证或安全挑战出现时会停下来等你处理。
+                    每个 Chrome Profile 只需预先登录一个 ChatGPT 账号。AIRunner 不读取 Cookie 或 session token；网页会话过期、验证码或安全挑战出现时会停下来等你处理。
                     """)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -496,6 +504,12 @@ struct CodexSettingsView: View {
                     Toggle("任务进入账号交接时自动登录下一个账号",
                            isOn: $autoLoginNextChatGPTAccountOnHandoff)
                     Text("开启后，点任务里的「暂停以切换账号」会直接完成退出、登录和检查点恢复。")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+
+                    Toggle("使用 Chrome Profile + Codex 浏览器授权切换",
+                           isOn: $useCodexBrowserOAuthRotation)
+                    Text("开启后从 Codex 原生“使用 ChatGPT/GPT 账号登录”入口进入官方浏览器授权；至少需要两个独立 Chrome Profile，且每个 Profile 已登录不同 ChatGPT 账号。")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
 
@@ -523,7 +537,106 @@ struct CodexSettingsView: View {
 
                 Divider()
 
-                // ★ 凭据自动登录 (主推) ★
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("网页账号 Profile").font(.headline)
+                        Spacer()
+                        Button("重新检测") { scanChromeProfiles(selectNewProfiles: false) }
+                            .controlSize(.small)
+                        Button("打开 Chrome Profile 管理") {
+                            if !services.chromeProfiles.openProfilePicker() {
+                                profileScanMessage = "无法打开 Chrome Profile 管理器，请确认已安装 Chrome。"
+                            }
+                        }
+                        .controlSize(.small)
+                    }
+
+                    Text("每个勾选项都应在 chatgpt.com 保持一个不同的 ChatGPT 账号登录。Chrome 个人资料无需登录 Google 账号；创建时可选“保持未登录状态”。轮换顺序按下列顺序循环。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    if availableChromeProfiles.isEmpty {
+                        Text("没有检测到 Chrome Profile。先打开 Profile 管理器创建至少两个，再回到这里点“重新检测”。")
+                            .font(.callout)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        ForEach(availableChromeProfiles) { profile in
+                            Toggle(profile.label, isOn: Binding(
+                                get: {
+                                    selectedChromeProfileDirectories.contains(profile.directoryName)
+                                },
+                                set: { selected in
+                                    if selected {
+                                        selectedChromeProfileDirectories.insert(profile.directoryName)
+                                    } else {
+                                        selectedChromeProfileDirectories.remove(profile.directoryName)
+                                    }
+                                }
+                            ))
+                        }
+
+                        let selectedCount = selectedChromeProfileDirectories.count
+                        Text(selectedCount >= 2
+                             ? "已选择 \(selectedCount) 个 Profile，可以轮换。"
+                             : "当前只选择了 \(selectedCount) 个；自动轮换至少需要 2 个。")
+                            .font(.caption2)
+                            .foregroundStyle(selectedCount >= 2 ? .green : .orange)
+                    }
+
+                    if let profileScanMessage {
+                        Text(profileScanMessage)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("一键退出 / 登录测试").font(.headline)
+                    Text("手动点击按钮后，AIRunner 会先检查所有 Codex 窗口并确认当前页面已经停止生成，再真实退出账号；等待 Codex 原生登录入口出现后，才打开轮换列表中的下一个 Chrome Profile 并完成网页授权。测试不会新建、绑定或修改任务，也不会发送“继续”。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack(spacing: 10) {
+                        Button {
+                            runOAuthLoginSafetyTest()
+                        } label: {
+                            if isTestingOAuthLogin {
+                                HStack(spacing: 6) {
+                                    ProgressView().controlSize(.small)
+                                    Text("正在测试退出和登录…")
+                                }
+                            } else {
+                                Label("一键测试安全退出并登录", systemImage: "arrow.triangle.2.circlepath.circle.fill")
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.purple)
+                        .disabled(
+                            isTestingOAuthLogin
+                            || !useCodexBrowserOAuthRotation
+                            || selectedChromeProfileDirectories.count < 2
+                        )
+
+                        if let oauthTestMessage {
+                            Text(oauthTestMessage)
+                                .font(.caption)
+                                .foregroundStyle(oauthTestIsError ? .red : .green)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+
+                    Text("这是一次真实退出操作。Codex 正在生成或无法确认已经停止时，程序会在退出前拒绝测试。")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+
+                Divider()
+
+                // 旧凭据方式保留为可选回退。
                 CodexAccountCredentialSection(services: services)
 
                 Divider()
@@ -532,7 +645,8 @@ struct CodexSettingsView: View {
                     Text("安全边界").font(.headline)
                     Text("""
                     自动登录与恢复只做这些:
-                     · 从 macOS 钥匙串读取你保存的邮箱和密码并模拟键盘登录
+                     · 在独立 Chrome Profile 中打开 Codex 官方短时授权地址
+                     · 不读取、不复制、不注入网页 Cookie 或 session token
                      · 检测到验证码、两步验证或安全挑战时立即停止
                      · 通过 macOS Accessibility API 定位已绑定的线程
                      · 二次验证 (标题 + 至少一个辅助信号) 后才发送
@@ -565,6 +679,11 @@ struct CodexSettingsView: View {
             autoResumeAfterManualAuthentication = services.settings.autoResumeAfterManualAuthentication
             autoLoginNextChatGPTAccountOnHandoff =
                 services.settings.autoLoginNextChatGPTAccountOnHandoff
+            useCodexBrowserOAuthRotation = services.settings.useCodexBrowserOAuthRotation
+            selectedChromeProfileDirectories = Set(
+                services.settings.accountRotationProfileDirectories
+            )
+            scanChromeProfiles(selectNewProfiles: selectedChromeProfileDirectories.isEmpty)
         }
     }
 
@@ -600,18 +719,92 @@ struct CodexSettingsView: View {
         settings.codexPreferredApplicationBundleIdentifier = trimmedBundle.isEmpty ? nil : trimmedBundle
         settings.autoResumeAfterManualAuthentication = autoResumeAfterManualAuthentication
         settings.autoLoginNextChatGPTAccountOnHandoff = autoLoginNextChatGPTAccountOnHandoff
+        settings.useCodexBrowserOAuthRotation = useCodexBrowserOAuthRotation
+        settings.accountRotationProfileDirectories = availableChromeProfiles
+            .filter { selectedChromeProfileDirectories.contains($0.directoryName) }
+            .map(\.directoryName)
+
+        if useCodexBrowserOAuthRotation,
+           settings.accountRotationProfileDirectories.count < 2 {
+            statusMessage = "已保存，但 OAuth 自动轮换还需要至少两个已勾选的 Chrome Profile"
+            statusIsError = true
+        }
 
         Task {
             await services.saveSettings(settings)
             await MainActor.run {
-                statusMessage = "已保存"
-                statusIsError = false
+                if !(useCodexBrowserOAuthRotation
+                     && settings.accountRotationProfileDirectories.count < 2) {
+                    statusMessage = "已保存"
+                    statusIsError = false
+                }
             }
+        }
+    }
+
+    private func runOAuthLoginSafetyTest() {
+        guard !isTestingOAuthLogin else { return }
+        guard useCodexBrowserOAuthRotation,
+              selectedChromeProfileDirectories.count >= 2 else {
+            oauthTestMessage = "请先开启 OAuth 轮换并勾选至少两个 Chrome Profile。"
+            oauthTestIsError = true
+            return
+        }
+
+        isTestingOAuthLogin = true
+        oauthTestMessage = "正在确认 Codex 已停止生成…"
+        oauthTestIsError = false
+
+        let selectedDirectories = availableChromeProfiles
+            .filter { selectedChromeProfileDirectories.contains($0.directoryName) }
+            .map(\.directoryName)
+
+        Task {
+            // 测试使用界面上当前勾选的 Profile，并立即保存这两项相关设置。
+            var settings = services.settings
+            settings.useCodexBrowserOAuthRotation = true
+            settings.accountRotationProfileDirectories = selectedDirectories
+            await services.saveSettings(settings)
+
+            do {
+                let outcome = try await services.codexOAuthSafetyTester.run()
+                await MainActor.run {
+                    oauthTestMessage =
+                        "测试成功：已通过“\(outcome.accountLabel)”重新登录 Codex；没有发送任务消息。"
+                    oauthTestIsError = false
+                    isTestingOAuthLogin = false
+                }
+            } catch {
+                let message = AppError.normalize(error).userMessage
+                await MainActor.run {
+                    oauthTestMessage = "测试失败：\(message)"
+                    oauthTestIsError = true
+                    isTestingOAuthLogin = false
+                }
+            }
+        }
+    }
+
+    private func scanChromeProfiles(selectNewProfiles: Bool) {
+        do {
+            let found = try services.chromeProfiles.availableProfiles()
+            availableChromeProfiles = found
+            if selectNewProfiles {
+                selectedChromeProfileDirectories = Set(found.map(\.directoryName))
+            } else {
+                selectedChromeProfileDirectories = selectedChromeProfileDirectories.intersection(
+                    Set(found.map(\.directoryName))
+                )
+            }
+            profileScanMessage = "检测到 \(found.count) 个 Chrome Profile。"
+        } catch {
+            availableChromeProfiles = []
+            profileScanMessage = "检测失败：\(AppError.normalize(error).userMessage)"
         }
     }
 }
 
-// MARK: - 凭据自动登录 (主推)
+// MARK: - 凭据自动登录 (兼容回退)
 
 /// 「凭据自动登录」账号编辑器 —— 列表 + 增删改, 凭据存 Keychain。
 ///
@@ -633,7 +826,7 @@ private struct CodexAccountCredentialSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("ChatGPT 账号凭据 (自动登录用)").font(.headline)
+                Text("旧版邮箱密码路线（回退）").font(.headline)
                 Spacer()
                 Button {
                     editing = nil
@@ -644,7 +837,7 @@ private struct CodexAccountCredentialSection: View {
                 .controlSize(.small)
             }
 
-            Text("AIRunner 会点侧边栏登出，再键入下一个账号的邮箱和密码登录。"
+            Text("关闭上面的浏览器 OAuth 开关后，AIRunner 会使用这套旧流程：点侧边栏登出，再键入下一个账号的邮箱和密码登录。"
                  + "密码只存 macOS 钥匙串，不进设置、数据库或日志；列表不会回读密码。至少添加两个账号。")
                 .font(.caption)
                 .foregroundStyle(.secondary)

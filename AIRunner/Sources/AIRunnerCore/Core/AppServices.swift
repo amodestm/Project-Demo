@@ -42,6 +42,10 @@ public final class AppServices: @unchecked Sendable {
     public let codexController: CodexResumeController
     /// 账号交接后自动恢复的监视器。
     public let codexMonitor: AccountHandoffResumeMonitor
+    /// Codex 运行中额度/登录异常监视器。
+    public let codexQuotaMonitor: CodexQuotaMonitor
+    /// 设置页中独立于任务的一键退出/重新登录测试。
+    public let codexOAuthSafetyTester: CodexOAuthSafetyTester
     public let chromeProfiles: ChromeProfileScanner
 
     // Chrome Profile 自动账号轮换
@@ -52,6 +56,7 @@ public final class AppServices: @unchecked Sendable {
     // Codex 凭据自动登录 (登出当前账号 → 账号密码重新登录)
     public let codexAccountVault: CodexAccountVaulting
     public let codexLogin: CodexLoginAutomating
+    public let codexBrowserOAuth: CodexBrowserOAuthAuthenticating
 
     // 设置
     private let settingsStore: SettingsStore
@@ -73,6 +78,7 @@ public final class AppServices: @unchecked Sendable {
         accessibilityPermission: AccessibilityPermissionManaging? = nil,
         codexAccountVault: CodexAccountVaulting? = nil,
         codexLogin: CodexLoginAutomating? = nil,
+        codexBrowserOAuth: CodexBrowserOAuthAuthenticating? = nil,
         echoLogsToConsole: Bool = true
     ) throws {
         self.database = database
@@ -173,6 +179,8 @@ public final class AppServices: @unchecked Sendable {
                 windows: BrowserWindowLocator(),
                 settings: { box.value }
             )
+        let resolvedCodexBrowserOAuth = codexBrowserOAuth
+            ?? CodexBrowserOAuthAuthenticator(profiles: chromeProfiles)
         let accountRotation = AccountRotationManager(
             profiles: chromeProfiles,
             windows: BrowserWindowLocator(),
@@ -182,7 +190,24 @@ public final class AppServices: @unchecked Sendable {
             chatGPTSwitcher: ChatGPTAccountSwitcher(),
             codexLogin: resolvedCodexLogin,
             codexAccountVault: resolvedCodexVault,
+            codexBrowserOAuth: resolvedCodexBrowserOAuth,
             settleDelay: .seconds(2)
+        )
+
+        let codexQuotaMonitor = CodexQuotaMonitor(
+            driver: driver,
+            bindings: codexBindingRepo,
+            tasks: tasks,
+            accountRotation: accountRotation,
+            logger: logger,
+            pollInterval: .seconds(max(2, loaded.codexMonitorPollInterval)),
+            onRotationComplete: { taskID in
+                await codexMonitor.start(taskID: taskID)
+            }
+        )
+        let codexOAuthSafetyTester = CodexOAuthSafetyTester(
+            driver: driver,
+            accountTesting: accountRotation
         )
 
         let runner = JobRunner(
@@ -232,12 +257,15 @@ public final class AppServices: @unchecked Sendable {
         self.codexDriver = driver
         self.codexController = codexController
         self.codexMonitor = codexMonitor
+        self.codexQuotaMonitor = codexQuotaMonitor
+        self.codexOAuthSafetyTester = codexOAuthSafetyTester
         self.chromeProfiles = chromeProfiles
         self.accountRotationRepo = accountRotationRepo
         self.accountRotation = accountRotation
         self.browserWindows = BrowserWindowLocator()
         self.codexAccountVault = resolvedCodexVault
         self.codexLogin = resolvedCodexLogin
+        self.codexBrowserOAuth = resolvedCodexBrowserOAuth
     }
 
     /// 一行启动。生产代码用默认路径, 测试用 `inMemory: true`。

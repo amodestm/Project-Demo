@@ -40,7 +40,7 @@ struct CreateTaskView: View {
                     .foregroundStyle(.blue)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("新建长任务").font(.title3.bold())
-                    Text("任务会被拆成 N 个顺序步骤, 每一步的结果与检查点都会立即落盘。")
+                    Text("创建只保存任务，不会自动执行或打开网页；确认后再从任务详情手动开始。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -145,14 +145,12 @@ struct CreateTaskView: View {
     private func submit() {
         guard let stepCount, stepCountIsValid else { return }
         do {
-            let task = try manager.createTask(
+            _ = try manager.createTask(
                 name: name,
                 goal: goal,
                 numberOfSteps: stepCount
             )
             isPresented = false
-            // 创建后自动开跑, 符合"长任务"直觉
-            manager.start(task)
         } catch {
             errorMessage = AppError.normalize(error).userMessage
         }

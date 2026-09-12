@@ -32,6 +32,10 @@ public struct AppSettings: Codable, Sendable, Equatable {
     /// Web 任务进入账号交接状态时, 是否立即用 Keychain 中的下一个账号自动登录。
     public var autoLoginNextChatGPTAccountOnHandoff: Bool
 
+    /// 使用独立 Chrome Profile 的网页会话，通过 Codex 官方浏览器 OAuth 切换账号。
+    /// 关闭时保留旧的钥匙串邮箱密码自动登录流程。
+    public var useCodexBrowserOAuthRotation: Bool
+
     /// 同一绑定两次 Resume 之间的冷却 (秒)。
     public var codexResumeCooldown: TimeInterval
 
@@ -77,6 +81,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         copyPromptToClipboard: Bool = true,
         autoResumeAfterManualAuthentication: Bool = true,
         autoLoginNextChatGPTAccountOnHandoff: Bool = true,
+        useCodexBrowserOAuthRotation: Bool = true,
         codexResumeCooldown: TimeInterval = 60,
         codexMonitorPollInterval: TimeInterval = 15,
         codexResumeMessage: String = "继续",
@@ -95,6 +100,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.copyPromptToClipboard = copyPromptToClipboard
         self.autoResumeAfterManualAuthentication = autoResumeAfterManualAuthentication
         self.autoLoginNextChatGPTAccountOnHandoff = autoLoginNextChatGPTAccountOnHandoff
+        self.useCodexBrowserOAuthRotation = useCodexBrowserOAuthRotation
         self.codexResumeCooldown = codexResumeCooldown
         self.codexMonitorPollInterval = codexMonitorPollInterval
         self.codexResumeMessage = codexResumeMessage
@@ -134,6 +140,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
             .decodeIfPresent(Bool.self, forKey: .autoResumeAfterManualAuthentication) ?? true
         autoLoginNextChatGPTAccountOnHandoff = try container
             .decodeIfPresent(Bool.self, forKey: .autoLoginNextChatGPTAccountOnHandoff) ?? true
+        useCodexBrowserOAuthRotation = try container
+            .decodeIfPresent(Bool.self, forKey: .useCodexBrowserOAuthRotation) ?? false
         codexResumeCooldown = try container
             .decodeIfPresent(TimeInterval.self, forKey: .codexResumeCooldown) ?? 60
         codexMonitorPollInterval = try container

@@ -80,6 +80,20 @@ public struct AccountRotationRepository: Sendable {
         )?.string("current_chatgpt_account")
     }
 
+    /// 最近一次由 AIRunner 成功登录的 ChatGPT 账号。
+    /// 新任务尚无自己的指针时用它继续全局轮换，避免每个任务都从第一条开始。
+    public func mostRecentChatGPTAccount() throws -> String? {
+        try db.queryOne(
+            """
+            SELECT current_chatgpt_account
+            FROM account_rotation_state
+            WHERE current_chatgpt_account IS NOT NULL
+            ORDER BY last_rotated_at DESC
+            LIMIT 1
+            """
+        )?.string("current_chatgpt_account")
+    }
+
     /// 记录一次 ChatGPT 网页账号切换。
     public func recordChatGPTAccount(taskID: String, account: String) throws {
         try db.execute(

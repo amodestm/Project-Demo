@@ -44,6 +44,29 @@ public struct CodexDriverConfiguration: Sendable, Equatable {
         "Stop", "停止", "Cancel", "取消", "Generating", "生成中", "正在生成", "Pause", "暫停"
     ]
 
+    /// 只有这些稳定语义才会触发账号轮换；普通“停止”按钮不在其中。
+    public var quotaIssueHints: [String] = [
+        "usage limit", "usage limits", "rate limit", "quota exceeded",
+        "out of credits", "credits exhausted", "limit reached", "you've hit your limit",
+        "monthly limit", "daily limit", "too many requests",
+        "额度不足", "额度已用尽", "额度耗尽", "达到使用上限", "用量上限",
+        "超出限额", "请求过多",
+    ]
+
+    public var authenticationIssueHints: [String] = [
+        "session expired", "登录已过期", "会话已过期", "重新登录",
+        "authentication required", "sign in to continue", "log in to continue",
+    ]
+
+    public var stoppedIssueHints: [String] = [
+        "task stopped", "execution stopped", "generation stopped",
+        "任务已停止", "执行已停止", "生成已停止",
+    ]
+
+    /// 只检查当前窗口 AX 文本序列的最后一小段。旧对话里的额度报错不能再次
+    /// 触发轮换；真正触发信号必须出现在最新输出附近。
+    public var accountIssueTailLimit: Int = 16
+
     /// 单次 AX 遍历的节点预算。
     public var traversalNodeBudget: Int = 6000
     /// 单次 AX 遍历的深度上限。
@@ -223,13 +246,102 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
 
     public func detectBusyState(_ app: CodexAppHandle) async throws -> CodexBusyState {
         let root = AXUIElementCreateApplication(app.processIdentifier)
-        let texts = Set(allTexts(of: root, maxDepth: min(configuration.traversalMaxDepth, 10)))
+        let surface = focusedWindow(of: root) ?? root
+        let texts = Set(allTexts(of: surface, maxDepth: min(configuration.traversalMaxDepth, 10)))
 
         for indicator in configuration.busyIndicators {
             if texts.contains(indicator) { return .generating }
         }
+        // 没有 Stop/Generating，且能找到可编辑的真实 composer，说明当前线程
+        // 已经可以接受新输入。搜索框等控件由 locateComposer 的排除规则过滤。
+        if let composer = try? await locateComposer(app), composer.isEditable {
+            return .idle
+        }
         // 读不到明确信号 —— 按"不确定"处理, 上层会拒绝发送。
         return .unknown
+    }
+
+    public func detectAnyTaskGenerating(_ app: CodexAppHandle) async throws -> Bool {
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        let surfaces = windows(of: root)
+        let generationIndicators: Set<String> = [
+            "Stop", "停止", "Generating", "生成中", "正在生成", "Pause", "暫停",
+        ]
+        let targets = surfaces.isEmpty ? [root] : surfaces
+        return targets.contains { surface in
+            let texts = Set(allTexts(
+                of: surface,
+                maxDepth: min(configuration.traversalMaxDepth, 10)
+            ))
+            return !texts.isDisjoint(with: generationIndicators)
+        }
+    }
+
+    public func detectTaskStopped(_ app: CodexAppHandle) async throws -> Bool {
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        let surface = focusedWindow(of: root) ?? root
+        let texts = Self.latestIssueTexts(allTexts(
+            of: surface,
+            maxDepth: configuration.traversalMaxDepth
+        ), configuration: configuration)
+        let normalized = texts.map(Self.normalizeIssueText)
+        return configuration.stoppedIssueHints.contains { hint in
+            let needle = Self.normalizeIssueText(hint)
+            return normalized.contains { $0.contains(needle) }
+        }
+    }
+
+    public func detectAccountIssue(_ app: CodexAppHandle) async throws -> CodexAccountIssue? {
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        let surface = focusedWindow(of: root) ?? root
+        let texts = allTexts(of: surface, maxDepth: configuration.traversalMaxDepth)
+        return Self.classifyLatestAccountIssue(texts, configuration: configuration)
+    }
+
+    static func classifyLatestAccountIssue(
+        _ texts: [String],
+        configuration: CodexDriverConfiguration = .default
+    ) -> CodexAccountIssue? {
+        classifyAccountIssue(
+            latestIssueTexts(texts, configuration: configuration),
+            configuration: configuration
+        )
+    }
+
+    private static func latestIssueTexts(
+        _ texts: [String], configuration: CodexDriverConfiguration
+    ) -> [String] {
+        let meaningful = texts.filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return Array(meaningful.suffix(max(1, configuration.accountIssueTailLimit)))
+    }
+
+    /// 纯函数便于在没有真实 Codex 窗口的测试里锁住 fail-closed 规则。
+    static func classifyAccountIssue(
+        _ texts: [String],
+        configuration: CodexDriverConfiguration = .default
+    ) -> CodexAccountIssue? {
+        let normalized = texts.map { normalizeIssueText($0) }
+        func containsAny(_ hints: [String]) -> Bool {
+            hints.contains { hint in
+                let needle = normalizeIssueText(hint)
+                return normalized.contains { $0.contains(needle) }
+            }
+        }
+
+        if containsAny(configuration.quotaIssueHints) { return .quotaExhausted }
+        if containsAny(configuration.authenticationIssueHints) {
+            return .authenticationRequired
+        }
+        if containsAny(configuration.stoppedIssueHints) { return .taskStopped }
+        return nil
+    }
+
+    private static func normalizeIssueText(_ text: String) -> String {
+        text.lowercased()
+            .split(whereSeparator: \Character.isWhitespace)
+            .joined(separator: " ")
     }
 
     // MARK: - Composer
@@ -616,12 +728,34 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
     }
 
     private func windowCount(of appElement: AXUIElement) -> Int {
+        windows(of: appElement).count
+    }
+
+    private func windows(of appElement: AXUIElement) -> [AXUIElement] {
         var raw: CFTypeRef?
         let status = AXUIElementCopyAttributeValue(
             appElement, kAXWindowsAttribute as CFString, &raw
         )
-        guard status == .success, let windows = raw as? [AXUIElement] else { return 0 }
-        return windows.count
+        guard status == .success, let windows = raw as? [AXUIElement] else { return [] }
+        return windows
+    }
+
+    private func focusedWindow(of appElement: AXUIElement) -> AXUIElement? {
+        for attribute in [kAXFocusedWindowAttribute, kAXMainWindowAttribute] {
+            var raw: CFTypeRef?
+            if AXUIElementCopyAttributeValue(
+                appElement, attribute as CFString, &raw
+            ) == .success, let raw {
+                return unsafeDowncast(raw, to: AXUIElement.self)
+            }
+        }
+        var raw: CFTypeRef?
+        if AXUIElementCopyAttributeValue(
+            appElement, kAXWindowsAttribute as CFString, &raw
+        ) == .success, let windows = raw as? [AXUIElement] {
+            return windows.first
+        }
+        return nil
     }
 
     private static func runningApplication(bundleIdentifier: String) -> NSRunningApplication? {

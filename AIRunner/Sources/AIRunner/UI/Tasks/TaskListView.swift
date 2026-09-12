@@ -42,6 +42,20 @@ struct MainSplitView: View {
             let url = ChatGPTWebTarget.resolvedURL(override: services.settings.chatGPTURL)
             WorkspaceBrowserLauncher().open(url)
         }
+        .onReceive(NotificationCenter.default.publisher(for: .airunnerStartSelectedTask)) { _ in
+            guard let taskID = selection,
+                  let task = manager.tasks.first(where: { $0.id == taskID }) else { return }
+
+            switch task.status {
+            case .queued:
+                manager.start(task)
+            case .paused, .waiting, .failed,
+                 .waitingForAccount, .waitingForBrowser, .waitingForUser:
+                manager.resume(task)
+            case .running, .completed, .cancelled:
+                break
+            }
+        }
     }
 }
 
@@ -103,7 +117,10 @@ struct TaskListView: View {
                 .listStyle(.inset)
             }
         }
-        .navigationTitle("AIRunner")
+        .navigationTitle(
+            Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName")
+                as? String ?? "AIRunner"
+        )
         .safeAreaInset(edge: .bottom) {
             bottomBar
         }
@@ -135,6 +152,12 @@ struct TaskListView: View {
                 set: { if !$0 { manager.lastErrorMessage = nil } }
             )
         ) {
+            if manager.lastErrorMessage?.contains("辅助功能权限") == true {
+                Button("打开辅助功能设置") {
+                    manager.lastErrorMessage = nil
+                    manager.openAccessibilitySettings()
+                }
+            }
             Button("好") { manager.lastErrorMessage = nil }
         } message: {
             Text(manager.lastErrorMessage ?? "")

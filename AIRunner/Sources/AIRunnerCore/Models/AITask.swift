@@ -226,7 +226,7 @@ public struct AITask: Codable, Sendable, Identifiable, Equatable, Hashable {
         case .waiting:
             return waitingUntil.map { "等待至 \(DateCoding.string(from: $0))" } ?? "等待中"
         case .waitingForAccount:
-            return "已安全保存检查点。请手动切换到另一个已授权的 ChatGPT 会话, 然后点「我已完成切换」。"
+            return "已安全保存检查点。正在自动登录下一个 ChatGPT 账号；若遇到验证码或安全挑战，请处理后继续。"
         case .waitingForBrowser:
             return "请在浏览器中打开 ChatGPT, 然后点「我已完成」。"
         case .waitingForUser:

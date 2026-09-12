@@ -226,6 +226,18 @@ public protocol CodexUIAutomationDriving: Sendable {
 
     func detectBusyState(_ app: CodexAppHandle) async throws -> CodexBusyState
 
+    /// 检查 Codex 的任意可见窗口是否仍在生成。设置页的真实退出测试必须先过
+    /// 这道全局门，避免只检查当前焦点窗口而漏掉另一个正在运行的任务。
+    func detectAnyTaskGenerating(_ app: CodexAppHandle) async throws -> Bool
+
+    /// 在忙碌状态无法明确判定时，读取页面是否出现“任务已停止”的终止信号。
+    /// 额度错误页通常会移除 Stop 按钮，因此这是自动切号前的第二道安全门。
+    func detectTaskStopped(_ app: CodexAppHandle) async throws -> Bool
+
+    /// 读取 Codex 当前窗口的额度耗尽 / 登录失效 / 任务停止信号。
+    /// 没有稳定信号时返回 nil；调用方必须等待，不能猜测并切号。
+    func detectAccountIssue(_ app: CodexAppHandle) async throws -> CodexAccountIssue?
+
     func locateComposer(_ app: CodexAppHandle) async throws -> CodexComposerHandle
     func focusComposer(_ composer: CodexComposerHandle, in app: CodexAppHandle) async throws
     func insertMessage(
@@ -243,4 +255,11 @@ public protocol CodexUIAutomationDriving: Sendable {
         _ app: CodexAppHandle,
         composer: CodexComposerHandle
     ) async throws -> SendConfirmation
+}
+
+public extension CodexUIAutomationDriving {
+    /// 兼容测试替身和第三方实现；真实 AX 驱动会扫描全部 Codex 窗口。
+    func detectAnyTaskGenerating(_ app: CodexAppHandle) async throws -> Bool {
+        try await detectBusyState(app) == .generating
+    }
 }

@@ -42,9 +42,32 @@ public final class TaskManager: ObservableObject {
 
             refresh()
 
+            // 绑定过 Codex 线程的非终态任务继续接受额度/登录异常监视。
+            // 这样应用重启后不会丢失“额度耗尽 → 自动切号”的后台链路；
+            // 具体是否执行轮换仍由监视器的 running + idle + 连续信号门控决定。
+            if services.settings.autoResumeAfterManualAuthentication {
+                let boundTaskIDs = (try? services.tasks.fetchAll())?
+                    .filter { !$0.status.isTerminal }
+                    .compactMap { task in
+                        ((try? services.codexBindings.fetchByTask(taskID: task.id)) ?? nil) != nil
+                            ? task.id : nil
+                    } ?? []
+                for taskID in boundTaskIDs {
+                    codexQuotaMonitorTaskIDs.insert(taskID)
+                    Task { [weak self] in
+                        guard let self else { return }
+                        await self.services.codexQuotaMonitor.start(taskID: taskID)
+                    }
+                }
+            }
+
             if autoStart, !report.recoverableTaskIDs.isEmpty {
                 for taskID in report.recoverableTaskIDs {
-                    Task { await services.runner.start(taskID: taskID) }
+                    Task { [weak self] in
+                        await self?.startRunnerWithLogin(
+                            taskID: taskID, rotateAccountBeforeStart: false
+                        )
+                    }
                 }
             }
             startPolling()
@@ -90,7 +113,8 @@ public final class TaskManager: ObservableObject {
     private func tick() async {
         refresh()
         // 刷新所有正在监视的任务的 Codex 监视器状态, 供 UI 实时显示。
-        for taskID in codexMonitorStates.keys {
+        let monitorIDs = Set(codexMonitorStates.keys).union(codexQuotaMonitorTaskIDs)
+        for taskID in monitorIDs {
             await refreshCodexMonitorState(taskID: taskID)
         }
     }
@@ -183,8 +207,35 @@ public final class TaskManager: ObservableObject {
         }
         Task { [weak self] in
             guard let self else { return }
-            await self.services.runner.start(taskID: task.id)
-            self.refresh()
+            await self.startRunnerWithLogin(
+                taskID: task.id, rotateAccountBeforeStart: task.executionMode == .chatGPTWeb
+            )
+        }
+    }
+
+    /// 新建 Web 任务主动打开 ChatGPT、退出当前会话并登录轮换池下一账号；
+    /// 崩溃恢复只检查现有登录态，避免每次重启 App 都额外切号。
+    private func startRunnerWithLogin(
+        taskID: String,
+        rotateAccountBeforeStart: Bool
+    ) async {
+        do {
+            if let task = try services.tasks.fetch(id: taskID), task.executionMode == .chatGPTWeb {
+                if rotateAccountBeforeStart {
+                    let outcome = try await services.accountRotation
+                        .rotateChatGPTAccount(taskID: taskID)
+                    lastInfoMessage =
+                        "已主动切换并登录 ChatGPT 账号「\(outcome.accountLabel)」，正在启动任务…"
+                } else if let label = try await services.accountRotation
+                    .ensureInitialChatGPTLogin(taskID: taskID) {
+                    lastInfoMessage = "已自动恢复 ChatGPT 账号「\(label)」，正在启动任务…"
+                }
+            }
+            await services.runner.start(taskID: taskID)
+            refresh()
+        } catch {
+            setError(error)
+            refresh()
         }
     }
 
@@ -259,6 +310,10 @@ public final class TaskManager: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             await self.services.runner.cancel(taskID: task.id)
+            self.codexQuotaMonitorTaskIDs.remove(task.id)
+            self.codexMonitorStates[task.id] = nil
+            await self.services.codexQuotaMonitor.stop(taskID: task.id, reason: "任务已取消")
+            await self.services.codexMonitor.stop(taskID: task.id, reason: "任务已取消")
             self.refresh()
         }
     }
@@ -268,6 +323,10 @@ public final class TaskManager: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             await self.services.runner.cancel(taskID: task.id)
+            self.codexQuotaMonitorTaskIDs.remove(task.id)
+            self.codexMonitorStates[task.id] = nil
+            await self.services.codexQuotaMonitor.stop(taskID: task.id, reason: "任务已删除")
+            await self.services.codexMonitor.stop(taskID: task.id, reason: "任务已删除")
             do {
                 try self.services.tasks.delete(id: task.id)
                 self.services.logger.info(.taskCancelled, "已删除任务「\(task.name)」")
@@ -435,6 +494,8 @@ public final class TaskManager: ObservableObject {
     @Published public private(set) var codexResumeResult: CodexResumeResult?
     /// Codex 监视器当前状态 (按任务 ID)。
     @Published public private(set) var codexMonitorStates: [String: AccountHandoffState] = [:]
+    /// 已开启 Codex 额度/登录异常监视的任务。
+    @Published public private(set) var codexQuotaMonitorTaskIDs: Set<String> = []
 
     /// 读取某任务绑定的 Codex 线程 (若有)。
     public func codexBinding(for task: AITask) -> CodexTaskBinding? {
@@ -455,6 +516,19 @@ public final class TaskManager: ObservableObject {
                 metadata: .object(["bindingID": .string(binding.id)])
             )
             lastErrorMessage = nil
+
+            // 绑定保存后即开始后台观察，但只有任务真正处于 running 时才会
+            // 解释页面异常；waitingForUser / waitingForAccount 只保持待命。
+            if services.settings.autoResumeAfterManualAuthentication,
+               let taskID = binding.taskID,
+               let task = try? services.tasks.fetch(id: taskID),
+               !task.status.isTerminal {
+                codexQuotaMonitorTaskIDs.insert(taskID)
+                Task { [weak self] in
+                    guard let self else { return }
+                    await self.services.codexQuotaMonitor.start(taskID: taskID)
+                }
+            }
         } catch {
             setError(error)
         }
@@ -462,9 +536,25 @@ public final class TaskManager: ObservableObject {
 
     /// 删除一个 Codex 绑定。
     public func deleteCodexBinding(_ binding: CodexTaskBinding) {
+        let taskID = binding.taskID
+        if let taskID {
+            codexQuotaMonitorTaskIDs.remove(taskID)
+            codexMonitorStates[taskID] = nil
+        }
         do {
             try services.codexBindings.delete(id: binding.id)
             lastInfoMessage = "已删除 Codex 绑定「\(binding.displayTitle)」"
+            if let taskID {
+                Task { [weak self] in
+                    guard let self else { return }
+                    await self.services.codexQuotaMonitor.stop(
+                        taskID: taskID, reason: "Codex 绑定已删除"
+                    )
+                    await self.services.codexMonitor.stop(
+                        taskID: taskID, reason: "Codex 绑定已删除"
+                    )
+                }
+            }
         } catch {
             setError(error)
         }
@@ -538,8 +628,10 @@ public final class TaskManager: ObservableObject {
             lastInfoMessage = "自动恢复已在设置中关闭。仍可使用 Test Locate、Dry Run 或手动发送「继续」。"
             return
         }
+        codexQuotaMonitorTaskIDs.insert(taskID)
         Task { [weak self] in
             guard let self else { return }
+            await self.services.codexQuotaMonitor.start(taskID: taskID)
             await self.services.codexMonitor.start(taskID: taskID)
             await self.refreshCodexMonitorState(taskID: taskID)
             self.lastInfoMessage =
@@ -550,8 +642,10 @@ public final class TaskManager: ObservableObject {
 
     /// 停止账号交接自动恢复监视器。
     public func stopCodexMonitor(taskID: String, reason: String = "用户手动停止") {
+        codexQuotaMonitorTaskIDs.remove(taskID)
         Task { [weak self] in
             guard let self else { return }
+            await self.services.codexQuotaMonitor.stop(taskID: taskID, reason: reason)
             await self.services.codexMonitor.stop(taskID: taskID, reason: reason)
             await self.refreshCodexMonitorState(taskID: taskID)
         }
@@ -559,7 +653,7 @@ public final class TaskManager: ObservableObject {
 
     /// 某任务是否正被监视器跟踪。
     public func isMonitoringCodex(taskID: String) -> Bool {
-        codexMonitorStates[taskID] != nil
+        codexMonitorStates[taskID] != nil || codexQuotaMonitorTaskIDs.contains(taskID)
     }
 
     /// 刷新某个任务的监视器状态 (供 UI 轮询显示)。
@@ -568,8 +662,50 @@ public final class TaskManager: ObservableObject {
         if monitoring {
             let state = await services.codexMonitor.state
             codexMonitorStates[taskID] = state
+        } else if codexQuotaMonitorTaskIDs.contains(taskID) {
+            if await services.codexQuotaMonitor.isMonitoring(taskID: taskID) {
+                codexMonitorStates[taskID] = .checkingSession
+            } else {
+                // 任务进入终态后 quota monitor 会自行退出；同步清理 UI 侧集合，
+                // 避免“未监视的任务”一直显示为已开启。
+                codexQuotaMonitorTaskIDs.remove(taskID)
+                codexMonitorStates[taskID] = nil
+            }
         } else {
             codexMonitorStates[taskID] = nil
+        }
+    }
+
+    /// 安全测试“额度耗尽 → 退出 Codex → 切换账号 → 恢复原线程”。
+    /// Core 会先读取真实 Codex 忙碌状态；仍在生成时不会执行任何退出操作。
+    public func simulateCodexQuotaHandoff(_ task: AITask) {
+        guard !isRotatingAccount else { return }
+        isRotatingAccount = true
+        lastErrorMessage = nil
+        lastInfoMessage = "正在确认 Codex 已停止生成…"
+
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isRotatingAccount = false }
+            do {
+                let outcome = try await self.services.codexQuotaMonitor
+                    .simulateQuotaExhaustion(taskID: task.id)
+                switch outcome {
+                case .rotationCompleted:
+                    self.lastInfoMessage =
+                        "安全模拟已通过：已退出当前 Codex 账号并完成下一个账号授权，正在恢复绑定线程。"
+                case .rotationFailed(let message):
+                    self.lastErrorMessage = message
+                default:
+                    self.lastInfoMessage = "安全模拟未执行账号切换，请查看当前 Codex 状态。"
+                }
+                self.codexQuotaMonitorTaskIDs.insert(task.id)
+                await self.refreshCodexMonitorState(taskID: task.id)
+                self.refresh()
+            } catch {
+                self.setError(error)
+                self.refresh()
+            }
         }
     }
 
@@ -741,8 +877,18 @@ public final class TaskManager: ObservableObject {
     // MARK: - 错误
 
     private func setError(_ error: Error) {
+        if let automationError = error as? CodexAutomationError,
+           automationError == .accessibilityPermissionMissing {
+            // 由用户点击“开始”触发时请求系统显示正式授权提示。
+            // macOS 仍要求用户亲自在系统设置里批准，应用不能自行授予权限。
+            _ = services.accessibilityPermission.requestPermission()
+        }
         let appError = AppError.normalize(error)
         lastErrorMessage = appError.userMessage
         services.logger.error(.unknown, appError.userMessage)
+    }
+
+    public func openAccessibilitySettings() {
+        services.accessibilityPermission.openAccessibilitySettings()
     }
 }

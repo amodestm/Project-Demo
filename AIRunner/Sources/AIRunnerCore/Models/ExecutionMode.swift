@@ -26,9 +26,9 @@ public enum ExecutionMode: String, Codable, Sendable, CaseIterable, Identifiable
 
     /// ★ 主流程: ChatGPT Web + 账号交接。
     ///
-    /// 程序负责: 检查点、已完成的步骤、续跑 prompt 生成、暂停与恢复、崩溃恢复。
-    /// 用户负责: 提交 prompt、把结果贴回来；账号受限时，程序可使用 macOS
-    /// Keychain 中由用户保存的凭据自动登录下一个账号。
+    /// 程序负责: 检查点、已完成的步骤、续跑 prompt 生成、自动提交与读取、
+    /// 暂停与恢复、崩溃恢复。自动化无法确认时可以降级为手工回填。
+    /// 账号受限时可使用 macOS Keychain 中由用户保存的凭据登录下一个账号。
     ///
     /// 程序**不做**: 读 Cookie / 读 session token / 绕过验证码、两步验证或安全挑战。
     case chatGPTWeb = "chatgpt_web"
@@ -51,7 +51,7 @@ public enum ExecutionMode: String, Codable, Sendable, CaseIterable, Identifiable
     public var detail: String {
         switch self {
         case .chatGPTWeb:
-            return "你在浏览器里提交结果; 账号受限时程序可自动登录下一个账号，并负责检查点、续跑 prompt 与崩溃恢复。"
+            return "AIRunner 在浏览器中执行任务；新任务会主动退出当前会话并登录轮换池下一账号，同时负责检查点、续跑 prompt 与崩溃恢复。"
         case .api:
             return "直连官方 API 全自动执行, 需自行配置 API Key。默认不启用。"
         }
