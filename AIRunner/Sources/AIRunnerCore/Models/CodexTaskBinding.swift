@@ -1,5 +1,93 @@
 import Foundation
 
+/// Codex 任务发送前需要锁定的模型与思考程度。
+///
+/// `modelID` 用稳定的 API 名称持久化；`modelDisplayName` 只用于匹配 Codex
+/// 界面上的可见文字。AIRunner 不读取 Codex 私有数据。
+public struct CodexExecutionPreference: Codable, Sendable, Equatable, Hashable {
+    public var modelID: String
+    public var reasoningEffort: CodexReasoningEffort
+
+    public init(modelID: String, reasoningEffort: CodexReasoningEffort) {
+        self.modelID = modelID
+        self.reasoningEffort = reasoningEffort
+    }
+
+    public static let gpt56SolHigh = CodexExecutionPreference(
+        modelID: "gpt-5.6-sol",
+        reasoningEffort: .high
+    )
+
+    public var modelDisplayName: String {
+        switch modelID.lowercased() {
+        case "gpt-5.6-sol": return "GPT-5.6 Sol"
+        case "gpt-5.6-terra": return "GPT-5.6 Terra"
+        case "gpt-5.6-luna": return "GPT-5.6 Luna"
+        case "gpt-6-astra": return "GPT-6 Astra"
+        case "gpt-5.5": return "GPT-5.5"
+        default: return modelID
+        }
+    }
+
+    public var displayName: String {
+        "\(modelDisplayName) · \(reasoningEffort.displayName)"
+    }
+}
+
+public enum CodexReasoningEffort: String, Codable, Sendable, Equatable, Hashable, CaseIterable {
+    case low
+    case medium
+    case high
+    case xhigh
+    case max
+
+    public var displayName: String {
+        switch self {
+        case .low: return "低"
+        case .medium: return "中"
+        case .high: return "高"
+        case .xhigh: return "极高"
+        case .max: return "最大"
+        }
+    }
+
+    /// Codex 可能随界面语言变化；真实驱动只在弹出的模型菜单中匹配这些完整标签。
+    public var uiLabels: [String] {
+        switch self {
+        case .low: return ["低", "Low"]
+        case .medium: return ["中", "中等", "Medium"]
+        case .high: return ["高", "High"]
+        case .xhigh: return ["极高", "超高", "Extra high", "XHigh"]
+        case .max: return ["最大", "Max", "Maximum"]
+        }
+    }
+}
+
+/// 从 Codex 模型按钮回读的可见状态。
+public struct CodexExecutionSelection: Sendable, Equatable {
+    public let visibleTitle: String
+
+    public init(visibleTitle: String) {
+        self.visibleTitle = visibleTitle
+    }
+
+    public func matches(_ preference: CodexExecutionPreference) -> Bool {
+        let normalized = Self.normalize(visibleTitle)
+        guard normalized.contains(Self.normalize(preference.modelDisplayName)) else {
+            return false
+        }
+        return preference.reasoningEffort.uiLabels.contains {
+            normalized.hasSuffix(Self.normalize($0))
+        }
+    }
+
+    private static func normalize(_ text: String) -> String {
+        text.lowercased()
+            .split(whereSeparator: \Character.isWhitespace)
+            .joined(separator: " ")
+    }
+}
+
 /// 用户手动绑定的一个"已存在的 Codex 长任务线程"。
 ///
 /// ## ★ 这个模型里不存在任何认证信息 ★
@@ -42,6 +130,10 @@ public struct CodexTaskBinding: Codable, Sendable, Identifiable, Equatable, Hash
     /// 自动恢复时发送的内容。默认「继续」。
     public var resumeMessage: String
 
+    /// 发送提示词前要在 Codex UI 中设置并回读确认的模型配置。
+    /// nil 表示沿用当前 Codex 设置，兼容旧绑定。
+    public var executionPreference: CodexExecutionPreference?
+
     public var lastVerifiedAt: Date?
     public var lastResumeSentAt: Date?
     public var createdAt: Date
@@ -60,6 +152,7 @@ public struct CodexTaskBinding: Codable, Sendable, Identifiable, Equatable, Hash
         chromeProfileDirectory: String? = nil,
         fingerprint: CodexTaskFingerprint,
         resumeMessage: String = "继续",
+        executionPreference: CodexExecutionPreference? = nil,
         lastVerifiedAt: Date? = nil,
         lastResumeSentAt: Date? = nil,
         createdAt: Date = Date(),
@@ -77,6 +170,7 @@ public struct CodexTaskBinding: Codable, Sendable, Identifiable, Equatable, Hash
         self.chromeProfileDirectory = chromeProfileDirectory
         self.fingerprint = fingerprint
         self.resumeMessage = resumeMessage
+        self.executionPreference = executionPreference
         self.lastVerifiedAt = lastVerifiedAt
         self.lastResumeSentAt = lastResumeSentAt
         self.createdAt = createdAt

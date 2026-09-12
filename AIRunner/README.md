@@ -17,7 +17,7 @@ macOS 上的 **AI 长任务自动执行器**。把一个跑几小时甚至几天
 - Codex 152 的正文控件位于很深的 Electron 窗口辅助功能树中。忙碌检测、Composer 定位、退出确认和退出后的登录入口现在都从 `AXWindows` 的完整窗口树读取，并使用受节点预算保护的 40 层遍历；不会再因为只读到菜单和窗口外壳而把空闲任务误报为“无法确认”。
 - 原钥匙串邮箱密码路线完整保留为回退；在设置中关闭 OAuth 开关即可继续使用，也可以直接运行旧版 App。
 - 当前自动化测试为 **234 个**；没有失败用例。
-- 两个 Release App 并存：旧路线 `dist/AIRunner.app` 保持 **1.3.2 / build 26**；新路线 `dist/AIRunner OAuth.app` 为 **1.5.15 / build 51**，使用独立应用名和 bundle id，不覆盖旧版。
+- 两个 Release App 并存：旧路线 `dist/AIRunner.app` 保持 **1.3.2 / build 26**；新路线 `dist/AIRunner OAuth.app` 为 **1.5.17 / build 53**，使用独立应用名和 bundle id，不覆盖旧版。
 
 Codex 的真实 UI 操作仍需在用户机器上授予 AIRunner「系统设置 → 隐私与安全性 → 辅助功能」权限后，用实际 Codex 窗口执行 Test Locate / Dry Run 验收。没有权限时程序会停止并报告原因，不会猜测目标或发送消息。
 

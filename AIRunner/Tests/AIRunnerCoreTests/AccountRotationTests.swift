@@ -1,6 +1,23 @@
 import XCTest
 @testable import AIRunnerCore
 
+private final class TestProfilePointer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+
+    func load() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func save(_ newValue: String) {
+        lock.lock()
+        value = newValue
+        lock.unlock()
+    }
+}
+
 /// Chrome Profile 自动账号轮换的核心逻辑测试。
 ///
 /// 重点测**纯逻辑** (选择下一个 profile 的循环规则) 与 **repository 落盘**;
@@ -208,7 +225,7 @@ final class AccountRotationTests: XCTestCase {
         XCTAssertEqual(decoded.accountRotationProfileDirectories, [])
     }
 
-    func testStandaloneOAuthTestAdvancesProfilesWithoutTaskRecord() async throws {
+    func testStandaloneOAuthTestPersistsProfileAcrossManagerRestart() async throws {
         let temporaryHome = FileManager.default.temporaryDirectory
             .appendingPathComponent("airunner-oauth-settings-test-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: temporaryHome) }
@@ -234,7 +251,8 @@ final class AccountRotationTests: XCTestCase {
         let configuredSettings = settings
         let services = try TestSupport.makeServices(settings: settings)
         let oauth = FakeCodexBrowserOAuthAuthenticator(loggedIn: true)
-        let manager = AccountRotationManager(
+        let pointer = TestProfilePointer()
+        let firstManager = AccountRotationManager(
             profiles: ChromeProfileScanner(homeDirectory: temporaryHome.path),
             windows: FakeBrowserWindowLocator(),
             repository: services.accountRotationRepo,
@@ -242,12 +260,25 @@ final class AccountRotationTests: XCTestCase {
             settings: { configuredSettings },
             codexBrowserOAuth: oauth,
             settleDelay: .seconds(0),
-            loadSettingsTestProfileDirectory: { nil },
-            saveSettingsTestProfileDirectory: { _ in }
+            loadSettingsTestProfileDirectory: { pointer.load() },
+            saveSettingsTestProfileDirectory: { pointer.save($0) }
         )
 
-        let first = try await manager.testCodexBrowserOAuthRotation()
-        let second = try await manager.testCodexBrowserOAuthRotation()
+        let first = try await firstManager.testCodexBrowserOAuthRotation()
+
+        // 模拟 AIRunner 更新/重启：新 manager 只能从持久化指针恢复轮换位置。
+        let secondManager = AccountRotationManager(
+            profiles: ChromeProfileScanner(homeDirectory: temporaryHome.path),
+            windows: FakeBrowserWindowLocator(),
+            repository: services.accountRotationRepo,
+            logger: services.logger,
+            settings: { configuredSettings },
+            codexBrowserOAuth: oauth,
+            settleDelay: .seconds(0),
+            loadSettingsTestProfileDirectory: { pointer.load() },
+            saveSettingsTestProfileDirectory: { pointer.save($0) }
+        )
+        let second = try await secondManager.testCodexBrowserOAuthRotation()
 
         XCTAssertEqual(first.accountLabel, "账号 A")
         XCTAssertEqual(second.accountLabel, "账号 B")

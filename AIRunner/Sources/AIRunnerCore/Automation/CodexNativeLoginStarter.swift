@@ -69,18 +69,58 @@ public struct CodexNativeLoginStarter: CodexNativeLoginStarting {
         try? await Task.sleep(for: .seconds(1))
 
         // 切换前台应用后重新读取控件，不能复用之前的 AX 句柄。
-        let initialRoot = AXUIElementCreateApplication(codex.processIdentifier)
-        let initialControls = Self.loginControls(in: initialRoot)
+        var initialRoot = AXUIElementCreateApplication(codex.processIdentifier)
+        var initialControls = Self.loginControls(in: initialRoot)
         if initialControls.count > 1 {
             throw CodexBrowserOAuthError.codexLoginControlAmbiguous
         }
-        guard let initialControl = initialControls.first else {
+        guard var initialControl = initialControls.first else {
             throw CodexBrowserOAuthError.codexLoginControlNotFound
         }
-        // Codex 的 Electron 登录按钮会出现 AXPress 返回 success、网页却未收到
-        // 事件的情况。这里先用已确认控件的真实中心点点击，再以 AXPress 兜底。
-        guard CodexLoginAutomator.clickCenter(initialControl)
-                || CodexLoginAutomator.press(initialControl) else {
+
+        // Codex 可能同时保留主界面和独立登录窗口。仅激活应用不能保证登录窗口
+        // 位于 Chrome 前面；必须提升包含按钮的真实 AXWindow 并设为主窗口。
+        guard Self.focusWindow(containing: initialControl, application: codex) else {
+            throw CodexBrowserOAuthError.codexLoginWindowFocusFailed
+        }
+        let activationDeadline = Date().addingTimeInterval(5)
+        while !codex.isActive, Date() < activationDeadline {
+            try Task.checkCancellation()
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        guard codex.isActive else {
+            throw CodexBrowserOAuthError.codexLoginWindowFocusFailed
+        }
+
+        // 窗口提升后重新读取一次 AXFrame。先尝试标准 AXPress；如果 Electron
+        // 仍把它当作“成功但无反应”，半秒后再对同一个实时按钮做完整鼠标点击。
+        initialRoot = AXUIElementCreateApplication(codex.processIdentifier)
+        initialControls = Self.loginControls(in: initialRoot)
+        if initialControls.count > 1 {
+            throw CodexBrowserOAuthError.codexLoginControlAmbiguous
+        }
+        guard let refreshedControl = initialControls.first else {
+            throw CodexBrowserOAuthError.codexLoginControlNotFound
+        }
+        initialControl = refreshedControl
+        let didPress = CodexLoginAutomator.press(initialControl)
+        try? await Task.sleep(for: .milliseconds(500))
+
+        let afterPressRoot = AXUIElementCreateApplication(codex.processIdentifier)
+        let controlsAfterPress = Self.loginControls(in: afterPressRoot)
+        if controlsAfterPress.count > 1 {
+            throw CodexBrowserOAuthError.codexLoginControlAmbiguous
+        }
+        let didClick: Bool
+        if let controlAfterPress = controlsAfterPress.first {
+            guard Self.focusWindow(containing: controlAfterPress, application: codex) else {
+                throw CodexBrowserOAuthError.codexLoginWindowFocusFailed
+            }
+            didClick = CodexLoginAutomator.clickCenter(controlAfterPress)
+        } else {
+            didClick = false // AXPress 已使按钮消失，视为成功推进。
+        }
+        guard didPress || didClick || controlsAfterPress.isEmpty else {
             throw CodexBrowserOAuthError.codexLoginControlPressFailed
         }
 
@@ -103,9 +143,8 @@ public struct CodexNativeLoginStarter: CodexNativeLoginStarting {
                     Date().timeIntervalSince(clickedAt) >= 10 {
                     // 某些 Codex 版本的 AXPress 会返回成功但网页没有收到事件。
                     // 按用户可见控件中心补点一次，之后继续按秒扫描，避免重复点击。
-                    _ = codex.activate(options: [.activateAllWindows])
-                    guard CodexLoginAutomator.clickCenter(control)
-                            || CodexLoginAutomator.press(control) else {
+                    guard Self.focusWindow(containing: control, application: codex),
+                          CodexLoginAutomator.clickCenter(control) else {
                         throw CodexBrowserOAuthError.codexLoginControlPressFailed
                     }
                     retriedWithCenterClick = true
@@ -122,6 +161,42 @@ public struct CodexNativeLoginStarter: CodexNativeLoginStarting {
         // 按钮消失后 OAuth 页面仍可能在创建中；给 Chrome 10 秒完成首次路由，
         // 再交给浏览器自动机扫描授权站点。
         try? await Task.sleep(for: .seconds(10))
+    }
+
+    /// 把登录控件所属窗口提升为 Codex 主窗口，避免坐标点击落到刚刚准备好的
+    /// Chrome Profile 窗口。只操作从精确登录控件向上找到的 AXWindow。
+    private static func focusWindow(
+        containing element: AXUIElement,
+        application: NSRunningApplication
+    ) -> Bool {
+        var current = element
+        var window: AXUIElement?
+        for _ in 0..<50 {
+            if CodexLoginAutomator.role(of: current) == kAXWindowRole {
+                window = current
+                break
+            }
+            guard let rawParent = CodexLoginAutomator.rawAttribute(
+                current, kAXParentAttribute
+            ) else { break }
+            current = unsafeDowncast(rawParent, to: AXUIElement.self)
+        }
+        guard let window else { return false }
+
+        let root = AXUIElementCreateApplication(application.processIdentifier)
+        _ = AXUIElementSetAttributeValue(
+            root, kAXFrontmostAttribute as CFString, kCFBooleanTrue
+        )
+        _ = application.activate(options: [.activateAllWindows])
+        _ = AXUIElementSetAttributeValue(
+            window, kAXMainAttribute as CFString, kCFBooleanTrue
+        )
+        _ = AXUIElementSetAttributeValue(
+            window, kAXFocusedAttribute as CFString, kCFBooleanTrue
+        )
+        return AXUIElementPerformAction(
+            window, kAXRaiseAction as CFString
+        ) == .success
     }
 
     static func isChatGPTLoginControl(role: String, text: String) -> Bool {
