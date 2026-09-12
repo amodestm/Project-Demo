@@ -1027,7 +1027,11 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
             return false
         }
         down.post(tap: .cghidEventTap)
+        // CGEvent 投递是异步的。立即发送 mouseUp 并移回鼠标时，Electron 偶尔
+        // 只收到一次移动而没有形成完整点击。保留短暂、接近真人的按下时间。
+        Thread.sleep(forTimeInterval: 0.06)
         up.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.10)
         if let previous,
            let restore = CGEvent(
                mouseEventSource: nil,

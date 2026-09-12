@@ -50,7 +50,6 @@ final class ChatGPTAccountSwitchTests: XCTestCase {
         let authenticator = CodexBrowserOAuthAuthenticator(
             executableURL: executable,
             timeout: 2,
-            relaunchCodexApplication: false,
             browserAutomation: ImmediateOAuthBrowserAutomation(),
             nativeLogout: RecordingNativeLogout(recorder: recorder),
             nativeLogin: RecordingNativeLogin(recorder: recorder)

@@ -17,6 +17,11 @@ public enum CodexAutomationError: Error, Sendable, Equatable {
     case targetVerificationFailed(String)
 
     case threadAlreadyRunning
+    case modelControlNotFound
+    case modelOptionNotFound(String)
+    case reasoningOptionNotFound(String)
+    case modelSelectionAmbiguous(label: String, count: Int)
+    case modelSelectionFailed(expected: String, actual: String?)
     case composerNotFound
     case composerNotEditable
     case composerFocusFailed
@@ -49,6 +54,16 @@ public enum CodexAutomationError: Error, Sendable, Equatable {
             return "目标验证未通过: \(detail)"
         case .threadAlreadyRunning:
             return "目标线程正在生成中, 不发送「继续」。"
+        case .modelControlNotFound:
+            return "找不到 Codex 模型选择器。"
+        case .modelOptionNotFound(let model):
+            return "模型列表中找不到「\(model)」。"
+        case .reasoningOptionNotFound(let effort):
+            return "思考程度列表中找不到「\(effort)」。"
+        case .modelSelectionAmbiguous(let label, let count):
+            return "模型菜单中匹配到 \(count) 个「\(label)」选项, 无法唯一确定。"
+        case .modelSelectionFailed(let expected, let actual):
+            return "模型设置校验失败 (期望「\(expected)」, 实际「\(actual ?? "无法读取")」)。"
         case .composerNotFound:
             return "找不到消息输入框。"
         case .composerNotEditable:
@@ -86,6 +101,11 @@ public enum CodexAutomationError: Error, Sendable, Equatable {
         case .ambiguousTarget:                 return "TARGET_AMBIGUOUS"
         case .targetVerificationFailed:        return "TARGET_VERIFICATION_FAILED"
         case .threadAlreadyRunning:            return "THREAD_ALREADY_RUNNING"
+        case .modelControlNotFound:             return "MODEL_CONTROL_NOT_FOUND"
+        case .modelOptionNotFound:              return "MODEL_OPTION_NOT_FOUND"
+        case .reasoningOptionNotFound:          return "REASONING_OPTION_NOT_FOUND"
+        case .modelSelectionAmbiguous:          return "MODEL_SELECTION_AMBIGUOUS"
+        case .modelSelectionFailed:             return "MODEL_SELECTION_FAILED"
         case .composerNotFound:                return "COMPOSER_NOT_FOUND"
         case .composerNotEditable:             return "COMPOSER_NOT_EDITABLE"
         case .composerFocusFailed:             return "COMPOSER_FOCUS_FAILED"
@@ -237,6 +257,15 @@ public protocol CodexUIAutomationDriving: Sendable {
     /// 读取 Codex 当前窗口的额度耗尽 / 登录失效 / 任务停止信号。
     /// 没有稳定信号时返回 nil；调用方必须等待，不能猜测并切号。
     func detectAccountIssue(_ app: CodexAppHandle) async throws -> CodexAccountIssue?
+
+    /// 设置模型与思考程度，并回读模型按钮确认最终状态。
+    func applyExecutionPreference(
+        _ preference: CodexExecutionPreference,
+        in app: CodexAppHandle
+    ) async throws -> CodexExecutionSelection
+
+    /// 只读当前模型按钮状态；Dry Run 使用，不改变任何设置。
+    func readExecutionSelection(_ app: CodexAppHandle) async throws -> CodexExecutionSelection
 
     func locateComposer(_ app: CodexAppHandle) async throws -> CodexComposerHandle
     func focusComposer(_ composer: CodexComposerHandle, in app: CodexAppHandle) async throws

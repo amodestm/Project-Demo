@@ -13,10 +13,10 @@ public enum CodexBrowserOAuthError: Error, LocalizedError, Sendable, Equatable {
     case browserOpenFailed
     case loginTimedOut
     case loginNotConfirmed
-    case codexRelaunchFailed
     case accessibilityPermissionMissing
     case codexLoginControlNotFound
     case codexLoginControlAmbiguous
+    case codexLoginWindowFocusFailed
     case codexLoginControlPressFailed
     case codexLoginControlDidNotDismiss
     case profileNotLoggedIn(String)
@@ -43,14 +43,14 @@ public enum CodexBrowserOAuthError: Error, LocalizedError, Sendable, Equatable {
             return "Codex 浏览器授权在规定时间内没有完成。请检查目标 Profile 的 ChatGPT 登录状态。"
         case .loginNotConfirmed:
             return "浏览器授权结束，但 Codex 没有确认登录成功。"
-        case .codexRelaunchFailed:
-            return "账号已授权，但 Codex 未能自动重新打开。请手动重新打开 Codex。"
         case .accessibilityPermissionMissing:
             return "AIRunner 缺少辅助功能权限，无法操作 Codex 登录入口。"
         case .codexLoginControlNotFound:
             return "Codex 已退出账号，但没有找到“使用 ChatGPT 账号登录”入口。"
         case .codexLoginControlAmbiguous:
             return "Codex 登录界面出现多个“使用 ChatGPT 账号登录”候选，已停止以避免误点。"
+        case .codexLoginWindowFocusFailed:
+            return "已经找到 Codex 的“继续登录”，但无法把它所在的登录窗口切到前台，因此没有点击。"
         case .codexLoginControlPressFailed:
             return "已经找到 Codex 的“使用 ChatGPT 账号登录”，但没有成功按下。"
         case .codexLoginControlDidNotDismiss:
@@ -86,7 +86,6 @@ public actor CodexBrowserOAuthAuthenticator: CodexBrowserOAuthAuthenticating {
     private let executableURL: URL
     private let timeout: TimeInterval
     private let environment: [String: String]?
-    private let relaunchCodexApplication: Bool
     private let browserAutomation: any CodexOAuthBrowserAutomating
     private let nativeLogout: any CodexNativeLogoutConfirming
     private let nativeLogin: any CodexNativeLoginStarting
@@ -98,7 +97,6 @@ public actor CodexBrowserOAuthAuthenticator: CodexBrowserOAuthAuthenticating {
         profiles: ChromeProfileScanner = ChromeProfileScanner(),
         timeout: TimeInterval = 180,
         environment: [String: String]? = nil,
-        relaunchCodexApplication: Bool = true,
         browserAutomation: any CodexOAuthBrowserAutomating = CodexOAuthBrowserAutomator(),
         nativeLogout: (any CodexNativeLogoutConfirming)? = nil,
         nativeLogin: (any CodexNativeLoginStarting)? = nil
@@ -106,7 +104,6 @@ public actor CodexBrowserOAuthAuthenticator: CodexBrowserOAuthAuthenticating {
         self.executableURL = executableURL
         self.timeout = timeout
         self.environment = environment
-        self.relaunchCodexApplication = relaunchCodexApplication
         self.browserAutomation = browserAutomation
         self.nativeLogout = nativeLogout ?? CodexNativeLogoutConfirmer()
         self.nativeLogin = nativeLogin ?? CodexNativeLoginStarter(profiles: profiles)
@@ -145,8 +142,13 @@ public actor CodexBrowserOAuthAuthenticator: CodexBrowserOAuthAuthenticating {
             throw CodexBrowserOAuthError.loginNotConfirmed
         }
 
-        if relaunchCodexApplication {
-            try await relaunchCodex()
+        // OAuth 回调会直接恢复当前 Codex 进程的登录状态。此时终止并重启桌面
+        // 应用会触发“退出 ChatGPT？”保护弹窗，并中断本地聊天与计划任务。
+        // 登录成功后只把现有窗口带回前台，不关闭或重启 Codex。
+        if let codex = NSRunningApplication.runningApplications(
+            withBundleIdentifier: "com.openai.codex"
+        ).first(where: { !$0.isTerminated }) {
+            _ = codex.activate(options: [.activateAllWindows])
         }
     }
 
@@ -159,34 +161,6 @@ public actor CodexBrowserOAuthAuthenticator: CodexBrowserOAuthAuthenticating {
             try? await Task.sleep(for: .milliseconds(500))
         }
         throw CodexBrowserOAuthError.loginTimedOut
-    }
-
-    private func relaunchCodex() async throws {
-        let applications = NSRunningApplication.runningApplications(
-            withBundleIdentifier: "com.openai.codex"
-        )
-        for application in applications {
-            _ = application.terminate()
-        }
-
-        let deadline = Date().addingTimeInterval(12)
-        while Date() < deadline,
-              NSRunningApplication.runningApplications(
-                withBundleIdentifier: "com.openai.codex"
-              ).contains(where: { !$0.isTerminated }) {
-            try? await Task.sleep(for: .milliseconds(250))
-        }
-
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        do {
-            _ = try await NSWorkspace.shared.openApplication(
-                at: URL(fileURLWithPath: "/Applications/ChatGPT.app"),
-                configuration: configuration
-            )
-        } catch {
-            throw CodexBrowserOAuthError.codexRelaunchFailed
-        }
     }
 
     private func runAndCapture(
