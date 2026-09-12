@@ -45,6 +45,14 @@ final class AccountRotationTests: XCTestCase {
         XCTAssertEqual(Self.next("Deleted", pool), "Default")
     }
 
+    func testOAuthCandidatesWrapFromPreferredProfile() {
+        let pool = [profile("Default"), profile("Profile 1"), profile("Profile 2")]
+        let candidates = AccountRotationManager.oauthCandidates(
+            startingWith: profile("Profile 1"), in: pool
+        )
+        XCTAssertEqual(candidates.map(\.directoryName), ["Profile 1", "Profile 2", "Default"])
+    }
+
     private static func next(_ current: String?, _ pool: [ChromeProfile]) -> String? {
         AccountRotationManager.nextProfile(after: current, in: pool)?.directoryName
     }
@@ -233,7 +241,9 @@ final class AccountRotationTests: XCTestCase {
             logger: services.logger,
             settings: { configuredSettings },
             codexBrowserOAuth: oauth,
-            settleDelay: .seconds(0)
+            settleDelay: .seconds(0),
+            loadSettingsTestProfileDirectory: { nil },
+            saveSettingsTestProfileDirectory: { _ in }
         )
 
         let first = try await manager.testCodexBrowserOAuthRotation()

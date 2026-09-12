@@ -68,9 +68,10 @@ public struct CodexDriverConfiguration: Sendable, Equatable {
     public var accountIssueTailLimit: Int = 16
 
     /// 单次 AX 遍历的节点预算。
-    public var traversalNodeBudget: Int = 6000
+    public var traversalNodeBudget: Int = 20_000
     /// 单次 AX 遍历的深度上限。
-    public var traversalMaxDepth: Int = 14
+    /// Codex 152 的正文控件位于窗口树约 25-30 层，低于这个深度只能看到菜单和外壳。
+    public var traversalMaxDepth: Int = 40
 
     public init() {}
     public static let `default` = CodexDriverConfiguration()
@@ -165,13 +166,14 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
     ) async throws -> [CodexThreadCandidate] {
 
         let root = AXUIElementCreateApplication(app.processIdentifier)
+        let surface = focusedWindow(of: root) ?? root
         var budget = configuration.traversalNodeBudget
 
         // 先在容器 role 下找行, 找不到再退回到全局遍历。
         var rows: [AXUIElement] = []
         for containerRole in configuration.threadContainerRoles {
             rows = collectElements(
-                in: root, matching: configuration.threadRowRoles,
+                in: surface, matching: configuration.threadRowRoles,
                 maxDepth: configuration.traversalMaxDepth, budget: &budget,
                 containerRole: containerRole
             )
@@ -180,7 +182,7 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
         if rows.isEmpty {
             budget = configuration.traversalNodeBudget
             rows = collectElements(
-                in: root, matching: configuration.threadRowRoles,
+                in: surface, matching: configuration.threadRowRoles,
                 maxDepth: configuration.traversalMaxDepth, budget: &budget,
                 containerRole: nil
             )
@@ -202,10 +204,11 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
 
     public func openThread(_ candidate: CodexThreadCandidate, in app: CodexAppHandle) async throws {
         let root = AXUIElementCreateApplication(app.processIdentifier)
+        let surface = focusedWindow(of: root) ?? root
         var budget = configuration.traversalNodeBudget
 
         let rows = collectElements(
-            in: root, matching: configuration.threadRowRoles,
+            in: surface, matching: configuration.threadRowRoles,
             maxDepth: configuration.traversalMaxDepth, budget: &budget,
             containerRole: nil
         )
@@ -234,7 +237,8 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
         // 第一个标题类文本作为候选 —— 无法可靠读到时如实返回 nil,
         // 由 matcher 判定为"缺少第二个信号"从而拒绝发送。
         let root = AXUIElementCreateApplication(app.processIdentifier)
-        let texts = allTexts(of: root, maxDepth: configuration.traversalMaxDepth)
+        let surface = focusedWindow(of: root) ?? root
+        let texts = allTexts(of: surface, maxDepth: configuration.traversalMaxDepth)
 
         guard let first = texts.first, !first.isEmpty else {
             return CodexOpenThreadContext()
@@ -247,7 +251,7 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
     public func detectBusyState(_ app: CodexAppHandle) async throws -> CodexBusyState {
         let root = AXUIElementCreateApplication(app.processIdentifier)
         let surface = focusedWindow(of: root) ?? root
-        let texts = Set(allTexts(of: surface, maxDepth: min(configuration.traversalMaxDepth, 10)))
+        let texts = Set(allTexts(of: surface, maxDepth: configuration.traversalMaxDepth))
 
         for indicator in configuration.busyIndicators {
             if texts.contains(indicator) { return .generating }
@@ -271,7 +275,7 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
         return targets.contains { surface in
             let texts = Set(allTexts(
                 of: surface,
-                maxDepth: min(configuration.traversalMaxDepth, 10)
+                maxDepth: configuration.traversalMaxDepth
             ))
             return !texts.isDisjoint(with: generationIndicators)
         }
@@ -348,12 +352,14 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
 
     public func locateComposer(_ app: CodexAppHandle) async throws -> CodexComposerHandle {
         let root = AXUIElementCreateApplication(app.processIdentifier)
-        var budget = configuration.traversalNodeBudget
-        let candidates = collectElements(
-            in: root, matching: configuration.composerRoles,
-            maxDepth: configuration.traversalMaxDepth, budget: &budget,
-            containerRole: nil
-        )
+        let candidates = contentSurfaces(of: root).flatMap { surface in
+            var budget = configuration.traversalNodeBudget
+            return collectElements(
+                in: surface, matching: configuration.composerRoles,
+                maxDepth: configuration.traversalMaxDepth, budget: &budget,
+                containerRole: nil
+            )
+        }
 
         // 排除搜索框 / 命令面板
         let usable = candidates.filter { element in
@@ -453,12 +459,14 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
 
     public func locateSendControl(_ app: CodexAppHandle) async throws -> CodexSendControlHandle {
         let root = AXUIElementCreateApplication(app.processIdentifier)
-        var budget = configuration.traversalNodeBudget
-        let buttons = collectElements(
-            in: root, matching: ["AXButton"],
-            maxDepth: configuration.traversalMaxDepth, budget: &budget,
-            containerRole: nil
-        )
+        let buttons = contentSurfaces(of: root).flatMap { surface in
+            var budget = configuration.traversalNodeBudget
+            return collectElements(
+                in: surface, matching: ["AXButton"],
+                maxDepth: configuration.traversalMaxDepth, budget: &budget,
+                containerRole: nil
+            )
+        }
 
         for button in buttons {
             let title = string(button, kAXTitleAttribute)
@@ -491,12 +499,14 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
         in app: CodexAppHandle
     ) async throws {
         let root = AXUIElementCreateApplication(app.processIdentifier)
-        var budget = configuration.traversalNodeBudget
-        let buttons = collectElements(
-            in: root, matching: ["AXButton"],
-            maxDepth: configuration.traversalMaxDepth, budget: &budget,
-            containerRole: nil
-        )
+        let buttons = contentSurfaces(of: root).flatMap { surface in
+            var budget = configuration.traversalNodeBudget
+            return collectElements(
+                in: surface, matching: ["AXButton"],
+                maxDepth: configuration.traversalMaxDepth, budget: &budget,
+                containerRole: nil
+            )
+        }
         let match = buttons.first { button in
             let identifier = string(button, kAXIdentifierAttribute)
             let title = string(button, kAXTitleAttribute)
@@ -556,12 +566,14 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
         _ app: CodexAppHandle
     ) -> AXUIElement? {
         let root = AXUIElementCreateApplication(app.processIdentifier)
-        var budget = configuration.traversalNodeBudget
-        let candidates = collectElements(
-            in: root, matching: configuration.composerRoles,
-            maxDepth: configuration.traversalMaxDepth, budget: &budget,
-            containerRole: nil
-        )
+        let candidates = contentSurfaces(of: root).flatMap { surface in
+            var budget = configuration.traversalNodeBudget
+            return collectElements(
+                in: surface, matching: configuration.composerRoles,
+                maxDepth: configuration.traversalMaxDepth, budget: &budget,
+                containerRole: nil
+            )
+        }
         return candidates.first {
             (string($0, kAXIdentifierAttribute) ?? "composer") == composer.identifier
         }
@@ -691,7 +703,11 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
 
     private func allTexts(of element: AXUIElement, maxDepth: Int) -> [String] {
         var result: [String] = []
-        collectTexts(element, depth: 0, maxDepth: maxDepth, into: &result)
+        var budget = configuration.traversalNodeBudget
+        collectTexts(
+            element, depth: 0, maxDepth: maxDepth,
+            budget: &budget, into: &result
+        )
         return result
     }
 
@@ -699,9 +715,11 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
         _ element: AXUIElement,
         depth: Int,
         maxDepth: Int,
+        budget: inout Int,
         into result: inout [String]
     ) {
-        guard depth <= maxDepth else { return }
+        guard depth <= maxDepth, budget > 0 else { return }
+        budget -= 1
 
         if let title = string(element, kAXTitleAttribute), !title.isEmpty {
             result.append(title)
@@ -719,7 +737,10 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
         )
         guard status == .success, let children = raw as? [AXUIElement] else { return }
         for child in children {
-            collectTexts(child, depth: depth + 1, maxDepth: maxDepth, into: &result)
+            collectTexts(
+                child, depth: depth + 1, maxDepth: maxDepth,
+                budget: &budget, into: &result
+            )
         }
     }
 
@@ -738,6 +759,15 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
         )
         guard status == .success, let windows = raw as? [AXUIElement] else { return [] }
         return windows
+    }
+
+    /// Electron 的 Codex 窗口通过 AXWindows 暴露，通常不在 AXApplication 的
+    /// 普通 AXChildren 中。正文控件必须从窗口根节点遍历；拿不到窗口时才回退应用根。
+    private func contentSurfaces(of appElement: AXUIElement) -> [AXUIElement] {
+        let appWindows = windows(of: appElement)
+        guard !appWindows.isEmpty else { return [appElement] }
+        guard let focused = focusedWindow(of: appElement) else { return appWindows }
+        return [focused] + appWindows.filter { !CFEqual($0, focused) }
     }
 
     private func focusedWindow(of appElement: AXUIElement) -> AXUIElement? {

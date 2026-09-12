@@ -85,21 +85,17 @@ public actor CodexOAuthBrowserAutomator: CodexOAuthBrowserAutomating {
         }
 
         let root = AXUIElementCreateApplication(chrome.processIdentifier)
-        let windows = Self.elements(in: root, attribute: kAXWindowsAttribute)
+        let windows = Self.orderedWindows(in: root)
 
-        // Chrome 把最近打开并保持在前台的窗口放在 AXWindows 首部。
-        // 一次 OAuth 只允许驱动这一个官方授权窗口；如果它正在加载，
-        // 直接等待，不能继续扫描其他 Profile 遗留的旧授权页。
-        guard let window = windows.first(where: { window in
-            guard let document = CodexLoginAutomator.stringAttribute(
-                window, kAXDocumentAttribute
-            ), let url = URL(string: document), url.scheme == "https",
-            url.host?.lowercased() == "auth.openai.com" else {
-                return false
-            }
-            return true
-        }), let document = CodexLoginAutomator.stringAttribute(window, kAXDocumentAttribute),
-        let url = URL(string: document) else {
+        // 一次 OAuth 只允许驱动当前真正获得焦点的官方授权窗口；如果它正在
+        // 加载，直接等待，不能继续扫描其他 Profile 遗留的旧授权页。
+        // 只接受 Chrome 当前窗口。继续扫描其他窗口会在目标 Profile 尚在加载时
+        // 接管另一个 Profile 遗留的授权页，造成看似“没有切换 Profile”。
+        guard let window = windows.first,
+              let document = CodexLoginAutomator.stringAttribute(
+                  window, kAXDocumentAttribute
+              ), let url = URL(string: document), url.scheme == "https",
+              url.host?.lowercased() == "auth.openai.com" else {
             return false
         }
 
@@ -178,6 +174,9 @@ public actor CodexOAuthBrowserAutomator: CodexOAuthBrowserAutomating {
                 pressedActions.remove(actionKey)
                 throw CodexOAuthBrowserAutomationError.controlPressFailed
             }
+            // 账号选择和授权确认点击后页面会异步跳转；等待 10 秒再进行下一次
+            // 窗口扫描，避免把临时空白/旧 URL 当成目标页面。
+            try? await Task.sleep(for: .seconds(10))
             return true
         }
     }
@@ -284,6 +283,24 @@ public actor CodexOAuthBrowserAutomator: CodexOAuthBrowserAutomating {
         let status = AXUIElementCopyAttributeValue(element, attribute as CFString, &raw)
         guard status == .success, let result = raw as? [AXUIElement] else { return [] }
         return result
+    }
+
+    /// 优先返回 Chrome 当前真正获得焦点的窗口。
+    ///
+    /// 多个 Profile 可能同时留有旧的 OAuth 页；仅依赖 `AXWindows` 的数组顺序
+    /// 会把上一次失败的授权页当成这一次的目标。Codex 点击“继续登录”前已将
+    /// 目标 Profile 置为最近窗口，因此这里先取 focused window，再回退到其他窗口。
+    private static func orderedWindows(in root: AXUIElement) -> [AXUIElement] {
+        let windows = elements(in: root, attribute: kAXWindowsAttribute)
+        guard !windows.isEmpty else { return [] }
+        var rawFocused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            root, kAXFocusedWindowAttribute as CFString, &rawFocused
+        ) == .success, let rawFocused else {
+            return windows
+        }
+        let focused = unsafeDowncast(rawFocused, to: AXUIElement.self)
+        return [focused] + windows.filter { !CFEqual($0, focused) }
     }
 
     private static func boolAttribute(_ element: AXUIElement, _ name: String) -> Bool? {

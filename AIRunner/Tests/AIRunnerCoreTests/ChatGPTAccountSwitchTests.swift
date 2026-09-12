@@ -67,6 +67,9 @@ final class ChatGPTAccountSwitchTests: XCTestCase {
 
     func testNativeCodexLoginMatcherAcceptsObservedAccountLabels() {
         XCTAssertTrue(CodexNativeLoginStarter.isChatGPTLoginControl(
+            role: "AXButton", text: "继续登录"
+        ))
+        XCTAssertTrue(CodexNativeLoginStarter.isChatGPTLoginControl(
             role: "AXButton", text: "使用 ChatGPT 账号进行登录"
         ))
         XCTAssertTrue(CodexNativeLoginStarter.isChatGPTLoginControl(
@@ -99,6 +102,31 @@ final class ChatGPTAccountSwitchTests: XCTestCase {
 
         let usedProfiles = await starter.usedProfiles
         XCTAssertEqual(usedProfiles, [profile])
+    }
+
+    func testChromeProfileProbeURLUsesLocalPageAndKeepsMarker() throws {
+        let marker = "airunner-(UUID().uuidString.lowercased())"
+        let url = try XCTUnwrap(
+            ChromeProfileScanner.profileProbeURL(marker: marker)
+        )
+
+        XCTAssertTrue(url.isFileURL)
+        XCTAssertNil(url.host)
+        XCTAssertEqual(
+            URLComponents(url: url, resolvingAgainstBaseURL: false)?.fragment,
+            "airunner_profile_probe=\(marker)"
+        )
+    }
+
+    func testOAuthErrorsIdentifyTheProfileOrStalledLoginEntry() {
+        let profileMessage = CodexBrowserOAuthError
+            .profileNotLoggedIn("测试账号 (Profile 2)").errorDescription ?? ""
+        XCTAssertTrue(profileMessage.contains("测试账号 (Profile 2)"))
+
+        let stalledMessage = CodexBrowserOAuthError
+            .codexLoginControlDidNotDismiss.errorDescription ?? ""
+        XCTAssertTrue(stalledMessage.contains("30 秒"))
+        XCTAssertTrue(stalledMessage.contains("未继续路由"))
     }
 
     func testPasswordLoginMethodHintsCoverOpenAIOTPFallback() {

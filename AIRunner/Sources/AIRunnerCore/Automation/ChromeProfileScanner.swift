@@ -133,6 +133,105 @@ public struct ChromeProfileScanner: Sendable {
 
     // MARK: - 打开
 
+    /// 为一次 Codex 登录准备一个可追踪的目标窗口。
+    ///
+    /// 仅仅调用 `activate()` 只能把 Chrome 置于前台，不能保证前台的窗口属于
+    /// 传入的 profile。这里打开一个本地准备页，把一次性标记放进 URL，并在
+    /// Accessibility 窗口树中找到包含该标记的窗口后再返回。准备页不访问
+    /// ChatGPT，避免在真正点击 Codex 登录入口前制造普通 chatgpt.com 页面。
+    @discardableResult
+    public func openTrackedProfileWindow(
+        profile: ChromeProfile,
+        kind: ChromeKind = .chrome,
+        timeout: TimeInterval = 30
+    ) async -> String? {
+        let marker = UUID().uuidString.lowercased()
+        guard let url = Self.profileProbeURL(marker: marker),
+              Self.writeProfileProbePage(for: url),
+              open(url: url, profile: profile, kind: kind, newWindow: true),
+              await focusProfileWindow(marker: marker, kind: kind, timeout: timeout)
+        else {
+            return nil
+        }
+        return marker
+    }
+
+    /// 找到带有一次性标记的 Chrome 窗口并将它提升到前台。
+    ///
+    /// 返回 `false` 通常表示辅助功能权限不足、浏览器没有按指定 profile
+    /// 建立窗口，或页面尚未完成导航。调用方应把它当作“不能安全继续”处理。
+    public func focusProfileWindow(
+        marker: String,
+        kind: ChromeKind = .chrome,
+        timeout: TimeInterval = 30
+    ) async -> Bool {
+        guard AXIsProcessTrusted() else { return false }
+        let deadline = Date().addingTimeInterval(timeout)
+
+        while Date() < deadline {
+            try? Task.checkCancellation()
+            guard let application = NSRunningApplication.runningApplications(
+                withBundleIdentifier: kind.rawValue
+            ).first(where: { !$0.isTerminated }) else {
+                try? await Task.sleep(for: .seconds(1))
+                continue
+            }
+
+            let root = AXUIElementCreateApplication(application.processIdentifier)
+            let windows = Self.axElements(in: root, attribute: kAXWindowsAttribute)
+            if let window = windows.first(where: { window in
+                guard let document = Self.axStringAttribute(
+                    window, name: kAXDocumentAttribute
+                ) else { return false }
+                return document.localizedCaseInsensitiveContains(marker)
+            }) {
+                _ = application.activate(options: [.activateAllWindows])
+                return AXUIElementPerformAction(window, kAXRaiseAction as CFString) == .success
+            }
+
+            try? await Task.sleep(for: .seconds(1))
+        }
+        return false
+    }
+
+    /// 构造不会联网、不会读取或携带账号信息的 Profile 准备页地址。
+    public static func profileProbeURL(marker: String) -> URL? {
+        let pageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIRunner-Codex-Login-Profile.html")
+        var components = URLComponents(
+            url: pageURL, resolvingAgainstBaseURL: false
+        )
+        components?.fragment = "airunner_profile_probe=\(marker)"
+        return components?.url
+    }
+
+    private static func writeProfileProbePage(for url: URL) -> Bool {
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.fragment = nil
+        guard let fileURL = components?.url else { return false }
+        let html = """
+        <!doctype html>
+        <html lang="zh-CN">
+        <meta charset="utf-8">
+        <meta name="color-scheme" content="dark light">
+        <title>AIRunner 正在准备 Codex 登录</title>
+        <style>
+          body { font-family: -apple-system, sans-serif; display: grid; place-items: center;
+                 min-height: 90vh; margin: 0; background: #171717; color: #f5f5f5; }
+          main { text-align: center; }
+          p { color: #aaa; }
+        </style>
+        <main><h2>正在准备 Codex 登录…</h2><p>AIRunner 已锁定这个 Chrome Profile</p></main>
+        </html>
+        """
+        do {
+            try html.write(to: fileURL, atomically: true, encoding: .utf8)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     /// 用指定 profile 打开一个 URL。
     ///
     /// 通过 `open -b <bundle-id> --args --profile-directory=<name>`。
@@ -281,5 +380,31 @@ public struct ChromeProfileScanner: Sendable {
             }
         }
         return nil
+    }
+
+    private static func axElements(
+        in element: AXUIElement,
+        attribute: String
+    ) -> [AXUIElement] {
+        var raw: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element, attribute as CFString, &raw
+        ) == .success, let result = raw as? [AXUIElement] else {
+            return []
+        }
+        return result
+    }
+
+    private static func axStringAttribute(
+        _ element: AXUIElement,
+        name: String
+    ) -> String? {
+        var raw: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element, name as CFString, &raw
+        ) == .success else {
+            return nil
+        }
+        return raw as? String
     }
 }

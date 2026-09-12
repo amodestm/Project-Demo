@@ -12,11 +12,12 @@ macOS 上的 **AI 长任务自动执行器**。把一个跑几小时甚至几天
 - Codex Existing Thread 可选通道已完成：基于 macOS Accessibility API 定位和唯一性验证线程，支持 Test Locate、Dry Run、Resume、冷却、跨进程租约，以及认证后的自动恢复监视。
 - 新建任务只保存为“排队中”，不会自动执行、登录或打开网页；用户从任务详情点击“开始执行”后才进入执行链。
 - Codex 运行中自动交接已接入：只检查当前焦点窗口末尾 16 条有效 AX 文本里的额度耗尽、登录失效和任务停止信号；只有任务已停止生成、页面空闲（或明确显示已停止）并连续确认两次后，才进入账号轮换。轮换完成后旧错误保持锁定，直到它从最新输出消失，避免重复切号。
-- Chrome Profile + Codex 官方浏览器 OAuth 账号轮换已完成：AIRunner 从 Codex 原生应用菜单发起“注销”，精确识别并按下“退出登录？”确认框，再在登录界面按下“使用 ChatGPT/GPT 账号登录”；官方授权随后在目标 Chrome Profile 中继续，自动完成账号选择、授权继续和个人工作空间继续，确认登录后重启 Codex、定位原任务并从检查点续跑。不会读取、复制或注入网页 Cookie/session token。
-- 设置页提供独立的“一键测试安全退出并登录”：手动点击后先扫描全部 Codex 窗口并验证页面空闲，依次完成原生“注销”、退出确认和登录页验证；只有检测到 Codex 原生登录入口后才打开下一个 Profile，避免失败时留下空白浏览器窗口。该测试不创建或绑定任务，不修改检查点，也不发送“继续”；检测到任一窗口仍在生成或状态无法确认时，会在退出前拒绝。
+- Chrome Profile + Codex 官方浏览器 OAuth 账号轮换已完成：AIRunner 先点击 Codex 左下角“打开个人资料菜单”，再点击账号菜单里的“退出登录”，精确识别 Codex 当前的“要退出登录？”或兼容版本的“退出登录？”确认框并按下其中的退出按钮；如果 Chromium 对第一层菜单项或红色确认按钮报告虚假的 AXPress 成功，等待两秒后会重新读取对应控件的实时位置并补点一次。只有确认框消失且原生登录入口出现才算退出完成；确认按钮未生效与登录页加载失败会显示不同错误。找不到新版入口时才回退顶部应用菜单。退出完成后等待原生“继续登录”入口，扫描最多 30 秒且每秒扫描一次。点击前先为选定 Chrome Profile 创建带一次性标记的 ChatGPT 窗口，并通过辅助功能确认该窗口真实存在，再点击“继续登录”，避免 OAuth 被送入上一个账号的窗口；点击后继续按秒扫描 30 秒，10 秒仍未消失时只补一次控件中心点击，按钮消失后再等待 10 秒让 Chrome 完成路由。网页账号选择和授权“继续”点击后同样等待 10 秒再扫描，随后自动完成账号选择、授权继续和个人工作空间继续，确认登录后重启 Codex、定位原任务并从检查点续跑。不会读取、复制或注入网页 Cookie/session token。
+- 设置页提供独立的“一键测试安全退出并登录”：手动点击后先扫描全部 Codex 窗口并验证页面空闲，依次完成“打开个人资料菜单 → 退出登录 → 退出确认 → 登录页验证”；如果上一轮在“要退出登录？”确认框处中断，新一轮会直接接管该确认框，不要求用户先取消。只有检测到 Codex 原生登录入口后才打开下一个 Profile，避免失败时留下空白浏览器窗口。该测试不创建或绑定任务，不修改检查点，也不发送“继续”；检测到任一窗口仍在生成或状态无法确认时，会在退出前拒绝。
+- Codex 152 的正文控件位于很深的 Electron 窗口辅助功能树中。忙碌检测、Composer 定位、退出确认和退出后的登录入口现在都从 `AXWindows` 的完整窗口树读取，并使用受节点预算保护的 40 层遍历；不会再因为只读到菜单和窗口外壳而把空闲任务误报为“无法确认”。
 - 原钥匙串邮箱密码路线完整保留为回退；在设置中关闭 OAuth 开关即可继续使用，也可以直接运行旧版 App。
-- 当前自动化测试为 **228 个**；没有失败用例。
-- 两个 Release App 并存：旧路线 `dist/AIRunner.app` 保持 **1.3.2 / build 26**；新路线 `dist/AIRunner OAuth.app` 为 **1.5.5 / build 41**，使用独立应用名和 bundle id，不覆盖旧版。
+- 当前自动化测试为 **234 个**；没有失败用例。
+- 两个 Release App 并存：旧路线 `dist/AIRunner.app` 保持 **1.3.2 / build 26**；新路线 `dist/AIRunner OAuth.app` 为 **1.5.15 / build 51**，使用独立应用名和 bundle id，不覆盖旧版。
 
 Codex 的真实 UI 操作仍需在用户机器上授予 AIRunner「系统设置 → 隐私与安全性 → 辅助功能」权限后，用实际 Codex 窗口执行 Test Locate / Dry Run 验收。没有权限时程序会停止并报告原因，不会猜测目标或发送消息。
 
@@ -50,7 +51,7 @@ Codex 的真实 UI 操作仍需在用户机器上授予 AIRunner「系统设置 
 
 AIRunner 的核心能力就是**自动切换账号（零点击）+ 自动续跑**，但它遵守以下硬性边界：
 
-- ✅ **主动登录与切换账号**：用户点击开始或发生账号交接时，程序选择下一个 Chrome Profile，通过 Codex 原生“注销 → 退出登录确认”完成安全退出，再从“使用 ChatGPT/GPT 账号登录”入口进入官方浏览器授权，确认成功后重启 Codex 并恢复任务。
+- ✅ **主动登录与切换账号**：用户点击开始或发生账号交接时，程序选择下一个 Chrome Profile，通过 Codex“左下角个人资料菜单 → 退出登录 → 退出确认”完成安全退出，再从“使用 ChatGPT/GPT 账号登录”入口进入官方浏览器授权，确认成功后重启 Codex 并恢复任务。
 - ✅ **自动续跑**：中断、切号、App 被强杀后从检查点原地接上，绝不重复已完成步骤。
 - ❌ 不读取或导出浏览器 Cookie。
 - ✅ 旧版邮箱密码回退仍只把密码写入 macOS 钥匙串；任务、设置 JSON、数据库和日志只保存非敏感记录 ID/备注。
@@ -177,7 +178,7 @@ Sources/AIRunner/              # SwiftUI 壳
   App/AppState.swift
   UI/{ContentView, Tasks/*, Settings/*, Logs/*}
 
-Tests/AIRunnerCoreTests/       # 228 个测试（含 2 个真实辅助功能树探针）
+Tests/AIRunnerCoreTests/       # 230 个测试（含 2 个真实辅助功能树探针）
 Scripts/make_app.sh
 ```
 
@@ -265,7 +266,7 @@ App 启动时 `RecoveryManager.recover()` 处理三类残留：
 swift test --disable-sandbox
 ```
 
-**228 个测试，0 个失败。**（数字以 `swift test` 的实际输出为准）
+**230 个测试，0 个失败。**（数字以 `swift test` 的实际输出为准）
 
 | 测试文件 | 覆盖 |
 |---|---|
@@ -281,7 +282,7 @@ swift test --disable-sandbox
 | `ChatGPTAccountSwitchTests` (29) | 网页账号切换、原生 Codex 登录入口识别、创建只排队、显式启动后登录、原生退出先于登录、指针落盘与管理器编排 |
 | `CodexQuotaMonitorTests` (11) | 最新输出范围、连续确认、生成中拒绝退出、旧错误锁定和安全轮换门控 |
 | `CodexOAuthSafetyTesterTests` (5) | 设置页独立测试、全窗口生成中拒绝、当前窗口忙碌拒绝、状态不明 fail closed、空闲时允许 OAuth 闭环 |
-| `CodexNativeLogoutConfirmerTests` (4) | 原生注销菜单、确认框标题和确认按钮的中英文本精确匹配，以及正文误匹配拒绝 |
+| `CodexNativeLogoutConfirmerTests` (6) | 左下角个人资料菜单、账号菜单退出项、兼容注销菜单、确认框标题和确认按钮的中英文本精确匹配，以及正文误匹配拒绝 |
 | `CredentialRotationTests` (9) | 凭据轮换、跨任务全局下一账号、首次登录、OpenAI“登录其他账户”识别、失败时不推进账号指针 |
 | `AccountRotationTests` (14) | 历史 Chrome Profile 兼容层的轮换池、持久化指针、窗口前置失败降级，以及无任务记录的一键 OAuth 测试轮换 |
 | `CodexResumeLeaseTests` (9) | 跨进程 Resume 租约、过期锁显式恢复与并发互斥 |
@@ -368,7 +369,7 @@ AILR_TEST_VERBOSE=1 swift test --disable-sandbox --filter testScenarioC_crashRec
 | `Models/ExecutionMode.swift` | `chatgpt_web`（默认）/ `api` |
 | `Services/ClipboardService.swift` | `ClipboardServicing` + `BrowserLaunching` 协议与测试替身 |
 | `Sources/AIRunner/Platform/*` | AppKit 实现（`NSPasteboard` / `NSWorkspace`） |
-| `Automation/CodexUIAutomationDriver.swift` | 基于 AX 树的线程定位、Composer 输入、发送与确认观察；无法确认时 fail closed |
+| `Automation/CodexUIAutomationDriver.swift` | 从 Codex 的 `AXWindows` 深层窗口树定位线程、生成/空闲状态、Composer、发送与确认观察；无法确认时 fail closed |
 | `Automation/CodexResumeController.swift` | Test Locate / Dry Run / Resume 的统一安全门槛、冷却与租约 |
 | `Core/AccountHandoffResumeMonitor.swift` | 认证后轮询 Codex 可用性并自动恢复绑定线程 |
 | `Core/AccountRotationManager.swift` | 在显式选择的 Chrome Profile 间循环；OAuth 成功后才推进账号指针；旧钥匙串路线继续作为回退 |
