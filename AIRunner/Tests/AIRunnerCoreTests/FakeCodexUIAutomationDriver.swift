@@ -24,6 +24,9 @@ final class FakeCodexUIAutomationDriver: CodexUIAutomationDriving, @unchecked Se
         var candidates: [CodexThreadCandidate] = []
         var openContext = CodexOpenThreadContext()
         var busyState: CodexBusyState = .idle
+        var anyTaskGenerating = false
+        var accountIssue: CodexAccountIssue?
+        var taskStoppedSignal = false
 
         var composerAvailable = true
         var composerEditable = true
@@ -87,6 +90,21 @@ final class FakeCodexUIAutomationDriver: CodexUIAutomationDriving, @unchecked Se
     var busyState: CodexBusyState {
         get { read { $0.busyState } }
         set { mutate { $0.busyState = newValue } }
+    }
+
+    var anyTaskGenerating: Bool {
+        get { read { $0.anyTaskGenerating } }
+        set { mutate { $0.anyTaskGenerating = newValue } }
+    }
+
+    var accountIssue: CodexAccountIssue? {
+        get { read { $0.accountIssue } }
+        set { mutate { $0.accountIssue = newValue } }
+    }
+
+    var taskStoppedSignal: Bool {
+        get { read { $0.taskStoppedSignal } }
+        set { mutate { $0.taskStoppedSignal = newValue } }
     }
 
     var composerAvailable: Bool {
@@ -168,6 +186,8 @@ final class FakeCodexUIAutomationDriver: CodexUIAutomationDriving, @unchecked Se
                 repositoryPath: repo
             )
             $0.busyState = .idle
+            $0.accountIssue = nil
+            $0.taskStoppedSignal = false
             $0.composerAvailable = true
             $0.composerEditable = true
             $0.composerValue = nil
@@ -236,6 +256,18 @@ final class FakeCodexUIAutomationDriver: CodexUIAutomationDriving, @unchecked Se
 
     func detectBusyState(_ app: CodexAppHandle) async throws -> CodexBusyState {
         read { $0.busyState }
+    }
+
+    func detectAnyTaskGenerating(_ app: CodexAppHandle) async throws -> Bool {
+        read { $0.anyTaskGenerating || $0.busyState == .generating }
+    }
+
+    func detectTaskStopped(_ app: CodexAppHandle) async throws -> Bool {
+        read { $0.taskStoppedSignal || $0.accountIssue == .taskStopped }
+    }
+
+    func detectAccountIssue(_ app: CodexAppHandle) async throws -> CodexAccountIssue? {
+        read { $0.accountIssue }
     }
 
     func locateComposer(_ app: CodexAppHandle) async throws -> CodexComposerHandle {

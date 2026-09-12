@@ -10,9 +10,13 @@ macOS 上的 **AI 长任务自动执行器**。把一个跑几小时甚至几天
 - Swift 6 核心、SQLite 持久化、检查点、崩溃恢复、重试与路由已完成。
 - ChatGPT Web 主流程已完成：生成确定性的续跑 Prompt、通过 macOS 辅助功能(AX) API 自动提交并读回结果、校验后原子推进检查点（也可降级为剪贴板手工模式）。
 - Codex Existing Thread 可选通道已完成：基于 macOS Accessibility API 定位和唯一性验证线程，支持 Test Locate、Dry Run、Resume、冷却、跨进程租约，以及认证后的自动恢复监视。
-- ChatGPT 账号自动切换已完成：在同一浏览器已登录会话的 ChatGPT 账号菜单里，**由程序自动点击目标账号完成切换，无需人工点击**；程序只保存账号显示名，不读取 Cookie、Token 或密码。
-- 当前自动化测试为 **183 个**，其中 **181 个通过、2 个 AX 真机探针因未授予辅助功能权限而跳过**；没有失败用例。
-- Release App（当前版本 1.2.1 / build 5）已在 `dist/AIRunner.app` 组装、校验 Info.plist 并完成 ad-hoc 签名。
+- 新建任务只保存为“排队中”，不会自动执行、登录或打开网页；用户从任务详情点击“开始执行”后才进入执行链。
+- Codex 运行中自动交接已接入：只检查当前焦点窗口末尾 16 条有效 AX 文本里的额度耗尽、登录失效和任务停止信号；只有任务已停止生成、页面空闲（或明确显示已停止）并连续确认两次后，才进入账号轮换。轮换完成后旧错误保持锁定，直到它从最新输出消失，避免重复切号。
+- Chrome Profile + Codex 官方浏览器 OAuth 账号轮换已完成：AIRunner 从 Codex 原生应用菜单发起“注销”，精确识别并按下“退出登录？”确认框，再在登录界面按下“使用 ChatGPT/GPT 账号登录”；官方授权随后在目标 Chrome Profile 中继续，自动完成账号选择、授权继续和个人工作空间继续，确认登录后重启 Codex、定位原任务并从检查点续跑。不会读取、复制或注入网页 Cookie/session token。
+- 设置页提供独立的“一键测试安全退出并登录”：手动点击后先扫描全部 Codex 窗口并验证页面空闲，依次完成原生“注销”、退出确认和登录页验证；只有检测到 Codex 原生登录入口后才打开下一个 Profile，避免失败时留下空白浏览器窗口。该测试不创建或绑定任务，不修改检查点，也不发送“继续”；检测到任一窗口仍在生成或状态无法确认时，会在退出前拒绝。
+- 原钥匙串邮箱密码路线完整保留为回退；在设置中关闭 OAuth 开关即可继续使用，也可以直接运行旧版 App。
+- 当前自动化测试为 **228 个**；没有失败用例。
+- 两个 Release App 并存：旧路线 `dist/AIRunner.app` 保持 **1.3.2 / build 26**；新路线 `dist/AIRunner OAuth.app` 为 **1.5.5 / build 41**，使用独立应用名和 bundle id，不覆盖旧版。
 
 Codex 的真实 UI 操作仍需在用户机器上授予 AIRunner「系统设置 → 隐私与安全性 → 辅助功能」权限后，用实际 Codex 窗口执行 Test Locate / Dry Run 验收。没有权限时程序会停止并报告原因，不会猜测目标或发送消息。
 
@@ -30,10 +34,11 @@ Codex 的真实 UI 操作仍需在用户机器上授予 AIRunner「系统设置 
 
 | 程序负责（全自动） | 你只需 |
 |---|---|
-| 任务状态 / 已完成步骤 / 检查点 | 在浏览器里保持已登录的备用账号（首次登录由你完成） |
-| 生成自包含的续跑 prompt | 授予 AIRunner「系统设置 → 隐私与安全性 → 辅助功能」权限 |
+| 任务状态 / 已完成步骤 / 检查点 | 首次为每个账号建立一个 Chrome Profile，并分别登录 ChatGPT 网页端 |
+| 退出 Codex、在目标 Profile 完成官方授权、重启 Codex | 在设置中勾选至少两个 Profile |
+| 生成自包含的续跑 prompt | |
 | 通过 AX 自动提交 prompt、自动读回结果 | |
-| 触发额度/限流/卡死时自动切换账号 | |
+| 检测到额度/登录异常且任务已停止时自动切换账号 | |
 | 崩溃恢复 / 不重复已完成的工作 | |
 
 > **为什么走 macOS 辅助功能(AX) 而不是 Selenium/Playwright**：见下方「边界」。
@@ -45,22 +50,17 @@ Codex 的真实 UI 操作仍需在用户机器上授予 AIRunner「系统设置 
 
 AIRunner 的核心能力就是**自动切换账号（零点击）+ 自动续跑**，但它遵守以下硬性边界：
 
-- ✅ **自动切换账号**：当某账号触发额度 / 限流 / 卡死，程序通过 macOS 辅助功能(AX) API 在已登录会话的 ChatGPT 账号菜单里点击目标条目完成切换，**不需要任何人工点击**。
+- ✅ **主动登录与切换账号**：用户点击开始或发生账号交接时，程序选择下一个 Chrome Profile，通过 Codex 原生“注销 → 退出登录确认”完成安全退出，再从“使用 ChatGPT/GPT 账号登录”入口进入官方浏览器授权，确认成功后重启 Codex 并恢复任务。
 - ✅ **自动续跑**：中断、切号、App 被强杀后从检查点原地接上，绝不重复已完成步骤。
 - ❌ 不读取或导出浏览器 Cookie。
-- ❌ 不读取或注入 session token / authentication storage（只在已登录会话的 UI 层操作）。
-- ❌ 不做「从零自动登录」：不自动填写账号密码、不绕过登录；只在使用者**已登录**的会话之间切换。
+- ✅ 旧版邮箱密码回退仍只把密码写入 macOS 钥匙串；任务、设置 JSON、数据库和日志只保存非敏感记录 ID/备注。
+- ❌ 不读取或注入 session token / authentication storage；主路线复用 Profile 中已有的网页登录，并让 Codex 自己管理 OAuth 凭据。
 - ❌ 不用 Selenium / Playwright 等网页自动化框架（采用原生 macOS AX API 驱动 UI）。
 - ❌ 不伪造或绕过平台安全机制：切换的是使用者自己合法持有的账号，不做 token 注入 / cookie 盗用 / 伪造请求。
 
-账号切换的产品入口是 ChatGPT 网页账号菜单：程序只在同一个浏览器的已登录会话里点击目标账号条目，不切换 Google/Chrome 系统账号，也不接触凭据；额度耗尽等「该不该切」的判断由程序在已配置账号池内自动完成，无需人工介入。
+账号登录入口是设置页的“Codex 自动恢复”：点击“重新检测”，勾选至少两个已经登录不同 ChatGPT 账号的 Chrome Profile。轮换成功后才更新任务的 Profile 指针；失败不会提前推进检查点。
 
-旧版本留下的 Chrome Profile 轮换代码和数据库字段暂时保留用于兼容历史数据，但当前 UI 不暴露该入口，「自动切换 ChatGPT 账号」不会切换浏览器 Profile。
-
-`CodexLoginAutomator.swift` 与 `CodexAccountVault.swift` 目前未装配到 `AppServices`，不属于产品 UI 的支持路径；当前 App 不会调用它们做「从零自动登录」或保存账号密码。账号切换依赖的是**已登录会话的 UI 自动化**，而非凭据重放。
-
-`BrowserLaunching` 协议的全部能力就是 `NSWorkspace.shared.open(url)` —— 打开一个 URL，
-让你在**自己已登录的浏览器**里操作。仅此而已。
+`CodexLoginAutomator.swift` 与 `CodexAccountVault.swift` 已装配到 `AppServices`。自动登录使用 Chrome 的可访问性树定位官方登录控件，不读取网页 Cookie、Token 或浏览器密码库。检测到验证码、人机验证或 2FA 时会停止并明确提示用户处理，不尝试绕过。
 
 API 直连是**可选后端**（代码在 `Legacy/API/`），需要你自己配置 API Key，默认不参与主流程。
 
@@ -82,6 +82,10 @@ swift test --disable-sandbox
 # 组装可双击的 .app
 bash Scripts/make_app.sh release
 open dist/AIRunner.app
+
+# 单独组装 OAuth/Profile 版本（不会覆盖上面的旧版）
+bash Scripts/make_oauth_app.sh release
+open "dist/AIRunner OAuth.app"
 ```
 
 > `--disable-sandbox` 只在**本项目的开发环境**（外层已有沙箱、SwiftPM 内置的 `sandbox-exec`
@@ -99,9 +103,10 @@ SwiftPM 包可以直接被 Xcode 打开成完整工程，选 `AIRunner` scheme �
 ### 首次使用
 
 1. 打开 App → `⌘,` 进入设置
-2. **Provider 与密钥**：填 Base URL / 默认模型，粘贴 API Key，点「保存到 Keychain」
-3. **模型路由**：确认优先级顺序（出厂是 OpenAI → OpenAI 备用 → DeepSeek → Ollama）
-4. 回主界面 `⌘N` 新建任务：名称 + 目标 + 步骤数 → 自动开跑
+2. 在 Chrome 中建立至少两个 Profile，并在每个 Profile 中分别登录一个 ChatGPT 账号
+3. 在“Codex 自动恢复”中重新检测并勾选这些 Profile；所有 Codex 任务停止后，可用“一键测试安全退出并登录”单独验收闭环；如需旧路线，可关闭 OAuth 并继续使用钥匙串账号
+4. 授予 AIRunner OAuth 辅助功能权限；需要 API 可选通道时再配置 Provider 与 API Key
+5. 回主界面 `⌘N` 新建任务；创建后保持“排队中”，在任务详情点击“开始执行”才会登录并执行
 
 ### 数据位置
 
@@ -109,6 +114,7 @@ SwiftPM 包可以直接被 Xcode 打开成完整工程，选 `AIRunner` scheme �
 |---|---|
 | 任务 / 步骤 / 检查点 / 日志 | `~/Library/Application Support/AIRunner/airunner.sqlite` |
 | API Key | macOS Keychain，`service = com.airunner.apikeys` |
+| ChatGPT 账号密码 | macOS Keychain，`service = com.airunner.codex-accounts` |
 | 非敏感配置（路由、并发、重试参数） | `UserDefaults`，key `com.airunner.settings.v1` |
 
 ---
@@ -139,7 +145,7 @@ SwiftPM 包可以直接被 Xcode 打开成完整工程，选 `AIRunner` scheme �
 │  BrowserLaunching        │   (OpenAICompatible · Mock)        │
 │         │                │         │                           │
 │    ChatGPT Web           │  api.openai.com / 自建网关          │
-│   (人工交接账号)          │                                    │
+│ (钥匙串自动登录/切换账号) │                                    │
 ├──────────────────────────┴────────────────────────────────────┤
 │ Repositories (Task/Step/Checkpoint/Event/ProviderHealth)       │
 │        └─ Database (系统 SQLite3, WAL, 单事务原子提交)          │
@@ -171,7 +177,7 @@ Sources/AIRunner/              # SwiftUI 壳
   App/AppState.swift
   UI/{ContentView, Tasks/*, Settings/*, Logs/*}
 
-Tests/AIRunnerCoreTests/       # 183 个测试（含 2 个需辅助功能权限的探针）
+Tests/AIRunnerCoreTests/       # 228 个测试（含 2 个真实辅助功能树探针）
 Scripts/make_app.sh
 ```
 
@@ -259,7 +265,7 @@ App 启动时 `RecoveryManager.recover()` 处理三类残留：
 swift test --disable-sandbox
 ```
 
-**183 个测试，0 个失败，2 个因缺少辅助功能权限而跳过。**（数字以 `swift test` 的实际输出为准）
+**228 个测试，0 个失败。**（数字以 `swift test` 的实际输出为准）
 
 | 测试文件 | 覆盖 |
 |---|---|
@@ -272,8 +278,12 @@ swift test --disable-sandbox
 | **`WebExecutionRegressionTests` (17)** | **正确性回归** —— 重复粘贴、步骤状态校验、CAS 提交、迁移版本推进、failed/cancelled 恢复语义 |
 | `CodexTaskMatcherTests` (15) | Codex 线程匹配、唯一性门槛、弱匹配拒绝与打开后二次验证 |
 | `AccountHandoffMonitorTests` (15) | 认证后监视、冷却、防重入、自动恢复与危险错误停止 |
-| `ChatGPTAccountSwitchTests` (14) | 网页账号菜单枚举、排除项过滤、目标账号切换、指针落盘与管理器编排 |
-| `AccountRotationTests` (13) | 历史 Chrome Profile 兼容层的轮换池、持久化指针、窗口前置失败降级 |
+| `ChatGPTAccountSwitchTests` (29) | 网页账号切换、原生 Codex 登录入口识别、创建只排队、显式启动后登录、原生退出先于登录、指针落盘与管理器编排 |
+| `CodexQuotaMonitorTests` (11) | 最新输出范围、连续确认、生成中拒绝退出、旧错误锁定和安全轮换门控 |
+| `CodexOAuthSafetyTesterTests` (5) | 设置页独立测试、全窗口生成中拒绝、当前窗口忙碌拒绝、状态不明 fail closed、空闲时允许 OAuth 闭环 |
+| `CodexNativeLogoutConfirmerTests` (4) | 原生注销菜单、确认框标题和确认按钮的中英文本精确匹配，以及正文误匹配拒绝 |
+| `CredentialRotationTests` (9) | 凭据轮换、跨任务全局下一账号、首次登录、OpenAI“登录其他账户”识别、失败时不推进账号指针 |
+| `AccountRotationTests` (14) | 历史 Chrome Profile 兼容层的轮换池、持久化指针、窗口前置失败降级，以及无任务记录的一键 OAuth 测试轮换 |
 | `CodexResumeLeaseTests` (9) | 跨进程 Resume 租约、过期锁显式恢复与并发互斥 |
 | `PersistenceSmokeTests` (5) | **真实文件数据库**：WAL、外键 CASCADE、关闭重开数据仍在、中断后重开继续 |
 | `SmokeTests` (1) | 模块加载冒烟检查 |
@@ -361,7 +371,10 @@ AILR_TEST_VERBOSE=1 swift test --disable-sandbox --filter testScenarioC_crashRec
 | `Automation/CodexUIAutomationDriver.swift` | 基于 AX 树的线程定位、Composer 输入、发送与确认观察；无法确认时 fail closed |
 | `Automation/CodexResumeController.swift` | Test Locate / Dry Run / Resume 的统一安全门槛、冷却与租约 |
 | `Core/AccountHandoffResumeMonitor.swift` | 认证后轮询 Codex 可用性并自动恢复绑定线程 |
-| `Core/AccountRotationManager.swift` | ChatGPT 网页账号菜单轮换；Chrome Profile 入口仅保留为历史兼容代码 |
+| `Core/AccountRotationManager.swift` | 在显式选择的 Chrome Profile 间循环；OAuth 成功后才推进账号指针；旧钥匙串路线继续作为回退 |
+| `Automation/CodexBrowserOAuthAuthenticator.swift` | 驱动 Codex 原生注销菜单和退出确认框，从 ChatGPT 登录入口进入目标 Chrome Profile，确认成功后重启 Codex |
+| `Automation/CodexLoginAutomator.swift` | 驱动官方登录页的“登录其他账户”、邮箱、下一步、密码与登录流程；验证码/2FA 时停止 |
+| `Security/CodexAccountVault.swift` | ChatGPT 账号凭据的 macOS 钥匙串存取，数据库只保存记录 ID |
 
 ### 降级为可选后端（代码保留，移入 `Legacy/API/`）
 
@@ -397,18 +410,14 @@ ALTER TABLE task_steps  ADD COLUMN submitted_at TEXT;
 
 按「对当前闭环的增益」排序，不是按炫技程度：
 
-1. **浏览器辅助（有限度）** — 在用户**已经打开的** ChatGPT 标签页上填入 prompt 并读取回复。
-   仍然不碰 Cookie / token / 登录；只是把"复制粘贴"这一步省掉。这是当前最高价值的一步
-2. **Notification** — 任务进入 `waitingForAccount` / `waitingForUser` / `completed` 时发本地通知。
+1. **Notification** — 任务进入 `waitingForAccount` / `waitingForUser` / `completed` 时发本地通知。
    长任务最需要的其实是"轮到你操作了"和"跑完了"
-3. **菜单栏模式** — 常驻状态栏显示「有几个任务在等我」
-4. **开机启动 + launchd** — `NSSupportsAutomaticTermination=false` 已就位，补一个 LaunchAgent plist
-5. **账号备注** — 给每个 ChatGPT session 起个名字（"账号A"），交接时在日志里留痕。
-   **只存名字，不存任何凭据**
-6. **导出 Markdown / JSON** — 检查点里已有结构化 `state`
-7. **智能 Task Planner** — 用一次 ChatGPT 交互把 goal 拆成有依赖的步骤图
-8. **文件输入 / PDF 分析 / Directory Watch** — 让 `map` 步骤真正消费文件
-9. **自动压缩 Context** — 按 token 预算而非字符数截断
-10. **更多 Provider 原生协议**（Anthropic Messages / Gemini generateContent）
+2. **菜单栏模式** — 常驻状态栏显示「有几个任务在等我」
+3. **开机启动 + launchd** — `NSSupportsAutomaticTermination=false` 已就位，补一个 LaunchAgent plist
+4. **导出 Markdown / JSON** — 检查点里已有结构化 `state`
+5. **智能 Task Planner** — 用一次 ChatGPT 交互把 goal 拆成有依赖的步骤图
+6. **文件输入 / PDF 分析 / Directory Watch** — 让 `map` 步骤真正消费文件
+7. **自动压缩 Context** — 按 token 预算而非字符数截断
+8. **更多 Provider 原生协议**（Anthropic Messages / Gemini generateContent）
 
-第 1 条之前的 MVP 未跑通前不实现这些。
+这些是后续增强项；当前登录、任务执行、账号轮换与检查点续跑闭环已经接通。

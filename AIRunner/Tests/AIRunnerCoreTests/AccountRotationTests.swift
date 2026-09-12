@@ -199,4 +199,49 @@ final class AccountRotationTests: XCTestCase {
         let decoded = try JSONCoding.decode(AppSettings.self, from: legacyJSON)
         XCTAssertEqual(decoded.accountRotationProfileDirectories, [])
     }
+
+    func testStandaloneOAuthTestAdvancesProfilesWithoutTaskRecord() async throws {
+        let temporaryHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("airunner-oauth-settings-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporaryHome) }
+        let chromeDirectory = temporaryHome
+            .appendingPathComponent("Library/Application Support/Google/Chrome")
+        try FileManager.default.createDirectory(
+            at: chromeDirectory, withIntermediateDirectories: true
+        )
+        let localState: [String: Any] = [
+            "profile": [
+                "info_cache": [
+                    "Default": ["name": "账号 A"],
+                    "Profile 1": ["name": "账号 B"],
+                ],
+            ],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: localState)
+        try data.write(to: chromeDirectory.appendingPathComponent("Local State"))
+
+        var settings = TestSupport.mockSettings()
+        settings.useCodexBrowserOAuthRotation = true
+        settings.accountRotationProfileDirectories = ["Default", "Profile 1"]
+        let configuredSettings = settings
+        let services = try TestSupport.makeServices(settings: settings)
+        let oauth = FakeCodexBrowserOAuthAuthenticator(loggedIn: true)
+        let manager = AccountRotationManager(
+            profiles: ChromeProfileScanner(homeDirectory: temporaryHome.path),
+            windows: FakeBrowserWindowLocator(),
+            repository: services.accountRotationRepo,
+            logger: services.logger,
+            settings: { configuredSettings },
+            codexBrowserOAuth: oauth,
+            settleDelay: .seconds(0)
+        )
+
+        let first = try await manager.testCodexBrowserOAuthRotation()
+        let second = try await manager.testCodexBrowserOAuthRotation()
+
+        XCTAssertEqual(first.accountLabel, "账号 A")
+        XCTAssertEqual(second.accountLabel, "账号 B")
+        let usedProfiles = await oauth.usedProfiles
+        XCTAssertEqual(usedProfiles.map(\.directoryName), ["Default", "Profile 1"])
+    }
 }

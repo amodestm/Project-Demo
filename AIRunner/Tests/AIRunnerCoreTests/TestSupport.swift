@@ -56,7 +56,8 @@ enum TestSupport {
             providers: resolvedProviders,
             routes: resolvedRoutes,
             concurrency: concurrency,
-            retry: retry ?? fastRetryConfig()
+            retry: retry ?? fastRetryConfig(),
+            useCodexBrowserOAuthRotation: false
         )
     }
 

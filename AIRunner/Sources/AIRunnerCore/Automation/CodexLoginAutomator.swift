@@ -15,7 +15,23 @@ public struct CodexLoginAutomatorConfiguration: Sendable, Equatable {
 
     /// 登录按钮 (chatgpt.com 未登录首页 / 邮箱页的「继续」) 的候选文案。
     public var continueButtonHints: [String] = [
-        "继续", "Continue", "登录", "Log in", "Login",
+        "继续", "下一步", "Continue", "Next", "登录", "Log in", "Login",
+    ]
+
+    /// 提交邮箱后，OpenAI 有时先给“邮箱验证码”页，并提供改用密码的入口。
+    public var passwordMethodHints: [String] = [
+        "使用密码登录", "改用密码登录", "用密码登录", "通过密码登录",
+        "continue with password", "use password", "log in with password",
+        "sign in with password",
+    ]
+
+    /// OpenAI 账号选择页中进入邮箱登录表单的按钮。
+    public var otherAccountHints: [String] = [
+        "登录其他账户", "登录其他账号", "使用其他账户", "使用其他账号",
+        "登录另一个账户", "登录另一个账号", "使用另一个账户", "使用另一个账号",
+        "use another account", "log in with another account", "sign in with another account",
+        "choose another account", "switch account", "add account",
+        "添加账号", "添加账户", "新增账号", "新增账户",
     ]
 
     /// SSO 按钮要**排除**的关键词 —— 它们也含 "Continue"/"登录" 字样但不是我们要点的。
@@ -35,7 +51,11 @@ public struct CodexLoginAutomatorConfiguration: Sendable, Equatable {
     /// 邮箱/显示名 —— 因此 `findSidebarAccountButton` 也会拿当前邮箱片段兜底匹配。
     public var sidebarAccountButtonHints: [String] = [
         "account", "账号", "profile", "个人资料", "manage account",
-        "settings", "设置",
+    ]
+
+    /// ChatGPT 已登录后的输入框候选标识。
+    public var composerHints: [String] = [
+        "prompt-textarea", "与 chatgpt 聊天", "message chatgpt", "ask chatgpt",
     ]
 
     /// ★ 人机验证 / 二次验证信号 —— 检测到任何一条立即停手交还用户 ★
@@ -114,6 +134,17 @@ public protocol CodexLoginAutomating: Sendable {
     /// 密码只在本次调用期间存在, 不落任何存储。
     func login(email: String, password: String) async throws
 
+    /// 浏览器已经登录时不做动作；处于登录流程时完成登录。
+    /// 返回 true 表示本次实际执行了登录，false 表示原本已经登录。
+    func loginIfRequired(email: String, password: String) async throws -> Bool
+
+}
+
+public extension CodexLoginAutomating {
+    func loginIfRequired(email: String, password: String) async throws -> Bool {
+        try await login(email: email, password: password)
+        return true
+    }
 }
 
 // MARK: - 真实实现
@@ -156,13 +187,13 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
     // MARK: - 登出
 
     public func logout(currentAccountEmail: String? = nil) async throws {
-        let chrome = try requireTrustedChrome()
-
-        // 已处于登录页 (能看到邮箱框) = 已经是登出态 → 幂等成功
-        if let axApp = appAXElement(of: chrome),
-           Self.findEmailField(in: axApp, configuration: configuration) != nil {
-            return
-        }
+        // 主动打开配置的 ChatGPT 页面，不依赖用户事先切到某个标签页。
+        let urlText = settings().chatGPTURL
+        let url = URL(string: urlText) ?? URL(string: "https://chatgpt.com/")!
+        _ = ChromeProfileScanner().open(url: url, profile: nil, newWindow: true)
+        let chrome = try await requireTrustedChrome()
+        chrome.activate()
+        try? await Task.sleep(for: configuration.menuAppearDelay)
 
         _ = try? windows.focusWindow(
             bundleIdentifier: "com.google.Chrome",
@@ -170,33 +201,68 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
             activateApp: true
         )
 
-        guard let axApp = appAXElement(of: chrome) else {
-            throw CodexLoginError.logoutFailed("无法读取 Chrome 的 AX 树")
+        // ChatGPT 首屏可能需要数秒才渲染出登录入口或侧边栏账号按钮。
+        // 轮询页面就绪，避免把加载中的空 AX 树误判成“检测不到账号”。
+        var sidebarButton: AXUIElement?
+        var logoutWindow: AXUIElement?
+        let readinessDeadline = Date().addingTimeInterval(configuration.fieldPollTimeout)
+        while Date() < readinessDeadline {
+            try Task.checkCancellation()
+            guard let axApp = appAXElement(of: chrome) else {
+                try? await Task.sleep(for: configuration.actionPollInterval)
+                continue
+            }
+
+            if let signal = Self.humanVerificationSignal(
+                in: axApp, configuration: configuration
+            ) {
+                throw CodexLoginError.humanVerificationRequired(signal)
+            }
+
+            let email = Self.findEmailField(in: axApp, configuration: configuration) != nil
+            let login = Self.findContinueButton(
+                in: axApp, configuration: configuration, matchLoginOnly: true
+            ) != nil
+            let chooser = Self.findOtherAccountButton(
+                in: axApp, configuration: configuration
+            ) != nil
+            if email || login || chooser { return }
+
+            if let found = Self.findSidebarAccountButton(
+                in: axApp, configuration: configuration, currentEmail: currentAccountEmail
+            ) {
+                sidebarButton = found
+                logoutWindow = axApp
+                break
+            }
+            try? await Task.sleep(for: configuration.actionPollInterval)
         }
 
-        // 找左下角侧边栏账号按钮 (新 ChatGPT UI; 旧版右上角头像菜单已改版消失)。
-        // 找不到就 fail-closed 交还手动 —— 绝不猜测目标。
-        guard let sidebarButton = Self.findSidebarAccountButton(
-            in: axApp, configuration: configuration, currentEmail: currentAccountEmail
-        ) else {
+        guard let sidebarButton else {
             throw CodexLoginError.logoutFailed(
                 "在新 ChatGPT 界面里没找到左下角侧边栏账号按钮 (你的账号/邮箱)。"
                 + "请手动点左下角账号 → 退出登录, 或在设置里调整侧边栏账号按钮提示词。"
             )
         }
 
-        guard Self.press(sidebarButton) else {
-            throw CodexLoginError.logoutFailed("无法点击侧边栏账号按钮")
+        if !Self.press(sidebarButton) {
+            // Chromium 有时声称支持 AXPress、实际却不触发页面事件；菜单轮询里还会
+            // 以控件的真实 AXFrame 做一次坐标点击兜底。
+            guard Self.clickCenter(sidebarButton) else {
+                throw CodexLoginError.logoutFailed("无法点击侧边栏账号按钮")
+            }
         }
         try? await Task.sleep(for: configuration.menuAppearDelay)
 
         // 菜单里轮询找「登出」项 (可能要点确认弹窗才出现)
         var logoutItem: AXUIElement?
+        var usedCoordinateFallback = false
+        let coordinateFallbackAt = Date().addingTimeInterval(2)
         let menuDeadline = Date().addingTimeInterval(configuration.loginCompleteTimeout)
         while Date() < menuDeadline {
             try Task.checkCancellation()
             try? await Task.sleep(for: configuration.actionPollInterval)
-            guard let appNow = appAXElement(of: chrome) else { break }
+            guard let appNow = logoutWindow ?? appAXElement(of: chrome) else { break }
 
             if let signal = Self.humanVerificationSignal(
                 in: appNow, configuration: configuration
@@ -211,6 +277,15 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
                 logoutItem = item
                 break
             }
+
+            // AXPress 返回成功并不保证 Chromium 页面真的收到点击。两秒后仍未见菜单，
+            // 提升已锁定窗口并点击同一个账号控件的中心点；绝不按猜测坐标点击。
+            if !usedCoordinateFallback, Date() >= coordinateFallbackAt {
+                if let logoutWindow {
+                    _ = AXUIElementPerformAction(logoutWindow, kAXRaiseAction as CFString)
+                }
+                usedCoordinateFallback = Self.clickCenter(sidebarButton)
+            }
         }
 
         guard let item = logoutItem else {
@@ -221,11 +296,13 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
         }
 
         // 等回到登录页 (邮箱框重新出现 = 登出完成)
+        var confirmationPressedAt: Date?
+        var confirmationMouseRetried = false
         let deadline = Date().addingTimeInterval(configuration.loginCompleteTimeout)
         while Date() < deadline {
             try Task.checkCancellation()
             try? await Task.sleep(for: configuration.actionPollInterval)
-            guard let appNow = appAXElement(of: chrome) else { break }
+            guard let appNow = logoutWindow ?? appAXElement(of: chrome) else { break }
 
             if let signal = Self.humanVerificationSignal(
                 in: appNow, configuration: configuration
@@ -233,8 +310,31 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
                 throw CodexLoginError.humanVerificationRequired(signal)
             }
 
-            if Self.findEmailField(in: appNow, configuration: configuration) != nil {
+            let email = Self.findEmailField(in: appNow, configuration: configuration) != nil
+            let login = Self.findContinueButton(
+                in: appNow, configuration: configuration, matchLoginOnly: true
+            ) != nil
+            let chooser = Self.findOtherAccountButton(
+                in: appNow, configuration: configuration
+            ) != nil
+            if email || login || chooser {
                 return  // ★ 已登出, 落在登录页 ★
+            }
+
+            // 第一层菜单项会弹出“确定退出登录”对话框；必须再点一次对话框里的
+            // 退出按钮。优先选择对话框后代；无 dialog 语义时选择面积最大的可见
+            // 退出按钮，避免再次命中左下角已经隐藏的菜单项。
+            if let confirmation = Self.findLogoutConfirmationButton(
+                in: appNow, configuration: configuration
+            ) {
+                if confirmationPressedAt == nil {
+                    _ = Self.press(confirmation)
+                    confirmationPressedAt = Date()
+                } else if !confirmationMouseRetried,
+                          Date().timeIntervalSince(confirmationPressedAt!) >= 2 {
+                    _ = AXUIElementPerformAction(appNow, kAXRaiseAction as CFString)
+                    confirmationMouseRetried = Self.clickCenter(confirmation)
+                }
             }
         }
 
@@ -243,13 +343,31 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
 
     // MARK: - 登录
 
-    public func login(email: String, password: String) async throws {
-        let chrome = try requireTrustedChrome()
+    public func loginIfRequired(email: String, password: String) async throws -> Bool {
+        let urlText = settings().chatGPTURL
+        let url = URL(string: urlText) ?? URL(string: "https://chatgpt.com/")!
+        _ = ChromeProfileScanner().open(url: url, profile: nil, newWindow: true)
+        let chrome = try await requireTrustedChrome()
+        chrome.activate()
+        try? await Task.sleep(for: configuration.menuAppearDelay)
 
+        if let app = appAXElement(of: chrome), Self.isAuthenticated(
+            in: app, configuration: configuration
+        ) {
+            return false
+        }
+
+        try await login(email: email, password: password)
+        return true
+    }
+
+    public func login(email: String, password: String) async throws {
         // 1) 打开 ChatGPT (未登录态会落在登录首页)
         let urlText = settings().chatGPTURL
         let url = URL(string: urlText) ?? URL(string: "https://chatgpt.com/")!
-        _ = ChromeProfileScanner().open(url: url, profile: nil)
+        _ = ChromeProfileScanner().open(url: url, profile: nil, newWindow: true)
+        let chrome = try await requireTrustedChrome()
+        chrome.activate()
         try? await Task.sleep(for: configuration.menuAppearDelay)
 
         // 聚焦 ChatGPT 窗口 (登录页标题通常也含 ChatGPT; 找不到就聚焦 Chrome 任一窗口)
@@ -264,15 +382,19 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
             activateApp: true
         )
 
-        var axApp = appAXElement(of: chrome)
+        var axApp = loginAXElement(of: chrome)
 
         // 2) 等邮箱输入框出现; 若先看到「登录」按钮则点它进入 auth 页
         var emailField: AXUIElement?
+        var loginButtonPressedAt: Date?
+        var loginButtonMouseRetried = false
+        var otherAccountPressedAt: Date?
+        var otherAccountMouseRetried = false
         let fieldDeadline = Date().addingTimeInterval(configuration.fieldPollTimeout)
         while Date() < fieldDeadline {
             try Task.checkCancellation()
             try? await Task.sleep(for: configuration.actionPollInterval)
-            axApp = appAXElement(of: chrome)
+            axApp = loginAXElement(of: chrome)
 
             if let signal = Self.humanVerificationSignal(
                 in: axApp, configuration: configuration
@@ -286,15 +408,38 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
                 emailField = field
                 break
             }
-            // 首页有「Log in」入口 → 点它
+            // OpenAI 账号选择页: 必须先点「登录其他账户」才能出现邮箱框。
+            if let otherAccount = Self.findOtherAccountButton(
+                in: axApp, configuration: configuration
+            ) {
+                if otherAccountPressedAt == nil {
+                    _ = Self.press(otherAccount)
+                    otherAccountPressedAt = Date()
+                } else if !otherAccountMouseRetried,
+                          Date().timeIntervalSince(otherAccountPressedAt!) >= 2 {
+                    otherAccountMouseRetried = Self.clickCenter(otherAccount)
+                }
+                continue
+            }
+
+            // ChatGPT 首页有「Log in / 登录」入口 → 点它进入 OpenAI 登录页。
             if let loginButton = Self.findContinueButton(
                 in: axApp, configuration: configuration, matchLoginOnly: true
             ) {
-                Self.press(loginButton)
+                if loginButtonPressedAt == nil {
+                    _ = Self.press(loginButton)
+                    loginButtonPressedAt = Date()
+                } else if !loginButtonMouseRetried,
+                          Date().timeIntervalSince(loginButtonPressedAt!) >= 2 {
+                    loginButtonMouseRetried = Self.clickCenter(loginButton)
+                }
             }
         }
 
         guard let emailElement = emailField else {
+            throw CodexLoginError.emailFieldNotFound
+        }
+        guard let loginWindow = axApp else {
             throw CodexLoginError.emailFieldNotFound
         }
 
@@ -302,6 +447,7 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
         Self.focusField(emailElement)
         await Self.clearField(emailElement, pid: chrome.processIdentifier)
         await keystroke(email, chrome.processIdentifier)
+        try? await Task.sleep(for: .milliseconds(150))
 
         let typed = Self.value(of: emailElement) ?? ""
         guard typed.contains(email) else {
@@ -310,7 +456,7 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
 
         // 4) 点「继续」
         guard let continueButton = Self.findContinueButton(
-            in: axApp, configuration: configuration, matchLoginOnly: false
+            in: loginWindow, configuration: configuration, matchLoginOnly: false
         ) else {
             throw CodexLoginError.continueButtonNotFound
         }
@@ -324,19 +470,28 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
         while Date() < pwDeadline {
             try Task.checkCancellation()
             try? await Task.sleep(for: configuration.actionPollInterval)
-            axApp = appAXElement(of: chrome)
-
-            if let signal = Self.humanVerificationSignal(
-                in: axApp, configuration: configuration
-            ) {
-                throw CodexLoginError.humanVerificationRequired(signal)
-            }
+            axApp = loginWindow
 
             if let field = Self.findSecureField(
                 in: axApp, configuration: configuration
             ) {
                 passwordField = field
                 break
+            }
+
+            // OpenAI 可能默认发送邮箱验证码，但页面同时允许切回密码登录。
+            // 有这个明确入口时先选密码；没有入口的验证码/2FA 才交给用户。
+            if let passwordMethod = Self.findPasswordMethodButton(
+                in: axApp, configuration: configuration
+            ) {
+                Self.press(passwordMethod)
+                continue
+            }
+
+            if let signal = Self.humanVerificationSignal(
+                in: axApp, configuration: configuration
+            ) {
+                throw CodexLoginError.humanVerificationRequired(signal)
             }
         }
         guard let pwElement = passwordField else {
@@ -349,7 +504,7 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
 
         // 7) 点「登录/继续」
         guard let submitButton = Self.findContinueButton(
-            in: axApp, configuration: configuration, matchLoginOnly: false
+            in: loginWindow, configuration: configuration, matchLoginOnly: false
         ), Self.press(submitButton) else {
             throw CodexLoginError.continueButtonNotFound
         }
@@ -359,7 +514,7 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
         while Date() < doneDeadline {
             try Task.checkCancellation()
             try? await Task.sleep(for: configuration.actionPollInterval)
-            axApp = appAXElement(of: chrome)
+            axApp = loginWindow
 
             if let signal = Self.humanVerificationSignal(
                 in: axApp, configuration: configuration
@@ -372,11 +527,13 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
             // 不再用它判断。
             let emailGone = Self.findEmailField(in: axApp, configuration: configuration) == nil
             let pwGone = Self.findSecureField(in: axApp, configuration: configuration) == nil
-            let composer = Self.findComposerTextArea(in: axApp, configuration: configuration) != nil
             let sidebar = Self.findSidebarAccountButton(
                 in: axApp, configuration: configuration, currentEmail: nil
             ) != nil
-            if emailGone, pwGone, composer || sidebar {
+            let loginButton = Self.findContinueButton(
+                in: axApp, configuration: configuration, matchLoginOnly: true
+            ) != nil
+            if emailGone, pwGone, sidebar, !loginButton {
                 return  // ★ 登录完成 ★
             }
         }
@@ -391,12 +548,62 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
         guard role == "AXButton" || role == "AXMenuItem" || role == "AXStaticText" else {
             return false
         }
-        let text = ((Self.stringAttribute(element, kAXDescriptionAttribute)
-            ?? Self.stringAttribute(element, kAXTitleAttribute)) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
+        let text = Self.matchingText(of: element)
         guard !text.isEmpty else { return false }
         return hints.contains { text.contains($0.lowercased()) }
+    }
+
+    static func findLogoutConfirmationButton(
+        in appElement: AXUIElement?,
+        configuration: CodexLoginAutomatorConfiguration
+    ) -> AXUIElement? {
+        guard let appElement else { return nil }
+        var dialogButtons: [(element: AXUIElement, area: CGFloat)] = []
+        var otherButtons: [(element: AXUIElement, area: CGFloat)] = []
+        let budget = ChatGPTAccountSwitcher.Box(configuration.traversalNodeBudget)
+        ChatGPTAccountSwitcher.walkElements(
+            in: appElement,
+            depth: 0,
+            budget: budget,
+            deadline: Date().addingTimeInterval(configuration.traversalTimeout),
+            maxDepth: configuration.traversalMaxDepth
+        ) { element in
+            let role = Self.role(of: element)
+            guard role == "AXButton" || role == "AXLink" else { return }
+            guard Self.isLogoutItem(element, hints: configuration.logoutItemHints),
+                  let frame = Self.frame(of: element),
+                  frame.width > 1, frame.height > 1 else { return }
+            let candidate = (element: element, area: frame.width * frame.height)
+            if Self.hasDialogAncestor(element) {
+                dialogButtons.append(candidate)
+            } else {
+                otherButtons.append(candidate)
+            }
+        }
+        return (dialogButtons.max { $0.area < $1.area }
+            ?? otherButtons.max { $0.area < $1.area })?.element
+    }
+
+    private static func hasDialogAncestor(_ element: AXUIElement) -> Bool {
+        var current = element
+        for _ in 0..<10 {
+            let semantic = [
+                Self.stringAttribute(current, kAXRoleAttribute),
+                Self.stringAttribute(current, kAXSubroleAttribute),
+                Self.stringAttribute(current, kAXRoleDescriptionAttribute),
+            ]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .lowercased()
+            if semantic.contains("dialog") || semantic.contains("modal")
+                || semantic.contains("alert") || semantic.contains("对话框")
+                || semantic.contains("警告") {
+                return true
+            }
+            guard let parent = Self.rawAttribute(current, kAXParentAttribute) else { break }
+            current = unsafeDowncast(parent, to: AXUIElement.self)
+        }
+        return false
     }
 
     /// 文本是否命中人机验证信号 (静态纯函数, 可测)。
@@ -425,9 +632,8 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
             guard hit == nil else { return }
             let role = Self.role(of: element)
             guard role == "AXStaticText" || role == "AXHeading" || role == "AXButton"
-                || role == "AXGroup" else { return }
-            let text = (Self.stringAttribute(element, kAXTitleAttribute)
-                ?? Self.stringAttribute(element, kAXDescriptionAttribute)) ?? ""
+                || role == "AXGroup" || role == "AXTextField" else { return }
+            let text = Self.matchingText(of: element)
             if !text.isEmpty, matchesHumanVerificationHints(text, configuration: configuration) {
                 hit = text
             }
@@ -463,11 +669,10 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
         ) { element in
             let role = Self.role(of: element)
             guard role == "AXTextField" || role == "AXTextArea" else { return false }
-            let text = ((Self.stringAttribute(element, kAXDescriptionAttribute)
-                ?? Self.stringAttribute(element, kAXTitleAttribute)) ?? "").lowercased()
-            // 命中提示词, 或 auth 页上没有提示词的第一个空文本框
-            if hints.contains(where: { text.contains($0) }) { return true }
-            return text.isEmpty && (Self.value(of: element) ?? "").isEmpty
+            let text = Self.matchingText(of: element)
+            // 只接受明确带邮箱提示词的输入框。Chrome 页面中还可能有搜索框，
+            // 不能把任意空 AXTextField 猜成邮箱框。
+            return hints.contains(where: { text.contains($0) })
         }
     }
 
@@ -484,6 +689,52 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
         }
     }
 
+    static func findPasswordMethodButton(
+        in appElement: AXUIElement?,
+        configuration: CodexLoginAutomatorConfiguration
+    ) -> AXUIElement? {
+        guard let appElement else { return nil }
+        return Self.findFirst(in: appElement, configuration: configuration) { element in
+            let role = Self.role(of: element)
+            guard role == "AXButton" || role == "AXLink" else { return false }
+            return Self.matchesPasswordMethodText(
+                Self.matchingText(of: element), configuration: configuration
+            )
+        }
+    }
+
+    public static func matchesPasswordMethodText(
+        _ text: String,
+        configuration: CodexLoginAutomatorConfiguration = .default
+    ) -> Bool {
+        let lower = text.lowercased()
+        return configuration.passwordMethodHints.contains { lower.contains($0.lowercased()) }
+    }
+
+    /// OpenAI 账号选择页的「登录其他账户 / Use another account」。
+    static func findOtherAccountButton(
+        in appElement: AXUIElement?,
+        configuration: CodexLoginAutomatorConfiguration
+    ) -> AXUIElement? {
+        guard let appElement else { return nil }
+        return Self.findFirst(in: appElement, configuration: configuration) { element in
+            let role = Self.role(of: element)
+            guard role == "AXButton" || role == "AXLink" else {
+                return false
+            }
+            let text = Self.matchingText(of: element)
+            return Self.matchesOtherAccountText(text, configuration: configuration)
+        }
+    }
+
+    public static func matchesOtherAccountText(
+        _ text: String,
+        configuration: CodexLoginAutomatorConfiguration = .default
+    ) -> Bool {
+        let lower = text.lowercased()
+        return configuration.otherAccountHints.contains { lower.contains($0.lowercased()) }
+    }
+
     /// 对话输入框 (composer): 登录成功后 ChatGPT 主页出现的文本框, 是"已登录"的强信号
     /// (登录页没有任何 textarea)。
     static func findComposerTextArea(
@@ -491,10 +742,13 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
         configuration: CodexLoginAutomatorConfiguration
     ) -> AXUIElement? {
         guard let appElement else { return nil }
+        let hints = configuration.composerHints.map { $0.lowercased() }
         return Self.findFirst(
             in: appElement, configuration: configuration
         ) { element in
-            Self.role(of: element) == "AXTextArea"
+            let role = Self.role(of: element)
+            let text = Self.matchingText(of: element)
+            return role == "AXTextArea" || hints.contains(where: { text.contains($0) })
         }
     }
 
@@ -516,11 +770,10 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
             in: appElement, configuration: configuration
         ) { element in
             let role = Self.role(of: element)
-            guard role == "AXButton" || role == "AXMenuItem" else { return false }
-            let text = ((Self.stringAttribute(element, kAXDescriptionAttribute)
-                ?? Self.stringAttribute(element, kAXTitleAttribute)) ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
+            guard role == "AXButton" || role == "AXMenuItem" || role == "AXPopUpButton" else {
+                return false
+            }
+            let text = Self.matchingText(of: element)
             guard !text.isEmpty else { return false }
             if hints.contains(where: { text.contains($0) }) { return true }
             if let frag = emailFragment, text.contains(frag) { return true }
@@ -545,6 +798,7 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
     ) -> AXUIElement? {
         guard let appElement else { return nil }
         let sso = configuration.ssoExcludedHints.map { $0.lowercased() }
+        let otherAccount = configuration.otherAccountHints.map { $0.lowercased() }
         let wanted = matchLoginOnly
             ? ["登录", "log in", "login"]
             : configuration.continueButtonHints.map { $0.lowercased() }
@@ -552,15 +806,30 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
         return Self.findFirst(
             in: appElement, configuration: configuration
         ) { element in
-            guard Self.role(of: element) == "AXButton" else { return false }
-            let text = ((Self.stringAttribute(element, kAXDescriptionAttribute)
-                ?? Self.stringAttribute(element, kAXTitleAttribute)) ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
+            let role = Self.role(of: element)
+            guard role == "AXButton" || role == "AXLink" else { return false }
+            let text = Self.matchingText(of: element)
             guard !text.isEmpty else { return false }
             guard !sso.contains(where: { text.contains($0) }) else { return false }
+            guard !otherAccount.contains(where: { text.contains($0) }) else { return false }
             return wanted.contains { text.contains($0) }
         }
+    }
+
+    static func isAuthenticated(
+        in appElement: AXUIElement?,
+        configuration: CodexLoginAutomatorConfiguration
+    ) -> Bool {
+        guard let appElement else { return false }
+        let emailGone = Self.findEmailField(in: appElement, configuration: configuration) == nil
+        let passwordGone = Self.findSecureField(in: appElement, configuration: configuration) == nil
+        let sidebar = Self.findSidebarAccountButton(
+            in: appElement, configuration: configuration, currentEmail: nil
+        ) != nil
+        let loginButton = Self.findContinueButton(
+            in: appElement, configuration: configuration, matchLoginOnly: true
+        ) != nil
+        return emailGone && passwordGone && sidebar && !loginButton
     }
 
     // MARK: - 键盘
@@ -616,25 +885,159 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
 
     // MARK: - AX 基础
 
-    private func requireTrustedChrome() throws -> NSRunningApplication {
+    private func requireTrustedChrome() async throws -> NSRunningApplication {
         guard AXIsProcessTrusted() else {
             throw CodexAutomationError.accessibilityPermissionMissing
         }
-        guard let chrome = NSWorkspace.shared.runningApplications.first(where: {
-            $0.bundleIdentifier == "com.google.Chrome" && !$0.isTerminated
-        }) else {
-            throw ChatGPTAccountError.chromeNotFound
+
+        // `open -a` 在 Chrome 冷启动时会先返回；短暂轮询直到进程可见。
+        let deadline = Date().addingTimeInterval(configuration.fieldPollTimeout)
+        while Date() < deadline {
+            if let chrome = NSWorkspace.shared.runningApplications.first(where: {
+                $0.bundleIdentifier == "com.google.Chrome" && !$0.isTerminated
+            }) {
+                return chrome
+            }
+            try Task.checkCancellation()
+            try? await Task.sleep(for: .milliseconds(250))
         }
-        return chrome
+        throw ChatGPTAccountError.chromeNotFound
     }
 
     private func appAXElement(of app: NSRunningApplication) -> AXUIElement? {
-        AXIsProcessTrusted() ? AXUIElementCreateApplication(app.processIdentifier) : nil
+        guard AXIsProcessTrusted() else { return nil }
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+
+        // 账号交接使用独立 ChatGPT 窗口。即使用户同时切到 Chrome 的其他窗口，
+        // 仍优先锁定标题/URL 属于 ChatGPT 的窗口，避免把 GitHub 等活动页当登录页。
+        var raw: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            appElement, kAXFocusedWindowAttribute as CFString, &raw
+        )
+        let focusedWindow: AXUIElement? = if result == .success, let window = raw {
+            unsafeDowncast(window, to: AXUIElement.self)
+        } else {
+            nil
+        }
+        if let focusedWindow, Self.isChatGPTWindow(focusedWindow) {
+            return focusedWindow
+        }
+
+        var rawWindows: CFTypeRef?
+        let windows: [AXUIElement]
+        if AXUIElementCopyAttributeValue(
+            appElement, kAXWindowsAttribute as CFString, &rawWindows
+        ) == .success,
+           let foundWindows = rawWindows as? [AXUIElement] {
+            windows = foundWindows
+        } else {
+            windows = []
+        }
+        if let chatGPTWindow = windows.first(where: Self.isChatGPTWindow) {
+            return chatGPTWindow
+        }
+        // 新窗口刚建立时标题和 URL 可能尚未出现；Chrome 的 AXWindows 以最新窗口
+        // 优先排列，先返回第一项让外层轮询等待它完成加载。
+        return windows.first ?? focusedWindow ?? appElement
+    }
+
+    /// 从全部 Chrome 窗口里优先选择登录流程窗口，而不是任意一个旧的
+    /// ChatGPT 对话窗口。页面从登录首页跳到邮箱/密码页后持续命中同一窗口。
+    private func loginAXElement(of app: NSRunningApplication) -> AXUIElement? {
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        var rawWindows: CFTypeRef?
+        if AXUIElementCopyAttributeValue(
+            appElement, kAXWindowsAttribute as CFString, &rawWindows
+        ) == .success,
+           let windows = rawWindows as? [AXUIElement],
+           let loginWindow = windows.first(where: {
+               Self.isLoginSurface($0, configuration: configuration)
+           }) {
+            return loginWindow
+        }
+        return appAXElement(of: app)
+    }
+
+    private static func isLoginSurface(
+        _ element: AXUIElement,
+        configuration: CodexLoginAutomatorConfiguration
+    ) -> Bool {
+        findEmailField(in: element, configuration: configuration) != nil
+            || findSecureField(in: element, configuration: configuration) != nil
+            || findOtherAccountButton(in: element, configuration: configuration) != nil
+            || findContinueButton(
+                in: element, configuration: configuration, matchLoginOnly: true
+            ) != nil
+    }
+
+    private static func isChatGPTWindow(_ element: AXUIElement) -> Bool {
+        let text = [
+            kAXTitleAttribute,
+            kAXDescriptionAttribute,
+            kAXDocumentAttribute,
+            kAXURLAttribute,
+        ]
+        .compactMap { rawAttribute(element, $0) }
+        .map { String(describing: $0).lowercased() }
+        .joined(separator: " ")
+        return text.contains("chatgpt") || text.contains("chatgpt.com")
+            || text.contains("openai") || text.contains("auth0")
     }
 
     @discardableResult
     static func press(_ element: AXUIElement) -> Bool {
-        AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
+        if AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
+            return true
+        }
+
+        // Chromium 有时把可见文案暴露成 AXStaticText，把动作放在父节点。
+        // 最多向上找 4 层，只执行标准 AXPress，不使用坐标猜测。
+        var current = element
+        for _ in 0..<4 {
+            guard let rawParent = Self.rawAttribute(current, kAXParentAttribute) else { break }
+            let parent = unsafeDowncast(rawParent, to: AXUIElement.self)
+            if AXUIElementPerformAction(parent, kAXPressAction as CFString) == .success {
+                return true
+            }
+            current = parent
+        }
+        return false
+    }
+
+    /// 用 AX 暴露的精确控件边框执行一次真实鼠标点击。仅在 Chromium 报告 AXPress
+    /// 成功但页面没有产生任何状态变化时使用；点击后恢复原鼠标位置。
+    @discardableResult
+    static func clickCenter(_ element: AXUIElement) -> Bool {
+        guard let frame = Self.frame(of: element), frame.width > 1, frame.height > 1 else {
+            return false
+        }
+        let point = CGPoint(x: frame.midX, y: frame.midY)
+        let previous = CGEvent(source: nil)?.location
+        guard let down = CGEvent(
+            mouseEventSource: nil,
+            mouseType: .leftMouseDown,
+            mouseCursorPosition: point,
+            mouseButton: .left
+        ), let up = CGEvent(
+            mouseEventSource: nil,
+            mouseType: .leftMouseUp,
+            mouseCursorPosition: point,
+            mouseButton: .left
+        ) else {
+            return false
+        }
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+        if let previous,
+           let restore = CGEvent(
+               mouseEventSource: nil,
+               mouseType: .mouseMoved,
+               mouseCursorPosition: previous,
+               mouseButton: .left
+           ) {
+            restore.post(tap: .cghidEventTap)
+        }
+        return true
     }
 
     static func focusField(_ element: AXUIElement) {
@@ -664,6 +1067,35 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
         var raw: CFTypeRef?
         let status = AXUIElementCopyAttributeValue(element, name as CFString, &raw)
         return status == .success ? raw : nil
+    }
+
+    static func frame(of element: AXUIElement) -> CGRect? {
+        guard let rawPosition = rawAttribute(element, kAXPositionAttribute),
+              let rawSize = rawAttribute(element, kAXSizeAttribute) else { return nil }
+        let positionValue = unsafeDowncast(rawPosition, to: AXValue.self)
+        let sizeValue = unsafeDowncast(rawSize, to: AXValue.self)
+        guard AXValueGetType(positionValue) == .cgPoint,
+              AXValueGetType(sizeValue) == .cgSize else { return nil }
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(positionValue, .cgPoint, &position),
+              AXValueGetValue(sizeValue, .cgSize, &size) else { return nil }
+        return CGRect(origin: position, size: size)
+    }
+
+    /// 汇总 Chromium 常用的可访问性文案字段，仅用于匹配控件，不写日志。
+    static func matchingText(of element: AXUIElement) -> String {
+        [
+            kAXDescriptionAttribute,
+            kAXTitleAttribute,
+            kAXIdentifierAttribute,
+            kAXPlaceholderValueAttribute,
+            kAXValueAttribute,
+        ]
+        .compactMap { Self.stringAttribute(element, $0) }
+        .joined(separator: " ")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
     }
 }
 

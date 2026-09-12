@@ -1,3 +1,5 @@
+import AppKit
+import ApplicationServices
 import Foundation
 
 /// 一个 Chrome profile。
@@ -62,6 +64,23 @@ public struct ChromeProfileScanner: Sendable {
             case .brave:        return "BraveSoftware/Brave-Browser"
             }
         }
+
+        /// Chromium 系浏览器的主可执行文件。`open --args --new-window` 在已运行的
+        /// Chrome 上可能只创建空壳窗口；直接调用浏览器才能可靠传入 URL。
+        public var executablePath: String {
+            switch self {
+            case .chrome:
+                return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            case .chromeCanary:
+                return "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"
+            case .chromium:
+                return "/Applications/Chromium.app/Contents/MacOS/Chromium"
+            case .edge:
+                return "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+            case .brave:
+                return "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+            }
+        }
     }
 
     private let homeDirectory: String
@@ -116,17 +135,39 @@ public struct ChromeProfileScanner: Sendable {
 
     /// 用指定 profile 打开一个 URL。
     ///
-    /// 通过 `open -a <bundle> --args --profile-directory=<name>`。
+    /// 通过 `open -b <bundle-id> --args --profile-directory=<name>`。
     /// 浏览器已经在那个 profile 里登录着, 所以不会要求再次输入密码。
     @discardableResult
     public func open(
         url: URL,
         profile: ChromeProfile?,
-        kind: ChromeKind = .chrome
+        kind: ChromeKind = .chrome,
+        newWindow: Bool = false
     ) -> Bool {
-        var arguments = ["-a", kind.rawValue]
+        if newWindow {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: kind.executablePath)
+            process.arguments = ["--new-window"]
+                + (profile.map { ["--profile-directory=\($0.directoryName)"] } ?? [])
+                + [url.absoluteString]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            do {
+                try process.run()
+                // Chrome 首次启动时主进程会一直运行，不能在这里等待退出，否则
+                // AIRunner 会卡住。成功创建进程就表示启动请求已经交给 Chrome。
+                return true
+            } catch {
+                return false
+            }
+        }
+
+        var arguments = ["-b", kind.rawValue]
+        if profile != nil {
+            arguments.append("--args")
+        }
         if let profile {
-            arguments += ["--args", "--profile-directory=\(profile.directoryName)"]
+            arguments.append("--profile-directory=\(profile.directoryName)")
         }
         arguments.append(url.absoluteString)
 
@@ -135,7 +176,8 @@ public struct ChromeProfileScanner: Sendable {
         process.arguments = arguments
         do {
             try process.run()
-            return true
+            process.waitUntilExit()
+            return process.terminationStatus == 0
         } catch {
             return false
         }
@@ -144,14 +186,100 @@ public struct ChromeProfileScanner: Sendable {
     /// 直接拉起 Chrome 的 profile 选择器, 让用户挑。
     @discardableResult
     public func openProfilePicker(kind: ChromeKind = .chrome) -> Bool {
+        // Chrome 已经运行时，它会把第二次启动请求转发给现有进程，但会丢弃
+        // `--profile-directory-picker`，最终只打开普通新标签页。对已运行的浏览器，直接按下
+        // Chrome 自带的“添加个人资料…”菜单项；该菜单项有稳定的 AXIdentifier
+        // `newProfile:`，所以不依赖中英文菜单名。
+        if let running = NSRunningApplication.runningApplications(
+            withBundleIdentifier: kind.rawValue
+        ).first {
+            guard AXIsProcessTrusted(), openNewProfileMenuItem(in: running) else {
+                return false
+            }
+            return true
+        }
+
+        // 浏览器未运行时，启动参数会在初次启动时生效。
+        guard FileManager.default.isExecutableFile(atPath: kind.executablePath) else {
+            return false
+        }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = ["-a", kind.rawValue, "--args", "--profile-directory-picker"]
+        process.executableURL = URL(fileURLWithPath: kind.executablePath)
+        process.arguments = ["--profile-directory-picker"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
         do {
             try process.run()
             return true
         } catch {
             return false
         }
+    }
+
+    /// 按下 Chromium 菜单里的“添加个人资料…”。
+    ///
+    /// Chrome 会在不同语言下改变菜单标题，但该项的 Accessibility identifier
+    /// 始终是 `newProfile:`。隐藏的菜单也会出现在 AX 树里，可以直接执行 AXPress，
+    /// 无需先猜测“个人资料 / Profiles”这一级菜单的本地化名称。
+    private func openNewProfileMenuItem(in application: NSRunningApplication) -> Bool {
+        let appElement = AXUIElementCreateApplication(application.processIdentifier)
+        var rawMenuBar: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            appElement,
+            kAXMenuBarAttribute as CFString,
+            &rawMenuBar
+        ) == .success, let rawMenuBar else {
+            return false
+        }
+
+        let menuBar = unsafeDowncast(rawMenuBar, to: AXUIElement.self)
+        guard let menuItem = firstDescendant(
+            of: menuBar,
+            maxDepth: 5,
+            matchingIdentifier: "newProfile:"
+        ) else {
+            return false
+        }
+
+        _ = application.activate(options: [.activateAllWindows])
+        return AXUIElementPerformAction(menuItem, kAXPressAction as CFString) == .success
+    }
+
+    private func firstDescendant(
+        of element: AXUIElement,
+        maxDepth: Int,
+        matchingIdentifier identifier: String
+    ) -> AXUIElement? {
+        guard maxDepth >= 0 else { return nil }
+
+        var rawIdentifier: CFTypeRef?
+        if AXUIElementCopyAttributeValue(
+            element,
+            kAXIdentifierAttribute as CFString,
+            &rawIdentifier
+        ) == .success, rawIdentifier as? String == identifier {
+            return element
+        }
+
+        guard maxDepth > 0 else { return nil }
+        var rawChildren: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXChildrenAttribute as CFString,
+            &rawChildren
+        ) == .success, let children = rawChildren as? [AXUIElement] else {
+            return nil
+        }
+
+        for child in children {
+            if let found = firstDescendant(
+                of: child,
+                maxDepth: maxDepth - 1,
+                matchingIdentifier: identifier
+            ) {
+                return found
+            }
+        }
+        return nil
     }
 }

@@ -87,13 +87,13 @@ CORE_WHITELIST: set[str] = {
 REQUIREMENT_MATRIX = """\
 | # | 需求约束 (用户明确要求"不要做") | 实现方式 / 代码证据 |
 |---|---|---|
-| 1 | 不自动登录多个 ChatGPT 个人账号 | 全部代码中不存在任何登录逻辑; `BrowserLaunching` 协议只有 `open(URL)` 一个方法 |
-| 2 | 不自动轮换账号规避额度 | `WebExecutionCoordinator.pauseForAccountSwitch()` 只把任务置为 `waitingForAccount` 并**停下**; 恢复必须由用户点按钮触发 (`resumeAfterManualAccountSwitch`) |
+| 1 | ChatGPT 登录密码不得进入数据库或设置 | 密码只写入 macOS Keychain；设置仅保存随机账号 ID 和顺序 |
+| 2 | 登录失败不得推进账号指针 | `AccountRotationManager` 仅在登录成功后写入下一个账号 ID；任务保持 `waitingForAccount` |
 | 3 | 不读取浏览器 Cookie | 无 `WebKit` / `HTTPCookieStorage` / `WKWebsiteDataStore` 引用; 无任何 Cookie 数据库路径 |
 | 4 | 不复制 session token | 无 `localStorage` / `sessionStorage` / token 注入代码; 密钥仅存 macOS Keychain |
-| 5 | 不用 Selenium / Playwright 操作网页 | 零第三方依赖 (`Package.swift` 的 `dependencies: []`); 无进程调用浏览器 |
-| 6 | 不绕过 rate limit / usage limit | 无任何限流规避逻辑; 遇到 `billingRequired` 一律**熔断该 Provider + 暂停任务** |
-| 7 | 只使用官方 API 或用户合法配置的 Provider | Web 通道仅生成文本 prompt 交给用户; API 通道 (可选) 需用户自配 Key |
+| 5 | 不用 Selenium / Playwright | 零第三方依赖；登录使用 macOS Accessibility API 与键盘事件 |
+| 6 | 不绕过验证码或安全挑战 | 检测到 CAPTCHA、2FA、邮箱验证码或验证提示时立即停止并提示用户 |
+| 7 | 只使用用户主动保存的账号或 API 配置 | ChatGPT 凭据由用户在设置页录入；API 通道需用户自配 Key |
 
 ### 能力边界的技术保证
 
