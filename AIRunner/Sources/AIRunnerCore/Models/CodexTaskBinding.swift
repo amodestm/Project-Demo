@@ -40,45 +40,125 @@ public enum CodexReasoningEffort: String, Codable, Sendable, Equatable, Hashable
     case high
     case xhigh
     case max
+    case ultra
 
     public var displayName: String {
         switch self {
-        case .low: return "低"
+        case .low: return "轻度"
         case .medium: return "中"
         case .high: return "高"
         case .xhigh: return "极高"
-        case .max: return "最大"
+        case .max: return "最高"
+        case .ultra: return "ultra"
         }
     }
 
     /// Codex 可能随界面语言变化；真实驱动只在弹出的模型菜单中匹配这些完整标签。
     public var uiLabels: [String] {
         switch self {
-        case .low: return ["低", "Low"]
-        case .medium: return ["中", "中等", "Medium"]
-        case .high: return ["高", "High"]
-        case .xhigh: return ["极高", "超高", "Extra high", "XHigh"]
-        case .max: return ["最大", "Max", "Maximum"]
+        case .low: return ["轻度", "低", "Low", "low"]
+        case .medium: return ["中", "中等", "Medium", "medium"]
+        case .high: return ["高", "High", "high"]
+        case .xhigh: return ["极高", "超高", "Extra high", "XHigh", "xhigh"]
+        // “Ultra” 是第六个滑杆档位；不能再把它作为“最高”的别名，
+        // 否则回读时无法区分第五个和第六个点。
+        case .max: return ["最高", "最大", "Max", "Maximum", "max"]
+        case .ultra: return ["ultra", "Ultra"]
         }
+    }
+
+    /// 滑杆从左到右的稳定序号。顺序与 Codex 当前六个离散点一致。
+    public var sliderIndex: Int {
+        Self.allCases.firstIndex(of: self) ?? 0
+    }
+
+    /// 六个离散点在归一化滑杆上的位置 (左端 0，右端 1)。
+    public var sliderFraction: Double {
+        guard Self.allCases.count > 1 else { return 0 }
+        return Double(sliderIndex) / Double(Self.allCases.count - 1)
+    }
+
+    /// 将滑杆归一化位置映射到最近的离散档位。
+    public static func fromSliderFraction(_ fraction: Double) -> Self {
+        let last = Swift.max(0, allCases.count - 1)
+        let clamped = Swift.min(1, Swift.max(0, fraction))
+        let index = Int((clamped * Double(last)).rounded())
+        return allCases[Swift.min(last, Swift.max(0, index))]
+    }
+
+    /// 将 AXSlider 的真实 min/max 数值映射到离散档位。
+    public static func fromSliderValue(
+        _ value: Double, min minValue: Double, max maxValue: Double
+    ) -> Self? {
+        guard maxValue > minValue else { return nil }
+        let fraction = (value - minValue) / (maxValue - minValue)
+        return fromSliderFraction(fraction)
+    }
+
+    /// 从 Codex 当前界面可能显示的单个档位文案回读档位。
+    public static func fromUILabel(_ label: String) -> Self? {
+        let normalized = label.lowercased()
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+
+        let aliases: [(effort: Self, label: String)] = allCases.flatMap { effort in
+            effort.uiLabels.map { candidate in
+                (
+                    effort,
+                    candidate.lowercased()
+                        .split(whereSeparator: \.isWhitespace)
+                        .joined(separator: " ")
+                )
+            }
+        }
+        // 先匹配更长的档位名，避免“Extra high”被尾部的“high”提前吞掉。
+        // 中文也必须要求档位前是分隔符，因此“高”不会命中“极高/最高”。
+        let ordered = aliases.sorted { $0.label.count > $1.label.count }
+        if let exact = ordered.first(where: { $0.label == normalized }) {
+            return exact.effort
+        }
+        let separators = CharacterSet.whitespacesAndNewlines.union(
+            CharacterSet(charactersIn: "·•:：|/—-()（）[]【】")
+        )
+        for alias in ordered where normalized.hasSuffix(alias.label) {
+            let prefix = normalized.dropLast(alias.label.count)
+            guard let last = prefix.unicodeScalars.last,
+                  separators.contains(last) else { continue }
+            return alias.effort
+        }
+        return nil
     }
 }
 
 /// 从 Codex 模型按钮回读的可见状态。
 public struct CodexExecutionSelection: Sendable, Equatable {
     public let visibleTitle: String
+    /// 某些 Codex 版本把思考程度作为 AXSlider 的数值暴露，模型按钮标题
+    /// 只包含模型名；驱动会把滑块值离散化后填入这里。
+    public let reasoningEffort: CodexReasoningEffort?
 
-    public init(visibleTitle: String) {
+    public init(
+        visibleTitle: String,
+        reasoningEffort: CodexReasoningEffort? = nil
+    ) {
         self.visibleTitle = visibleTitle
+        self.reasoningEffort = reasoningEffort
     }
 
     public func matches(_ preference: CodexExecutionPreference) -> Bool {
         let normalized = Self.normalize(visibleTitle)
-        guard normalized.contains(Self.normalize(preference.modelDisplayName)) else {
+        let model = Self.normalize(preference.modelDisplayName)
+        guard normalized.hasPrefix(model) else {
             return false
         }
-        return preference.reasoningEffort.uiLabels.contains {
-            normalized.hasSuffix(Self.normalize($0))
+        if let reasoningEffort {
+            return reasoningEffort == preference.reasoningEffort
         }
+        let effortText = String(normalized.dropFirst(model.count))
+        return CodexReasoningEffort.fromUILabel(effortText)
+            == preference.reasoningEffort
     }
 
     private static func normalize(_ text: String) -> String {

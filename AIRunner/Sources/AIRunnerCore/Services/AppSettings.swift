@@ -15,7 +15,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
 
     // MARK: Web 执行通道
 
-    /// 新建任务默认使用的执行通道。默认 `chatgpt_web`。
+    /// 新建任务默认使用的执行通道。默认走 Codex 桌面自动执行；旧 Web
+    /// 剪贴板流程仍可在设置中显式选择。
     public var defaultExecutionMode: ExecutionMode
     /// ChatGPT Web 地址 (可改成自建网关或区域域名)。
     public var chatGPTURL: String
@@ -70,12 +71,18 @@ public struct AppSettings: Codable, Sendable, Equatable {
     /// 留空 = 尚未配置自动登录。
     public var codexAccountRotationIDs: [String]
 
+    /// Chrome Profile 对应的账号显示邮箱。
+    ///
+    /// 这是用户确认后的显示别名，只存目录名 → 邮箱映射；不从 Chrome
+    /// Cookie、Google 账号信息或 ChatGPT session 中读取。
+    public var accountRotationProfileAliases: [String: String]
+
     public init(
         providers: [ProviderConfig],
         routes: [RouteEntry],
         concurrency: Int = 3,
         retry: RetryConfiguration = .default,
-        defaultExecutionMode: ExecutionMode = .chatGPTWeb,
+        defaultExecutionMode: ExecutionMode = .codexDesktop,
         chatGPTURL: String = ChatGPTWebTarget.defaultURLString,
         openBrowserOnPrepare: Bool = true,
         copyPromptToClipboard: Bool = true,
@@ -88,7 +95,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
         codexPreferredApplicationBundleIdentifier: String? = nil,
         accountRotationProfileDirectories: [String] = [],
         chatGPTAccountList: [String] = [],
-        codexAccountRotationIDs: [String] = []
+        codexAccountRotationIDs: [String] = [],
+        accountRotationProfileAliases: [String: String] = [:]
     ) {
         self.providers = providers
         self.routes = routes
@@ -109,6 +117,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.accountRotationProfileDirectories = accountRotationProfileDirectories
         self.chatGPTAccountList = chatGPTAccountList
         self.codexAccountRotationIDs = codexAccountRotationIDs
+        self.accountRotationProfileAliases = accountRotationProfileAliases
     }
 
     /// 手写解码, 让**老版本存下的配置能平滑升级**。
@@ -127,7 +136,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         retry = try container.decodeIfPresent(RetryConfiguration.self, forKey: .retry) ?? .default
 
         defaultExecutionMode = try container
-            .decodeIfPresent(ExecutionMode.self, forKey: .defaultExecutionMode) ?? .chatGPTWeb
+            .decodeIfPresent(ExecutionMode.self, forKey: .defaultExecutionMode) ?? .codexDesktop
         chatGPTURL = try container
             .decodeIfPresent(String.self, forKey: .chatGPTURL)
             ?? ChatGPTWebTarget.defaultURLString
@@ -156,6 +165,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
             .decodeIfPresent([String].self, forKey: .chatGPTAccountList) ?? []
         codexAccountRotationIDs = try container
             .decodeIfPresent([String].self, forKey: .codexAccountRotationIDs) ?? []
+        accountRotationProfileAliases = try container
+            .decodeIfPresent([String: String].self, forKey: .accountRotationProfileAliases) ?? [:]
     }
 
     public static let `default` = AppSettings(
@@ -195,6 +206,9 @@ public struct SettingsStore: @unchecked Sendable {
 
     private let defaults: UserDefaults
     private let storageKey: String
+    /// 只把已有安装从旧的 Web 默认值迁移一次。这样用户后来显式选择
+    /// 兼容 Web 模式时，不会在每次启动时又被强行改回 Codex。
+    private let codexDefaultMigrationKey: String
 
     public init(
         defaults: UserDefaults = .standard,
@@ -202,6 +216,7 @@ public struct SettingsStore: @unchecked Sendable {
     ) {
         self.defaults = defaults
         self.storageKey = storageKey
+        self.codexDefaultMigrationKey = "\(storageKey).codexDesktopDefault.v1"
     }
 
     public func load() -> AppSettings {
@@ -211,7 +226,21 @@ public struct SettingsStore: @unchecked Sendable {
             return .default
         }
         // 防御: 老版本配置可能缺少新增的 Provider
-        return Self.mergingMissingProviders(decoded)
+        var settings = Self.mergingMissingProviders(decoded)
+
+        // 1.5.44 之前默认是手动 Web 回填。已有配置只迁移一次，避免用户
+        // 明确选择兼容模式后再次启动被覆盖；没有配置的全新安装直接使用
+        // AppSettings.default 中的 Codex 自动执行。
+        if !defaults.bool(forKey: codexDefaultMigrationKey) {
+            // 只对仍停留在旧默认值的已有配置做一次迁移；同时立刻写入
+            // 标记，避免用户之后手动选择兼容 Web 模式又被覆盖。
+            if settings.defaultExecutionMode == .chatGPTWeb {
+                settings.defaultExecutionMode = .codexDesktop
+                try? save(settings)
+            }
+            defaults.set(true, forKey: codexDefaultMigrationKey)
+        }
+        return settings
     }
 
     public func save(_ settings: AppSettings) throws {

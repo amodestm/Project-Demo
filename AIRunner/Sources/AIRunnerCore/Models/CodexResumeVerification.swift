@@ -78,17 +78,21 @@ public struct CodexOpenThreadContext: Sendable, Equatable {
     public let projectName: String?
     public let repositoryPath: String?
     public let worktreePath: String?
+    /// 当前主会话区所属的真实应用。由运行中的 App 句柄读取，不要求用户填写。
+    public let applicationBundleIdentifier: String?
 
     public init(
         threadTitle: String? = nil,
         projectName: String? = nil,
         repositoryPath: String? = nil,
-        worktreePath: String? = nil
+        worktreePath: String? = nil,
+        applicationBundleIdentifier: String? = nil
     ) {
         self.threadTitle = threadTitle
         self.projectName = projectName
         self.repositoryPath = repositoryPath
         self.worktreePath = worktreePath
+        self.applicationBundleIdentifier = applicationBundleIdentifier
     }
 }
 
@@ -149,7 +153,7 @@ public enum SendConfirmation: String, Sendable, Equatable {
 ///
 /// 分成两档门槛是刻意的:
 /// * `passesLocateGate` —— Test Locate / Dry Run 用。只要求"能唯一确定目标"。
-/// * `passesSendGate`   —— 真正发送前用。要求 9 个信号全部通过。
+/// * `passesSendGate`   —— 真正发送前用。要求目标、模型、输入与发送控件全部通过。
 ///
 /// 用户明确要求: 如果只能取得一个弱信号, Test Locate 可以提示,
 /// 但 **Production Auto Send 默认必须拒绝**。
@@ -162,6 +166,9 @@ public struct CodexResumeVerification: Sendable, Equatable {
     /// 候选集合里恰有一个可用匹配 (不是 0 个, 也不是 2 个以上)。
     public var uniqueTargetConfirmed = false
     public var notCurrentlyGenerating = false
+    /// 预设模型与思考程度已经设置并从 Codex 模型按钮回读确认。
+    /// 未配置预设时由 Controller 标记为通过，兼容旧绑定。
+    public var executionPreferenceMatched = false
 
     public var composerFound = false
     public var composerEditable = false
@@ -185,6 +192,7 @@ public struct CodexResumeVerification: Sendable, Equatable {
         passesLocateGate
             && secondaryContextMatched
             && notCurrentlyGenerating
+            && executionPreferenceMatched
             && composerFound
             && composerEditable
             && composerFocused
@@ -197,6 +205,7 @@ public struct CodexResumeVerification: Sendable, Equatable {
         [
             applicationMatched, codexViewMatched, threadMatched,
             secondaryContextMatched, uniqueTargetConfirmed, notCurrentlyGenerating,
+            executionPreferenceMatched,
             composerFound, composerEditable, composerFocused,
             messageInserted, sendControlFound, sendConfirmed,
         ].filter { $0 }.count
@@ -211,6 +220,7 @@ public struct CodexResumeVerification: Sendable, Equatable {
             "\(mark(secondaryContextMatched)) secondaryContextMatched",
             "\(mark(uniqueTargetConfirmed)) uniqueTargetConfirmed",
             "\(mark(notCurrentlyGenerating)) notCurrentlyGenerating",
+            "\(mark(executionPreferenceMatched)) executionPreferenceMatched",
             "\(mark(composerFound)) composerFound",
             "\(mark(composerEditable)) composerEditable",
             "\(mark(composerFocused)) composerFocused",
@@ -227,7 +237,7 @@ public struct CodexResumeVerification: Sendable, Equatable {
 
     /// 一句话摘要 (日志用)。
     public var compactSummary: String {
-        if let failureReason { return "未通过 (\(passedGateCount)/12): \(failureReason)" }
-        return "通过 (\(passedGateCount)/12)"
+        if let failureReason { return "未通过 (\(passedGateCount)/13): \(failureReason)" }
+        return "通过 (\(passedGateCount)/13)"
     }
 }

@@ -14,7 +14,7 @@ public struct JobRunnerDependencies: Sendable {
     public var factory: ProviderFactory
     public var logger: LoggerService
     public var registry: TaskExecutionRegistry
-    /// ChatGPT Web 执行通道 (主流程)。
+    /// ChatGPT Web 执行通道（兼容通道）。
     public var web: any WebExecutionCoordinating
     public var config: RetryConfiguration
     /// 全局最多同时运行几个任务。
@@ -370,6 +370,11 @@ public actor JobRunner {
     /// RecoveryManager / Logs / ResponseValidator), 差别只在"这一步的结果从哪里来"。
     private func executeStep(task: AITask, step: TaskStep) async -> StepOutcome {
         switch task.executionMode {
+        case .codexDesktop:
+            // Codex 桌面任务由 TaskManager + CodexQuotaMonitor 驱动；如果
+            // 误从旧 Runner 入口调用，立即失败并提醒调用方修正分派，绝不打开
+            // 普通 ChatGPT 网页或生成剪贴板 Prompt。
+            return .failed(AppError.invalidRequest("Codex 自动任务必须通过桌面监视器启动"))
         case .chatGPTWeb:
             return await executeWebStep(task: task, step: step)
         case .api:
@@ -377,7 +382,7 @@ public actor JobRunner {
         }
     }
 
-    // MARK: - ChatGPT Web 通道 (主流程)
+    // MARK: - ChatGPT Web 通道（兼容通道）
 
     /// 生成续跑 prompt, 然后把任务转入「等用户」。
     ///

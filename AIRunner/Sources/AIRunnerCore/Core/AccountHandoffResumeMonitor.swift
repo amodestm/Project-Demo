@@ -271,7 +271,9 @@ public actor AccountHandoffResumeMonitor {
         // 唯一性判定 / 二次验证 / 忙碌检查 / 60s 冷却 / 跨进程租约
         // 全部由 CodexResumeController 内部完成 —— 这里没有第二套逻辑。
         do {
-            let result = try await resumeController.resume(bindingID: binding.id)
+            let result = try await resumeController.resumeAfterAccountHandoff(
+                bindingID: binding.id
+            )
 
             lastSendAt[taskID] = result.sentAt
 
@@ -321,6 +323,7 @@ public actor AccountHandoffResumeMonitor {
 
         // ---- 还没准备好 → 继续等 ----
         case .targetTaskNotFound, .applicationNotFound, .codexViewNotFound,
+             .modelControlNotFound,
              .composerNotFound, .composerNotEditable, .composerFocusFailed,
              .accessibilityPermissionMissing, .timeout:
             state = .waitingForUserAuthentication
@@ -351,6 +354,8 @@ public actor AccountHandoffResumeMonitor {
         // ---- ★ 危险情况: 目标不唯一或验证失败 → 立即停止自动恢复 ★ ----
         // 反复重试不会让"有两个同名线程"变好, 只会增加误发风险。
         case .ambiguousTarget, .targetVerificationFailed, .messageInsertionFailed,
+             .modelOptionNotFound, .reasoningOptionNotFound,
+             .modelSelectionAmbiguous, .modelSelectionFailed,
              .sendControlNotFound, .sendFailed, .sendUnconfirmed, .bindingNotFound:
             state = .failed
             logger.error(

@@ -47,7 +47,10 @@ public final class TaskManager: ObservableObject {
             // 具体是否执行轮换仍由监视器的 running + idle + 连续信号门控决定。
             if services.settings.autoResumeAfterManualAuthentication {
                 let boundTaskIDs = (try? services.tasks.fetchAll())?
-                    .filter { !$0.status.isTerminal }
+                    .filter {
+                        $0.status == .running || $0.status == .waitingForUser
+                            || $0.status == .waitingForAccount
+                    }
                     .compactMap { task in
                         ((try? services.codexBindings.fetchByTask(taskID: task.id)) ?? nil) != nil
                             ? task.id : nil
@@ -144,10 +147,12 @@ public final class TaskManager: ObservableObject {
         let currentSettings = services.settings
         let mode = currentSettings.defaultExecutionMode
 
-        // Web 模式 (主流程) 不依赖 API 路由;
+        // Web 模式（兼容通道）不依赖 API 路由;
         // 只有 API 可选后端才要求至少有一条可用的模型路由。
         let primary: RouteEntry?
         switch mode {
+        case .codexDesktop:
+            primary = nil
         case .chatGPTWeb:
             primary = currentSettings.primaryRoute
         case .api:
@@ -205,6 +210,12 @@ public final class TaskManager: ObservableObject {
             lastErrorMessage = "任务已处于「\(task.status.displayName)」, 无法启动"
             return
         }
+        if task.executionMode == .codexDesktop {
+            Task { [weak self] in
+                await self?.startCodexDesktopTask(taskID: task.id, markRunning: true)
+            }
+            return
+        }
         Task { [weak self] in
             guard let self else { return }
             await self.startRunnerWithLogin(
@@ -220,7 +231,18 @@ public final class TaskManager: ObservableObject {
         rotateAccountBeforeStart: Bool
     ) async {
         do {
-            if let task = try services.tasks.fetch(id: taskID), task.executionMode == .chatGPTWeb {
+            guard let task = try services.tasks.fetch(id: taskID) else {
+                throw AppError.invalidRequest("找不到任务: \(taskID)")
+            }
+
+            // Codex 桌面任务由额度/登录监视器驱动，不启动旧的 Web/API Runner，
+            // 也不会在启动时打开普通 ChatGPT 网页。
+            if task.executionMode == .codexDesktop {
+                await startCodexDesktopTask(taskID: taskID, markRunning: false)
+                return
+            }
+
+            if task.executionMode == .chatGPTWeb {
                 if rotateAccountBeforeStart {
                     let outcome = try await services.accountRotation
                         .rotateChatGPTAccount(taskID: taskID)
@@ -239,7 +261,68 @@ public final class TaskManager: ObservableObject {
         }
     }
 
+    /// 启动 Codex 桌面任务的后台监视。
+    ///
+    /// Codex 本身负责生成多步对话；AIRunner 只在绑定的线程上做额度/登录
+    /// 异常观察，并在安全门通过后执行一次账号切换和续跑。因此这里绝不能
+    /// 交给 JobRunner，否则会误走旧的剪贴板 Web 流程。
+    private func startCodexDesktopTask(taskID: String, markRunning: Bool) async {
+        do {
+            guard let task = try services.tasks.fetch(id: taskID) else {
+                throw AppError.invalidRequest("找不到任务: \(taskID)")
+            }
+            guard task.executionMode == .codexDesktop else {
+                throw AppError.invalidRequest("该任务不是 Codex 自动执行任务")
+            }
+            guard (try services.codexBindings.fetchByTask(taskID: taskID)) != nil else {
+                throw AppError.invalidRequest("请先绑定一个已存在的 Codex 工作对话")
+            }
+
+            if markRunning, task.status != .running, task.status != .waitingForAccount {
+                _ = try services.tasks.updateStatus(
+                    id: taskID, to: .running, errorMessage: nil, errorClass: nil
+                )
+            }
+
+            if task.status == .waitingForAccount {
+                // 账号交接期间只等待 Codex 恢复，恢复后由 handoff monitor
+                // 复用同一个 resume controller 完成定位、核验与发送。
+                codexQuotaMonitorTaskIDs.insert(taskID)
+                await services.codexQuotaMonitor.start(taskID: taskID)
+                await services.codexMonitor.start(taskID: taskID)
+                lastInfoMessage = "正在等待 Codex 完成账号切换，恢复后会自动锁定并发送「继续」"
+            } else {
+                codexQuotaMonitorTaskIDs.insert(taskID)
+                await services.codexQuotaMonitor.start(taskID: taskID)
+                lastInfoMessage = "已开始监控 Codex 工作对话；不会打开普通 ChatGPT 网页"
+            }
+            lastErrorMessage = nil
+            refresh()
+        } catch {
+            setError(error)
+            refresh()
+        }
+    }
+
     public func pause(_ task: AITask) {
+        if task.executionMode == .codexDesktop {
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    _ = try self.services.tasks.updateStatus(
+                        id: task.id, to: .paused, errorMessage: nil, errorClass: nil
+                    )
+                    self.codexQuotaMonitorTaskIDs.remove(task.id)
+                    self.codexMonitorStates[task.id] = nil
+                    await self.services.codexQuotaMonitor.stop(taskID: task.id, reason: "任务已暂停")
+                    await self.services.codexMonitor.stop(taskID: task.id, reason: "任务已暂停")
+                    self.lastErrorMessage = nil
+                    self.lastInfoMessage = "Codex 任务已暂停监控"
+                    self.refresh()
+                } catch { self.setError(error) }
+            }
+            return
+        }
         Task { [weak self] in
             guard let self else { return }
             await self.services.runner.pause(taskID: task.id)
@@ -248,6 +331,17 @@ public final class TaskManager: ObservableObject {
     }
 
     public func resume(_ task: AITask) {
+        if task.executionMode == .codexDesktop {
+            guard task.status != .completed, task.status != .cancelled else {
+                lastErrorMessage = "任务已处于「\(task.status.displayName)」，无法恢复"
+                return
+            }
+            Task { [weak self] in
+                guard let self else { return }
+                await self.startCodexDesktopTask(taskID: task.id, markRunning: true)
+            }
+            return
+        }
         switch task.status {
         case .failed:
             // failed 必须走专门入口: 先重置失败步骤, 否则它们会被跳过。
@@ -502,8 +596,9 @@ public final class TaskManager: ObservableObject {
         (try? services.codexBindings.fetchByTask(taskID: task.id)) ?? nil
     }
 
-    /// 保存或更新一个 Codex 绑定。
-    public func saveCodexBinding(_ binding: CodexTaskBinding) {
+    /// 保存或更新一个 Codex 绑定。返回值让界面只在真正写库成功后收起表单。
+    @discardableResult
+    public func saveCodexBinding(_ binding: CodexTaskBinding) -> Bool {
         do {
             if (try? services.codexBindings.fetch(id: binding.id)) != nil {
                 try services.codexBindings.update(binding)
@@ -516,21 +611,68 @@ public final class TaskManager: ObservableObject {
                 metadata: .object(["bindingID": .string(binding.id)])
             )
             lastErrorMessage = nil
+            lastInfoMessage = "已保存 Codex 工作对话「\(binding.displayTitle)」"
+
+            // 绑定时选定的 Profile 是该任务的初始账号。只在任务还没有
+            // 轮换状态时写入，避免编辑绑定或重启应用时把已经轮换到的账号
+            // 重置回第一个 Profile。
+            if let taskID = binding.taskID,
+               let profile = binding.chromeProfileDirectory {
+                try services.accountRotationRepo.setInitial(
+                    taskID: taskID,
+                    profile: profile
+                )
+            }
 
             // 绑定保存后即开始后台观察，但只有任务真正处于 running 时才会
             // 解释页面异常；waitingForUser / waitingForAccount 只保持待命。
             if services.settings.autoResumeAfterManualAuthentication,
                let taskID = binding.taskID,
                let task = try? services.tasks.fetch(id: taskID),
-               !task.status.isTerminal {
+               (task.status == .running || task.status == .waitingForUser
+                || task.status == .waitingForAccount) {
                 codexQuotaMonitorTaskIDs.insert(taskID)
                 Task { [weak self] in
                     guard let self else { return }
                     await self.services.codexQuotaMonitor.start(taskID: taskID)
                 }
             }
+            return true
         } catch {
             setError(error)
+            return false
+        }
+    }
+
+    /// 从当前打开的 Codex 主会话区读取工作对话标题，只读，不输入也不发送。
+    public func readCurrentCodexThreadTitle() async -> String? {
+        do {
+            guard await services.codexDriver.checkAccessibilityPermission() == .granted else {
+                throw CodexAutomationError.accessibilityPermissionMissing
+            }
+            let app = try await services.codexDriver.locateApplication(
+                bundleIdentifier: "com.openai.codex"
+            )
+            // “读取当前对话”通常是在 AIRunner 的绑定表单上触发的，此时 Codex
+            // 不是前台应用。先激活 Codex，让 Electron 把当前主会话树刷新到
+            // AX；驱动随后会在异步刷新期间只读轮询标题，不会输入或发送内容。
+            try await services.codexDriver.activate(app)
+            try? await Task.sleep(for: .milliseconds(250))
+            try await services.codexDriver.ensureCodexViewPresent(app)
+            let context = try await services.codexDriver.readOpenThreadContext(app)
+            let title = (context.threadTitle ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else {
+                throw CodexAutomationError.targetVerificationFailed(
+                    "无法从当前 Codex 主会话区读取工作对话标题。请先在 Codex 中打开目标工作对话；登录页或空白新对话没有可绑定标题"
+                )
+            }
+            lastErrorMessage = nil
+            lastInfoMessage = "已读取当前 Codex 工作对话标题"
+            return title
+        } catch {
+            setError(error)
+            return nil
         }
     }
 
@@ -598,7 +740,31 @@ public final class TaskManager: ObservableObject {
         }
     }
 
-    /// Resume: 真正发送「继续」到绑定的 Codex 线程。
+    /// 锁定目标线程并设置、回读模型；不输入提示词，不发送。
+    public func prepareCodexExecution(bindingID: String) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let verification = try await self.services.codexController.prepareExecution(
+                    bindingID: bindingID
+                )
+                self.codexVerification = verification
+                self.codexVerificationTaskID = (
+                    try? self.services.codexBindings.fetch(id: bindingID)
+                )?.taskID
+                self.codexResumeResult = nil
+                self.lastErrorMessage = nil
+                self.lastInfoMessage = "已锁定目标对话并确认模型（未输入、未发送）。"
+                self.refresh()
+            } catch {
+                self.codexVerification = nil
+                self.codexResumeResult = nil
+                self.setError(error)
+            }
+        }
+    }
+
+    /// Resume: 设置模型后发送绑定中保存的提示词。
     public func resumeCodex(bindingID: String, message: String? = nil) {
         Task { [weak self] in
             guard let self else { return }
@@ -845,6 +1011,108 @@ public final class TaskManager: ObservableObject {
                 self.lastRotationOutcome = nil
                 self.setError(error)
             }
+        }
+    }
+
+    /// 主界面指定一个 Chrome Profile 切换 Codex 账号。
+    ///
+    /// 这是“账号选择”入口，不会发送提示词。若任务正处于额度耗尽后的
+    /// `waitingForAccount`，认证完成后重新启用恢复监视器，由同一个
+    /// `CodexResumeController` 完成目标会话核验和一次「继续」发送。
+    public func switchCodexAccount(_ task: AITask, to profileDirectory: String) {
+        guard task.executionMode == .codexDesktop else {
+            lastErrorMessage = "只有 Codex 自动执行任务支持在主界面选择 Profile 账号"
+            return
+        }
+        guard !task.status.isTerminal else {
+            lastErrorMessage = "任务已处于「\(task.status.displayName)」，无法切换账号"
+            return
+        }
+        // 手动切号不能打断正在生成的 Codex 对话。额度监视器会在安全门
+        // 通过后自动切换；用户手动操作时先暂停监视，避免触发 Codex 的
+        // “退出 ChatGPT？”保护弹窗或丢失当前生成。
+        guard task.status != .running else {
+            lastErrorMessage = "当前 Codex 任务仍在运行，请先暂停监控，再手动切换账号"
+            return
+        }
+        guard !isRotatingAccount else { return }
+
+        isRotatingAccount = true
+        lastErrorMessage = nil
+        lastInfoMessage = "正在安全退出 Codex 并登录所选账号…"
+
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isRotatingAccount = false }
+            do {
+                guard let latest = try self.services.tasks.fetch(id: task.id) else {
+                    throw AppError.invalidRequest("找不到任务: \(task.id)")
+                }
+                guard latest.status != .running else {
+                    throw AppError.invalidRequest(
+                        "当前 Codex 任务仍在运行，请先暂停监控，再手动切换账号"
+                    )
+                }
+
+                // 任务可能在 AIRunner 刷新间隔内被重新启动；同时检查 Codex
+                // 的全部窗口，防止手动切号影响另一条正在生成的对话。
+                try await self.ensureCodexHasNoGeneratingTask()
+
+                let outcome = try await self.services.accountRotation.switchCodexAccount(
+                    taskID: task.id,
+                    to: profileDirectory
+                )
+                // 认证成功后把所选 Profile 同步写入绑定。这样应用重启、
+                // 自动轮换和主界面选择器都会从同一个非敏感指针继续，失败时
+                // 不会提前改写绑定。
+                if var binding = try self.services.codexBindings.fetchByTask(taskID: task.id) {
+                    binding.chromeProfileDirectory = profileDirectory
+                    binding.updatedAt = Date()
+                    try self.services.codexBindings.update(binding)
+                }
+                self.lastRotationOutcome = AccountRotationOutcome(
+                    fromProfile: nil,
+                    toProfile: profileDirectory,
+                    toProfileDisplayName: outcome.accountLabel,
+                    browserOpened: true,
+                    windowFocused: true,
+                    focusFailureReason: nil
+                )
+
+                let updatedTask = try self.services.tasks.fetch(id: task.id)
+                if updatedTask?.status == .waitingForAccount {
+                    self.codexQuotaMonitorTaskIDs.insert(task.id)
+                    await self.services.codexQuotaMonitor.start(taskID: task.id)
+                    await self.services.codexMonitor.start(taskID: task.id)
+                    self.lastInfoMessage =
+                        "已登录「\(outcome.accountLabel)」，正在等待 Codex 恢复并自动锁定目标对话"
+                } else {
+                    self.lastInfoMessage =
+                        "已切换到「\(outcome.accountLabel)」。未发送消息，任务仍按当前状态等待"
+                }
+                self.refresh()
+            } catch {
+                self.lastRotationOutcome = nil
+                self.setError(error)
+                self.refresh()
+            }
+        }
+    }
+
+    /// 手动账号切换前的全局安全门。不可用时不猜测状态，让认证链路给出
+    /// 明确错误；可用时只要任意 Codex 窗口显示生成指示，就拒绝退出。
+    private func ensureCodexHasNoGeneratingTask() async throws {
+        let probe = await services.codexDriver.probeAvailability(
+            bundleIdentifier: "com.openai.codex"
+        )
+        guard probe.isUsable else { return }
+        let app = try await services.codexDriver.locateApplication(
+            bundleIdentifier: "com.openai.codex"
+        )
+        guard try await !services.codexDriver.detectAnyTaskGenerating(app) else {
+            throw AppError.invalidRequest(
+                "检测到 Codex 仍有对话正在生成，已拒绝退出账号；请等所有对话停止后再试"
+            )
         }
     }
 

@@ -10,7 +10,7 @@ public enum DatabaseMigrator {
     ///
     /// ★ 每个 migration 只允许把自己推进到**自己的**版本号 ★
     /// 详见 `migrateToV1` 的注释。
-    public static let currentVersion = 5
+    public static let currentVersion = 7
 
     public static func migrate(_ db: Database) throws {
         let existing = try db.scalarInt("PRAGMA user_version;") ?? 0
@@ -40,6 +40,14 @@ public enum DatabaseMigrator {
 
         if existing < 5 {
             try migrateToV5(db)
+        }
+
+        if existing < 6 {
+            try migrateToV6(db)
+        }
+
+        if existing < 7 {
+            try migrateToV7(db)
         }
     }
 
@@ -226,7 +234,7 @@ public enum DatabaseMigrator {
     ///
     /// 全部是 `ALTER TABLE ADD COLUMN` + 默认值 —— **非破坏性**迁移:
     /// 已有数据库里的任务、步骤、检查点、日志、Provider 健康记录一条都不动。
-    /// 老任务会被默认标记为 `chatgpt_web`, 因为这是新的主流程。
+    /// 老任务会被默认标记为 `chatgpt_web`，作为兼容通道保留。
     private static func migrateToV2(_ db: Database) throws {
         let additions: [(table: String, column: String, definition: String)] = [
             ("tasks", "execution_mode",
@@ -368,6 +376,51 @@ public enum DatabaseMigrator {
                 )
             }
             try db.execute("PRAGMA user_version = 5;")
+        }
+    }
+
+    // MARK: - V6
+
+    /// V6: 每个 Codex 绑定保存发送前要校验的模型与思考程度。
+    /// 两列均可为空，旧绑定继续沿用 Codex 当前设置。
+    private static func migrateToV6(_ db: Database) throws {
+        try db.transaction {
+            if try !columnExists(db, table: "codex_task_bindings", column: "preferred_model_id") {
+                try db.execute(
+                    "ALTER TABLE codex_task_bindings ADD COLUMN preferred_model_id TEXT;"
+                )
+            }
+            if try !columnExists(db, table: "codex_task_bindings", column: "reasoning_effort") {
+                try db.execute(
+                    "ALTER TABLE codex_task_bindings ADD COLUMN reasoning_effort TEXT;"
+                )
+            }
+            try db.execute("PRAGMA user_version = 6;")
+        }
+    }
+
+    // MARK: - V7: Codex 自动执行成为独立主通道
+
+    /// 已绑定 Codex 工作对话的旧 Web 任务实际已经在使用桌面自动恢复链路。
+    /// 将这些任务迁入独立模式，并清除旧剪贴板 Runner 留下的“等待提交结果”状态。
+    /// 未绑定的 `chatgpt_web` 任务保持不变，继续作为兼容回填流程使用。
+    private static func migrateToV7(_ db: Database) throws {
+        try db.transaction {
+            try db.execute(
+                """
+                UPDATE tasks
+                SET execution_mode = 'codex_desktop',
+                    status = CASE WHEN status = 'waitingForUser' THEN 'running' ELSE status END,
+                    error_message = CASE WHEN error_class = 'AWAITING_RESULT' THEN NULL ELSE error_message END,
+                    error_class = CASE WHEN error_class = 'AWAITING_RESULT' THEN NULL ELSE error_class END,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE execution_mode = 'chatgpt_web'
+                  AND id IN (
+                      SELECT task_id FROM codex_task_bindings WHERE task_id IS NOT NULL
+                  );
+                """
+            )
+            try db.execute("PRAGMA user_version = 7;")
         }
     }
 

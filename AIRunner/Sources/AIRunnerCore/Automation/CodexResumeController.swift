@@ -46,7 +46,7 @@ public struct CodexResumeResult: Sendable, Equatable {
 /// ```
 /// load binding → cooldown → lease → 权限 → 找 App → 激活 → 确认 Codex 视图
 ///   → 找候选线程 → 唯一性判定 → 打开 → **二次验证** → 确认不忙
-///   → 找 composer → 聚焦 → 输入 → 校验输入 → 找发送控件
+///   → 设置并回读模型/思考程度 → 找 composer → 聚焦 → 输入 → 校验输入 → 找发送控件
 ///   → ★最终 Gate★ → 发送 → 观察确认 → 落盘 → 释放租约
 /// ```
 ///
@@ -135,6 +135,13 @@ public actor CodexResumeController {
         let busy = try await driver.detectBusyState(located.app)
         verification.notCurrentlyGenerating = busy.isSafeToSend
 
+        if let preference = binding.executionPreference,
+           let selection = try? await driver.readExecutionSelection(located.app) {
+            verification.executionPreferenceMatched = selection.matches(preference)
+        } else {
+            verification.executionPreferenceMatched = binding.executionPreference == nil
+        }
+
         if let composer = try? await driver.locateComposer(located.app) {
             verification.composerFound = true
             verification.composerEditable = composer.isEditable
@@ -143,6 +150,50 @@ public actor CodexResumeController {
         logger.info(
             .codexComposerFound,
             "Dry Run 完成: \(verification.compactSummary) (未输入、未发送)",
+            metadata: .object(["bindingID": .string(bindingID)])
+        )
+        return verification
+    }
+
+    // MARK: - 锁定与模型测试（会设置模型，但绝不输入或发送）
+
+    public func prepareExecution(bindingID: String) async throws -> CodexResumeVerification {
+        let binding = try requireBinding(bindingID)
+        let located = try await locateAndOpen(binding: binding)
+        var verification = located.verification
+
+        let busy = try await driver.detectBusyState(located.app)
+        verification.notCurrentlyGenerating = busy.isSafeToSend
+        guard busy.isSafeToSend else {
+            throw CodexAutomationError.threadAlreadyRunning
+        }
+
+        if let preference = binding.executionPreference {
+            let selection = try await driver.applyExecutionPreference(
+                preference, in: located.app
+            )
+            verification.executionPreferenceMatched = selection.matches(preference)
+            guard verification.executionPreferenceMatched else {
+                throw CodexAutomationError.modelSelectionFailed(
+                    expected: preference.displayName,
+                    actual: selection.visibleTitle
+                )
+            }
+        } else {
+            verification.executionPreferenceMatched = true
+        }
+
+        let composer = try await driver.locateComposer(located.app)
+        verification.composerFound = true
+        verification.composerEditable = composer.isEditable
+        guard composer.isEditable else {
+            throw CodexAutomationError.composerNotEditable
+        }
+
+        try? bindings.markVerified(bindingID: bindingID, at: now())
+        logger.info(
+            .codexTargetVerified,
+            "锁定与模型测试通过（未输入、未发送）: \(verification.compactSummary)",
             metadata: .object(["bindingID": .string(bindingID)])
         )
         return verification
@@ -170,9 +221,55 @@ public actor CodexResumeController {
             throw CodexAutomationError.duplicateResumePrevented(retryAfter: remaining)
         }
 
+        return try await resumeClaimingLease(
+            binding: binding,
+            text: message ?? binding.resumeMessage,
+            timestamp: timestamp,
+            allowExplicitStoppedState: false
+        )
+    }
+
+    /// 页面明确出现额度耗尽且线程已经停止后，允许监视器补发一次「继续」。
+    ///
+    /// 这条入口只跳过普通 Resume 的时间冷却；跨进程租约、目标唯一性、忙碌状态、
+    /// 模型回读、输入校验和发送确认仍完整执行。是否只调用一次由额度监视器负责。
+    public func resumeAfterConfirmedQuota(
+        bindingID: String,
+        message: String? = nil
+    ) async throws -> CodexResumeResult {
+        let binding = try requireBinding(bindingID)
+        return try await resumeClaimingLease(
+            binding: binding,
+            text: message ?? binding.resumeMessage,
+            timestamp: now(),
+            allowExplicitStoppedState: true
+        )
+    }
+
+    /// 账号完成切换后恢复原绑定线程。新账号是新的认证阶段，不能被切换前
+    /// 账号留下的 Resume 冷却记录阻塞；其余所有安全门仍与普通 Resume 相同。
+    public func resumeAfterAccountHandoff(
+        bindingID: String,
+        message: String? = nil
+    ) async throws -> CodexResumeResult {
+        let binding = try requireBinding(bindingID)
+        return try await resumeClaimingLease(
+            binding: binding,
+            text: message ?? binding.resumeMessage,
+            timestamp: now(),
+            allowExplicitStoppedState: false
+        )
+    }
+
+    private func resumeClaimingLease(
+        binding: CodexTaskBinding,
+        text: String,
+        timestamp: Date,
+        allowExplicitStoppedState: Bool
+    ) async throws -> CodexResumeResult {
         // --- 跨进程租约 ---
         let claim = try leases.claim(
-            bindingID: bindingID,
+            bindingID: binding.id,
             ownerID: ownerID,
             ttl: configuration.leaseTTL,
             now: timestamp
@@ -182,7 +279,7 @@ public actor CodexResumeController {
             logger.warning(
                 .codexResumeDuplicateBlocked,
                 "该绑定已被另一个 Resume 占用 (owner=\(existing.ownerID.prefix(8)))",
-                metadata: .object(["bindingID": .string(bindingID)])
+                metadata: .object(["bindingID": .string(binding.id)])
             )
             throw CodexAutomationError.resumeLeaseBusy(ownerID: existing.ownerID)
 
@@ -190,7 +287,7 @@ public actor CodexResumeController {
             logger.warning(
                 .codexResumeDuplicateBlocked,
                 "存在过期租约, 需要用户显式恢复",
-                metadata: .object(["bindingID": .string(bindingID)])
+                metadata: .object(["bindingID": .string(binding.id)])
             )
             throw CodexAutomationError.staleResumeLease(acquiredAt: existing.acquiredAt)
 
@@ -198,11 +295,12 @@ public actor CodexResumeController {
             break
         }
 
-        defer { _ = try? leases.release(bindingID: bindingID, ownerID: ownerID) }
+        defer { _ = try? leases.release(bindingID: binding.id, ownerID: ownerID) }
 
         return try await performResume(
             binding: binding,
-            text: message ?? binding.resumeMessage
+            text: text,
+            allowExplicitStoppedState: allowExplicitStoppedState
         )
     }
 
@@ -245,7 +343,8 @@ public actor CodexResumeController {
             throw CodexAutomationError.accessibilityPermissionMissing
         }
 
-        // 2) 找目标 App (bundle id 来自绑定时的真实读取, 不硬编码)
+        // 2) 找目标 Codex App。绑定记录中固定保存 Codex 的 bundle id，
+        //    用户不需要在界面填写这一项。
         let app = try await driver.locateApplication(
             bundleIdentifier: binding.applicationBundleIdentifier
         )
@@ -255,9 +354,26 @@ public actor CodexResumeController {
         try await driver.ensureCodexViewPresent(app)
 
         // 4) 找候选线程
-        let candidates = try await driver.locateThreadCandidates(
-            app, fingerprint: binding.fingerprint
-        )
+        // Codex 重启后会先显示窗口外壳，再异步挂载侧边栏列表。不能把
+        // 第一次 AX 读取到的空数组当成“目标不存在”；在同一窗口内只读轮询，
+        // 等待列表出现后再进入唯一性匹配。
+        var candidates: [CodexThreadCandidate] = []
+        let candidateDeadline = Date().addingTimeInterval(10)
+        repeat {
+            if (try? await driver.dismissBlockingWelcomeOverlay(app)) == true {
+                logger.info(
+                    .codexTargetOpened,
+                    "已关闭登录后出现的模型介绍弹窗，继续定位绑定线程",
+                    metadata: .object(["bindingID": .string(binding.id)])
+                )
+            }
+            candidates = (try? await driver.locateThreadCandidates(
+                app, fingerprint: binding.fingerprint
+            )) ?? []
+            if !candidates.isEmpty { break }
+            if Date() >= candidateDeadline { break }
+            try? await Task.sleep(for: .milliseconds(250))
+        } while Date() < candidateDeadline
 
         var verification = CodexResumeVerification()
         verification.applicationMatched = true
@@ -309,11 +425,22 @@ public actor CodexResumeController {
         logger.info(.codexTargetOpened, "已打开候选线程, 准备二次验证",
                     metadata: .object(["bindingID": .string(binding.id)]))
 
-        // 7) ★二次验证★ —— 回到主会话区重新确认
-        let context = try await driver.readOpenThreadContext(app)
-        let verified = matcher.verifyOpenedThread(
+        // 7) ★二次验证★ —— 回到主会话区重新确认。
+        // Electron 点击侧边栏后会先保留旧会话标题，再异步切换到目标会话。
+        // 不能把“读到一个非空标题”当成切换完成；必须等标题与绑定一致，
+        // 最多轮询 10 秒，避免在旧标题窗口内提前报错。
+        var context = try await driver.readOpenThreadContext(app)
+        var verified = matcher.verifyOpenedThread(
             context: context, against: binding.fingerprint
         )
+        let contextDeadline = Date().addingTimeInterval(10)
+        while !verified.passed && Date() < contextDeadline {
+            try? await Task.sleep(for: .milliseconds(250))
+            context = try await driver.readOpenThreadContext(app)
+            verified = matcher.verifyOpenedThread(
+                context: context, against: binding.fingerprint
+            )
+        }
 
         verification.threadMatched = verified.passed
         verification.secondaryContextMatched = verified.secondaryMatched
@@ -348,7 +475,8 @@ public actor CodexResumeController {
 
     private func performResume(
         binding: CodexTaskBinding,
-        text: String
+        text: String,
+        allowExplicitStoppedState: Bool = false
     ) async throws -> CodexResumeResult {
 
         var verification = CodexResumeVerification()
@@ -360,12 +488,38 @@ public actor CodexResumeController {
 
             // 8) 确认线程当前不在生成
             let busy = try await driver.detectBusyState(app)
-            verification.notCurrentlyGenerating = busy.isSafeToSend
-            guard busy.isSafeToSend else {
+            var explicitlyStopped = false
+            if allowExplicitStoppedState, busy == .unknown {
+                // 该入口只由额度横幅的监视器调用。额度页经常移除
+                // Stop/Generating 和“任务已停止”文本，但横幅本身已经
+                // 说明本轮生成终止；允许继续走 Composer/发送回读门槛。
+                explicitlyStopped = true
+            }
+            verification.notCurrentlyGenerating = busy.isSafeToSend || explicitlyStopped
+            guard verification.notCurrentlyGenerating else {
                 throw CodexAutomationError.threadAlreadyRunning
             }
 
-            // 9) 找 composer
+            // 9) 模型配置必须在提示词进入输入框之前完成，并从 Codex UI 回读确认。
+            if let preference = binding.executionPreference {
+                let selection = try await driver.applyExecutionPreference(preference, in: app)
+                verification.executionPreferenceMatched = selection.matches(preference)
+                guard verification.executionPreferenceMatched else {
+                    throw CodexAutomationError.modelSelectionFailed(
+                        expected: preference.displayName,
+                        actual: selection.visibleTitle
+                    )
+                }
+                logger.info(
+                    .codexTargetVerified,
+                    "模型配置已锁定: \(selection.visibleTitle)",
+                    metadata: .object(["bindingID": .string(binding.id)])
+                )
+            } else {
+                verification.executionPreferenceMatched = true
+            }
+
+            // 10) 找 composer
             let composer = try await driver.locateComposer(app)
             verification.composerFound = true
             verification.composerEditable = composer.isEditable
@@ -376,10 +530,14 @@ public actor CodexResumeController {
             try await driver.focusComposer(composer, in: app)
             verification.composerFocused = true
 
-            // 10) 输入并校验
+            // 11) 输入并校验
             try await driver.insertMessage(text, into: composer, in: app)
             let actual = try await driver.readComposerValue(composer, in: app)
-            let inserted = (actual ?? "").contains(text)
+            let inserted = actual.map {
+                CodexUIAutomationDriver.composerContentMatches(
+                    actual: $0, expected: text
+                )
+            } ?? false
             verification.messageInserted = inserted
             guard inserted else {
                 throw CodexAutomationError.messageInsertionFailed(
@@ -389,21 +547,21 @@ public actor CodexResumeController {
             logger.info(.codexMessageInserted, "已输入「\(text)」并校验通过",
                         metadata: .object(["bindingID": .string(binding.id)]))
 
-            // 11) 找发送控件
+            // 12) 找发送控件
             let sendControl = try await driver.locateSendControl(app)
             verification.sendControlFound = true
 
-            // 12) ★最终 Gate★ —— 12 项里除 sendConfirmed 外全部必须通过
+            // 13) ★最终 Gate★ —— 除 sendConfirmed 外全部必须通过
             guard verification.passesSendGate else {
                 throw CodexAutomationError.targetVerificationFailed(
                     "发送门槛未通过: \(verification.compactSummary)"
                 )
             }
 
-            // 13) 发送
+            // 14) 发送
             try await driver.pressSend(sendControl, in: app)
 
-            // 14) 观察确认
+            // 15) 观察确认
             let confirmation = try await driver.observeSendConfirmation(app, composer: composer)
             verification.sendConfirmed = (confirmation != .unconfirmed)
 

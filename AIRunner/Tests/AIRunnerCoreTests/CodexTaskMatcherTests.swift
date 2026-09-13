@@ -189,6 +189,41 @@ final class CodexTaskMatcherTests: XCTestCase {
         XCTAssertNotNil(result.reason)
     }
 
+    func testVerifyPassesWithAutomaticallyCapturedCodexApplication() {
+        let titleAndApp = CodexTaskFingerprint(
+            threadTitle: "长对话任务",
+            applicationBundleIdentifier: "com.openai.codex"
+        )
+        let result = matcher.verifyOpenedThread(
+            context: CodexOpenThreadContext(
+                threadTitle: "长对话任务",
+                applicationBundleIdentifier: "com.openai.codex"
+            ),
+            against: titleAndApp
+        )
+
+        XCTAssertTrue(result.passed)
+        XCTAssertTrue(result.secondaryMatched)
+        XCTAssertNil(result.reason)
+    }
+
+    func testVerifyAcceptsCodexDuplicateTitleSuffixInMainContext() {
+        let titleAndApp = CodexTaskFingerprint(
+            threadTitle: "长对话任务",
+            applicationBundleIdentifier: "com.openai.codex"
+        )
+        let result = matcher.verifyOpenedThread(
+            context: CodexOpenThreadContext(
+                threadTitle: "长对话任务 (2)",
+                applicationBundleIdentifier: "com.openai.codex"
+            ),
+            against: titleAndApp
+        )
+
+        XCTAssertTrue(result.passed)
+        XCTAssertTrue(result.secondaryMatched)
+    }
+
     // MARK: - 指纹自检
 
     func testFingerprintSufficiencyRequiresSecondarySignal() {
@@ -199,6 +234,13 @@ final class CodexTaskMatcherTests: XCTestCase {
         XCTAssertTrue(
             CodexTaskFingerprint(threadTitle: "标题", projectName: "proj")
                 .isSufficientForAutoResume
+        )
+        XCTAssertTrue(
+            CodexTaskFingerprint(
+                threadTitle: "标题",
+                applicationBundleIdentifier: "com.openai.codex"
+            ).isSufficientForAutoResume,
+            "应用标识由 AIRunner 自动读取，用户只填工作对话标题也应足够"
         )
         XCTAssertFalse(CodexTaskFingerprint().isSufficientForAutoResume)
     }

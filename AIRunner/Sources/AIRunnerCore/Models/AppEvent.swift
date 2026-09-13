@@ -74,7 +74,7 @@ public enum EventType: String, Codable, Sendable, CaseIterable {
     case runnerStopped    = "RUNNER_STOPPED"
     case runnerRejectedDuplicate = "RUNNER_REJECTED_DUPLICATE"
 
-    // ChatGPT Web 执行 (主流程)
+    // ChatGPT Web 执行（兼容通道）
     case webStepPrepared         = "WEB_STEP_PREPARED"
     case webStepSubmitted        = "WEB_STEP_SUBMITTED"
     case webPromptCopied         = "WEB_PROMPT_COPIED"

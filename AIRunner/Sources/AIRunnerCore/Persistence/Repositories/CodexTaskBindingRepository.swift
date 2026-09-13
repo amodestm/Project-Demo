@@ -19,10 +19,10 @@ public struct CodexTaskBindingRepository: Sendable {
                 display_title, project_name, repository_path, worktree_path,
                 application_bundle_identifier, application_name, window_title_hint,
                 chrome_profile_directory,
-                fingerprint_json, resume_message,
+                fingerprint_json, resume_message, preferred_model_id, reasoning_effort,
                 last_verified_at, last_resume_sent_at,
                 created_at, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             [
                 .text(binding.id),
@@ -37,6 +37,8 @@ public struct CodexTaskBindingRepository: Sendable {
                 binding.chromeProfileDirectory.map { SQLValue.text($0) } ?? .null,
                 .text((try? JSONCoding.encodeToString(binding.fingerprint)) ?? "{}"),
                 .text(binding.resumeMessage),
+                binding.executionPreference.map { .text($0.modelID) } ?? .null,
+                binding.executionPreference.map { .text($0.reasoningEffort.rawValue) } ?? .null,
                 binding.lastVerifiedAt.map { SQLValue.text(DateCoding.string(from: $0)) } ?? .null,
                 binding.lastResumeSentAt.map { SQLValue.text(DateCoding.string(from: $0)) } ?? .null,
                 .text(DateCoding.string(from: binding.createdAt)),
@@ -54,6 +56,7 @@ public struct CodexTaskBindingRepository: Sendable {
                 application_bundle_identifier = ?, application_name = ?, window_title_hint = ?,
                 chrome_profile_directory = ?,
                 fingerprint_json = ?, resume_message = ?,
+                preferred_model_id = ?, reasoning_effort = ?,
                 updated_at = ?
             WHERE id = ?
             """,
@@ -69,6 +72,8 @@ public struct CodexTaskBindingRepository: Sendable {
                 binding.chromeProfileDirectory.map { SQLValue.text($0) } ?? .null,
                 .text((try? JSONCoding.encodeToString(binding.fingerprint)) ?? "{}"),
                 .text(binding.resumeMessage),
+                binding.executionPreference.map { .text($0.modelID) } ?? .null,
+                binding.executionPreference.map { .text($0.reasoningEffort.rawValue) } ?? .null,
                 .text(DateCoding.string(from: Date())),
                 .text(binding.id),
             ]
@@ -167,6 +172,13 @@ public struct CodexTaskBindingRepository: Sendable {
                 ?? CodexTaskFingerprint()
         }()
 
+        let executionPreference: CodexExecutionPreference? = {
+            guard let modelID = row.string("preferred_model_id"),
+                  let rawEffort = row.string("reasoning_effort"),
+                  let effort = CodexReasoningEffort(rawValue: rawEffort) else { return nil }
+            return CodexExecutionPreference(modelID: modelID, reasoningEffort: effort)
+        }()
+
         return CodexTaskBinding(
             id: try row.requireString("id"),
             taskID: row.string("task_id"),
@@ -180,6 +192,7 @@ public struct CodexTaskBindingRepository: Sendable {
             chromeProfileDirectory: row.string("chrome_profile_directory"),
             fingerprint: fingerprint,
             resumeMessage: row.string("resume_message") ?? "继续",
+            executionPreference: executionPreference,
             lastVerifiedAt: row.date("last_verified_at"),
             lastResumeSentAt: row.date("last_resume_sent_at"),
             createdAt: row.date("created_at") ?? Date(),

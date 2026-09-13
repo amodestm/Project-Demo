@@ -12,7 +12,7 @@ public enum TaskStatus: String, Codable, Sendable, CaseIterable {
     case running
     case waiting
 
-    /// ★ ChatGPT Web 主流程: 当前 session 无法继续, 需要切换到另一个
+    /// ★ ChatGPT Web 兼容流程: 当前 session 无法继续, 需要切换到另一个
     /// **自己已授权**的 ChatGPT session。任务详情可从 macOS Keychain 读取用户
     /// 保存的凭据并自动登录下一个账号；程序不读 Cookie 或 session token。
     case waitingForAccount
@@ -131,7 +131,8 @@ public struct AITask: Codable, Sendable, Identifiable, Equatable, Hashable {
     public var goal: String
     public var status: TaskStatus
 
-    /// 执行通道。默认走 ChatGPT Web (人工交接账号); `api` 为可选后端。
+    /// 执行通道。新任务默认走 Codex 桌面自动执行；`chatgpt_web` 和 `api`
+    /// 是保留的兼容/可选后端。
     public var executionMode: ExecutionMode
 
     /// 这两个字段只在 `executionMode == .api` 时有意义。
@@ -166,7 +167,7 @@ public struct AITask: Codable, Sendable, Identifiable, Equatable, Hashable {
         name: String,
         goal: String,
         status: TaskStatus = .queued,
-        executionMode: ExecutionMode = .chatGPTWeb,
+        executionMode: ExecutionMode = .codexDesktop,
         primaryProvider: String = "",
         primaryModel: String = "",
         currentStep: Int = 0,
@@ -220,9 +221,15 @@ public struct AITask: Codable, Sendable, Identifiable, Equatable, Hashable {
     public var actionHint: String {
         switch status {
         case .queued:
-            return "点击「开始执行」"
+            return executionMode == .codexDesktop
+                ? "绑定 Codex 工作对话后点击「开始监控」"
+                : "点击「开始执行」"
         case .running:
-            return executionMode == .chatGPTWeb ? "正在准备下一步的续跑 prompt" : "正在执行"
+            switch executionMode {
+            case .codexDesktop: return "正在监控绑定的 Codex 工作对话"
+            case .chatGPTWeb: return "正在准备下一步的续跑 prompt"
+            case .api: return "正在执行"
+            }
         case .waiting:
             return waitingUntil.map { "等待至 \(DateCoding.string(from: $0))" } ?? "等待中"
         case .waitingForAccount:

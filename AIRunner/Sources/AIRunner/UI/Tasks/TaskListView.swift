@@ -207,16 +207,16 @@ struct TaskListView: View {
     private func actionButtons(for task: AITask) -> some View {
         switch task.status {
         case .queued:
-            Button("开始") { manager.start(task) }
+            Button(task.executionMode == .codexDesktop ? "开始监控" : "开始") { manager.start(task) }
                 .buttonStyle(.borderedProminent)
 
         case .running:
-            Button("暂停") { manager.pause(task) }
+            Button(task.executionMode == .codexDesktop ? "暂停监控" : "暂停") { manager.pause(task) }
             Button("取消", role: .destructive) { manager.cancel(task) }
 
         case .paused, .waiting, .failed,
              .waitingForAccount, .waitingForBrowser, .waitingForUser:
-            Button("继续") { manager.resume(task) }
+            Button(task.executionMode == .codexDesktop ? "恢复监控" : "继续") { manager.resume(task) }
                 .buttonStyle(.borderedProminent)
             Button("取消", role: .destructive) { manager.cancel(task) }
 

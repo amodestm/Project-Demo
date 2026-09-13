@@ -650,13 +650,15 @@ final class WebExecutionTests: XCTestCase {
         XCTAssertEqual(task.executionMode, .chatGPTWeb, "v1 老数据应默认归入 Web 主通道")
     }
 
-    func testDefaultExecutionModeIsChatGPTWeb() {
+    func testDefaultExecutionModeIsCodexDesktop() {
         XCTAssertEqual(ExecutionMode.chatGPTWeb.rawValue, "chatgpt_web")
-        XCTAssertTrue(ExecutionMode.chatGPTWeb.isPrimary)
+        XCTAssertEqual(ExecutionMode.codexDesktop.rawValue, "codex_desktop")
+        XCTAssertTrue(ExecutionMode.codexDesktop.isPrimary)
+        XCTAssertFalse(ExecutionMode.chatGPTWeb.isPrimary)
         XCTAssertFalse(ExecutionMode.api.isPrimary)
 
-        // 出厂设置默认走 Web
-        XCTAssertEqual(AppSettings.default.defaultExecutionMode, .chatGPTWeb)
+        // 出厂设置默认走 Codex 桌面主通道；旧 Web 仍保留为兼容选项。
+        XCTAssertEqual(AppSettings.default.defaultExecutionMode, .codexDesktop)
 
         // 设置升级: 老 JSON 里没有新字段也不该整份失效
         let legacyJSON = """
@@ -664,6 +666,6 @@ final class WebExecutionTests: XCTestCase {
         """
         let decoded = try? JSONCoding.decode(AppSettings.self, from: legacyJSON)
         XCTAssertEqual(decoded?.concurrency, 5, "老配置里的已有字段必须保留")
-        XCTAssertEqual(decoded?.defaultExecutionMode, .chatGPTWeb, "缺失的新字段走默认值")
+        XCTAssertEqual(decoded?.defaultExecutionMode, .codexDesktop, "缺失的新字段走默认值")
     }
 }

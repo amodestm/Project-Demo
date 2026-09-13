@@ -21,10 +21,14 @@ struct CreateTaskView: View {
         return (1...1000).contains(stepCount)
     }
 
+    private var executionMode: ExecutionMode {
+        manager.services.settings.defaultExecutionMode
+    }
+
     private var canSubmit: Bool {
         !name.trimmingCharacters(in: .whitespaces).isEmpty
             && !goal.trimmingCharacters(in: .whitespaces).isEmpty
-            && stepCountIsValid
+            && (executionMode == .codexDesktop || stepCountIsValid)
     }
 
     private var primaryRoute: RouteEntry? {
@@ -73,16 +77,18 @@ struct CreateTaskView: View {
                 }
 
                 HStack(alignment: .top, spacing: 20) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("步骤数").font(.caption.bold()).foregroundStyle(.secondary)
-                        TextField("5", text: $stepsText)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 90)
-                            .monospacedDigit()
-                        if !stepCountIsValid && !stepsText.isEmpty {
-                            Text("必须是 1 – 1000 的整数")
-                                .font(.caption2)
-                                .foregroundStyle(.red)
+                    if executionMode != .codexDesktop {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("步骤数").font(.caption.bold()).foregroundStyle(.secondary)
+                            TextField("5", text: $stepsText)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 90)
+                                .monospacedDigit()
+                            if !stepCountIsValid && !stepsText.isEmpty {
+                                Text("必须是 1 – 1000 的整数")
+                                    .font(.caption2)
+                                    .foregroundStyle(.red)
+                            }
                         }
                     }
 
@@ -96,8 +102,11 @@ struct CreateTaskView: View {
                             .padding(.vertical, 5)
                             .background(.teal.opacity(0.15), in: Capsule())
 
-                        if mode == .chatGPTWeb {
-                            Text("可在「设置 → ChatGPT Web」中调整")
+                        if mode == .codexDesktop {
+                            Text("创建后在任务详情绑定已有 Codex 工作对话")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        } else if mode == .chatGPTWeb {
+                            Text("可在「设置 → 执行方式」中调整")
                                 .font(.caption2).foregroundStyle(.tertiary)
                         } else {
                             Text(primaryRoute.map { "路由: \($0.label)" } ?? "未配置路由")
@@ -110,8 +119,9 @@ struct CreateTaskView: View {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "info.circle")
                         .foregroundStyle(.secondary)
-                    Text("MVP 会把目标拆成 N 个等价步骤, 每步都带上目标与最新检查点摘要。"
-                          + "步骤拆分策略后续可由 Task Planner 增强。")
+                    Text(executionMode == .codexDesktop
+                         ? "Codex 自动任务只保存目标和绑定信息；Codex 工作对话负责实际生成，AIRunner 只监控额度并在必要时切换账号。"
+                         : "MVP 会把目标拆成 N 个等价步骤, 每步都带上目标与最新检查点摘要。步骤拆分策略后续可由 Task Planner 增强。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -143,12 +153,18 @@ struct CreateTaskView: View {
     }
 
     private func submit() {
-        guard let stepCount, stepCountIsValid else { return }
+        let count: Int
+        if executionMode == .codexDesktop {
+            count = 1
+        } else {
+            guard let stepCount, stepCountIsValid else { return }
+            count = stepCount
+        }
         do {
             _ = try manager.createTask(
                 name: name,
                 goal: goal,
-                numberOfSteps: stepCount
+                numberOfSteps: count
             )
             isPresented = false
         } catch {

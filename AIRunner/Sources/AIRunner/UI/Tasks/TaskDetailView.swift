@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import AIRunnerCore
 
 struct TaskDetailView: View {
@@ -11,11 +12,27 @@ struct TaskDetailView: View {
     @State private var showingAllSteps = false
 
     // Codex 绑定表单
-    @State private var codexDisplayTitle = ""
     @State private var codexThreadTitle = ""
     @State private var codexProjectName = ""
-    @State private var codexBundleID = ""
+    @State private var codexPrompt = "继续"
+    @State private var codexModelID = "gpt-5.6-sol"
+    @State private var codexReasoningEffort: CodexReasoningEffort = .high
     @State private var showingCodexBindingForm = false
+    @State private var showingCodexExecutionEditor = false
+    /// 当前编辑器草稿对应的绑定 ID。绑定区会随 manager 发布状态而重绘，
+    /// 不能再用空的 @State 默认值覆盖已经保存的草稿。
+    @State private var codexEditorBindingID: String?
+    @State private var isReadingCodexTitle = false
+    /// 主界面账号选择器当前选中的 Chrome Profile。
+    @State private var selectedCodexProfileDirectory: String?
+
+    private let codexModels: [(id: String, name: String)] = [
+        ("gpt-5.6-sol", "GPT-5.6 Sol"),
+        ("gpt-5.6-terra", "GPT-5.6 Terra"),
+        ("gpt-5.6-luna", "GPT-5.6 Luna"),
+        ("gpt-6-astra", "GPT-6 Astra"),
+        ("gpt-5.5", "GPT-5.5"),
+    ]
 
     private var steps: [TaskStep] { manager.steps(for: task) }
     private var latestCheckpoint: Checkpoint? { manager.latestCheckpoint(for: task) }
@@ -41,12 +58,16 @@ struct TaskDetailView: View {
             VStack(alignment: .leading, spacing: 20) {
                 headerSection
                 actionSection
-                webExecutionSection
-                codexSection
-                metricsSection
-                checkpointSection
-                stepsSection
-                footerSection
+                if task.executionMode == .codexDesktop {
+                    codexSection
+                } else {
+                    webExecutionSection
+                    codexSection
+                    metricsSection
+                    checkpointSection
+                    stepsSection
+                    footerSection
+                }
             }
             .padding(22)
         }
@@ -63,6 +84,7 @@ struct TaskDetailView: View {
         .sheet(isPresented: $showingLogs) {
             LogView(manager: manager, task: task, isPresented: $showingLogs)
         }
+        .onAppear { syncSelectedCodexProfile() }
     }
 
     // MARK: - 头部
@@ -98,11 +120,13 @@ struct TaskDetailView: View {
                 .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
             }
 
-            ProgressView(value: task.progress) {
-                HStack {
-                    Text(task.progressText).font(.caption.monospacedDigit())
-                    Spacer()
-                    Text("\(Int(task.progress * 100))%").font(.caption.monospacedDigit())
+            if task.executionMode != .codexDesktop {
+                ProgressView(value: task.progress) {
+                    HStack {
+                        Text(task.progressText).font(.caption.monospacedDigit())
+                        Spacer()
+                        Text("\(Int(task.progress * 100))%").font(.caption.monospacedDigit())
+                    }
                 }
             }
         }
@@ -116,20 +140,29 @@ struct TaskDetailView: View {
             case .queued:
                 Button {
                     manager.start(task)
-                } label: { Label("开始执行", systemImage: "play.fill") }
+                } label: {
+                    Label(task.executionMode == .codexDesktop ? "开始监控" : "开始执行",
+                          systemImage: "play.fill")
+                }
                     .buttonStyle(.borderedProminent)
 
             case .running:
                 Button {
                     manager.pause(task)
-                } label: { Label("暂停", systemImage: "pause.fill") }
+                } label: {
+                    Label(task.executionMode == .codexDesktop ? "暂停监控" : "暂停",
+                          systemImage: "pause.fill")
+                }
                     .buttonStyle(.borderedProminent)
 
             case .paused, .waiting, .failed,
                  .waitingForAccount, .waitingForBrowser, .waitingForUser:
                 Button {
                     manager.resume(task)
-                } label: { Label("继续", systemImage: "play.fill") }
+                } label: {
+                    Label(task.executionMode == .codexDesktop ? "恢复监控" : "继续",
+                          systemImage: "play.fill")
+                }
                     .buttonStyle(.borderedProminent)
 
             case .completed, .cancelled:
@@ -144,7 +177,7 @@ struct TaskDetailView: View {
 
             Spacer()
 
-            if manager.isActive(task) {
+            if task.executionMode != .codexDesktop, manager.isActive(task) {
                 HStack(spacing: 5) {
                     ProgressView().controlSize(.small)
                     Text("Runner 正在执行").font(.caption).foregroundStyle(.secondary)
@@ -300,26 +333,176 @@ struct TaskDetailView: View {
 
     private var currentCodexBinding: CodexTaskBinding? { manager.codexBinding(for: task) }
 
+    /// 主界面显示的账号池。设置页保存的是有序目录名；这里再从当前机器
+    /// 读取对应 Profile 的用户可读名称/邮箱别名，避免让用户面对“Profile 1”。
+    private var configuredCodexProfiles: [ChromeProfile] {
+        let allProfiles = manager.availableChromeProfiles()
+            .first(where: { $0.browser == .chrome })?.profiles ?? []
+        let directories = services.settings.accountRotationProfileDirectories
+        guard !directories.isEmpty else { return allProfiles }
+        return directories.compactMap { directory in
+            allProfiles.first(where: { $0.directoryName == directory })
+        }
+    }
+
+    private var currentCodexProfileDirectory: String? {
+        manager.currentAccountProfileName(for: task)
+    }
+
+    private func codexProfileDisplayName(_ profile: ChromeProfile) -> String {
+        let alias = services.settings.accountRotationProfileAliases[profile.directoryName]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !alias.isEmpty { return alias }
+        return profile.displayName.isEmpty ? profile.directoryName : profile.displayName
+    }
+
+    private func codexProfileDisplayName(directory: String) -> String {
+        if let profile = configuredCodexProfiles.first(where: { $0.directoryName == directory }) {
+            return codexProfileDisplayName(profile)
+        }
+        return services.settings.accountRotationProfileAliases[directory]
+            ?? directory
+    }
+
+    private func syncSelectedCodexProfile() {
+        let current = currentCodexProfileDirectory
+        if let current,
+           configuredCodexProfiles.contains(where: { $0.directoryName == current }) {
+            selectedCodexProfileDirectory = current
+        } else if selectedCodexProfileDirectory == nil {
+            selectedCodexProfileDirectory = configuredCodexProfiles.first?.directoryName
+        }
+    }
+
+    /// 账号选择器是 Codex 主执行界面的唯一账号入口。它只显示用户配置的
+    /// 邮箱别名，切换按钮复用安全退出 + 指定 Profile OAuth 链路。
+    @ViewBuilder
+    private var codexAccountSelector: some View {
+        if usesBrowserOAuth {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Label("Codex 账号", systemImage: "person.crop.circle")
+                        .font(.callout.weight(.semibold))
+                    if let current = currentCodexProfileDirectory {
+                        Text("当前：\(codexProfileDisplayName(directory: current))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("尚未选择")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+
+                if configuredCodexProfiles.isEmpty {
+                    Text("没有找到已配置的 Chrome Profile。请在设置中检测并勾选至少两个 Profile，再回到这里选择账号。")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    HStack(spacing: 10) {
+                        Picker("选择账号", selection: Binding(
+                            get: {
+                                selectedCodexProfileDirectory
+                                    ?? currentCodexProfileDirectory
+                                    ?? configuredCodexProfiles[0].directoryName
+                            },
+                            set: { selectedCodexProfileDirectory = $0 }
+                        )) {
+                            ForEach(configuredCodexProfiles) { profile in
+                                Text(codexProfileDisplayName(profile))
+                                    .tag(profile.directoryName)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(minWidth: 180, alignment: .leading)
+
+                        Button {
+                            guard let selectedCodexProfileDirectory else { return }
+                            manager.switchCodexAccount(task, to: selectedCodexProfileDirectory)
+                        } label: {
+                            if manager.isRotatingAccount {
+                                HStack(spacing: 6) {
+                                    ProgressView().controlSize(.small)
+                                    Text("切换中…")
+                                }
+                            } else {
+                                Label("切换到所选账号", systemImage: "arrow.triangle.2.circlepath")
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.purple)
+                        .disabled(
+                            manager.isRotatingAccount
+                            || currentCodexBinding == nil
+                            || selectedCodexProfileDirectory == nil
+                            || task.status == .running
+                        )
+                        .help(task.status == .running
+                              ? "当前任务仍在运行，请先暂停监控再切换账号"
+                              : "安全退出当前 Codex 账号，使用所选 Chrome Profile 完成 OAuth；不会发送任务消息")
+                    }
+                }
+
+                if task.status == .running {
+                    Label(
+                        "当前任务正在监视中。请先暂停监控再手动切换；额度耗尽时，自动切换会在安全门通过后执行。",
+                        systemImage: "lock.shield"
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if let message = manager.lastInfoMessage,
+                   manager.isRotatingAccount || message.contains("切换") || message.contains("登录") {
+                    Text(message)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(10)
+            .background(.purple.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
+        } else if task.executionMode == .codexDesktop {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "person.crop.circle.badge.exclamationmark")
+                    .foregroundStyle(.orange)
+                Text("当前使用的是钥匙串兼容登录。若要在主界面按邮箱选择 Chrome Profile，请到设置开启“Chrome Profile + Codex 浏览器授权切换”。")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(10)
+            .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
     @ViewBuilder
     private var codexSection: some View {
-        if task.executionMode == .chatGPTWeb {
+        if task.executionMode == .chatGPTWeb || task.executionMode == .codexDesktop {
             VStack(alignment: .leading, spacing: 12) {
 
                 HStack(spacing: 8) {
                     Label("Codex 自动恢复", systemImage: "bolt.horizontal.circle")
                         .font(.headline)
-                    Text("账号交接后自动续跑")
+                    Text(task.executionMode == .codexDesktop ? "主执行通道" : "兼容模式")
                         .font(.caption2.weight(.semibold))
                         .padding(.horizontal, 7).padding(.vertical, 3)
                         .background(.indigo.opacity(0.18), in: Capsule())
                         .foregroundStyle(.indigo)
                     Spacer()
-                    Text(usesBrowserOAuth
-                         ? "绑定线程只发「继续」· 账号由 Codex 官方浏览器授权处理"
-                         : "绑定线程只发「继续」· 账号登录由钥匙串模块处理")
+                    Text(task.executionMode == .codexDesktop
+                         ? "按标题锁定 · 选择账号 · 自动监控额度"
+                         : (usesBrowserOAuth
+                            ? "按标题锁定工作对话 · 模型与提示词按任务预设"
+                            : "按标题锁定工作对话 · 账号登录由钥匙串模块处理"))
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
+
+                codexAccountSelector
 
                 if let binding = currentCodexBinding {
                     codexBoundView(binding)
@@ -346,16 +529,12 @@ struct TaskDetailView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(binding.displayTitle)
+                    Text(binding.fingerprint.threadTitle ?? binding.displayTitle)
                         .font(.callout.weight(.semibold))
-                    Text("目标: \(binding.displayTarget)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    if !binding.fingerprint.summary.isEmpty {
-                        Text(binding.fingerprint.summary)
+                    if let projectName = binding.projectName, !projectName.isEmpty {
+                        Text("项目文件夹：\(projectName)")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                            .lineLimit(1)
                     }
                 }
                 Spacer()
@@ -366,30 +545,59 @@ struct TaskDetailView: View {
                 }
             }
 
-            // 操作按钮: Test Locate → Dry Run → Resume (递进, 绝不跳级)
+            HStack(spacing: 8) {
+                Label(
+                    binding.executionPreference?.displayName ?? "沿用 Codex 当前模型",
+                    systemImage: "cpu"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Text("提示词: \(binding.resumeMessage)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer()
+                Button("编辑绑定") {
+                    loadCodexExecutionEditor(binding)
+                }
+                .controlSize(.small)
+            }
+
+            if showingCodexExecutionEditor {
+                codexExecutionEditor(binding: binding)
+                    .onAppear {
+                        // 仅在切换到另一条绑定时从数据库装载；同一条绑定的
+                        // manager 更新不能覆盖用户正在编辑的字段。
+                        if codexEditorBindingID != binding.id {
+                            loadCodexExecutionEditor(binding)
+                        }
+                    }
+            }
+
+            // 操作按钮: 定位 → 锁定模型 → 完整发送（递进验证）。
             HStack(spacing: 10) {
                 Button {
                     manager.testLocateCodex(bindingID: binding.id)
                 } label: {
-                    Label("Test Locate", systemImage: "scope")
+                    Label("定位测试", systemImage: "scope")
                 }
                 .help("定位并打开绑定的线程, 二次验证后停住 —— 绝不发送")
 
                 Button {
-                    manager.dryRunCodex(bindingID: binding.id)
+                    manager.prepareCodexExecution(bindingID: binding.id)
                 } label: {
-                    Label("Dry Run", systemImage: "play.circle")
+                    Label("锁定与模型测试", systemImage: "checkmark.shield")
                 }
-                .help("定位 + 验证 + 找到输入框, 但不输入、不发送")
+                .help("锁定目标对话，设置并回读模型；不输入提示词，也不发送")
 
                 Button {
                     manager.resumeCodex(bindingID: binding.id)
                 } label: {
-                    Label("发送「继续」", systemImage: "paperplane.fill")
+                    Label("锁定并发送", systemImage: "paperplane.fill")
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.indigo)
-                .help("真正发送「\(binding.resumeMessage)」到绑定的 Codex 线程")
+                .help("锁定线程和模型后，发送预设提示词「\(binding.resumeMessage)」")
 
                 Spacer()
 
@@ -411,38 +619,58 @@ struct TaskDetailView: View {
         VStack(alignment: .leading, spacing: 10) {
             if showingCodexBindingForm {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("绑定一个已存在的 Codex 线程")
+                    Text("绑定一个已存在的 Codex 工作对话")
                         .font(.callout.weight(.semibold))
 
                     Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 6) {
                         GridRow {
-                            Text("显示名").font(.caption).foregroundStyle(.secondary)
-                            TextField("例如: 300 份 PDF 研究", text: $codexDisplayTitle)
+                            Text("工作对话标题").font(.caption).foregroundStyle(.secondary)
+                            HStack(spacing: 6) {
+                                TextField("Codex 左侧栏中显示的完整对话名称", text: $codexThreadTitle)
+                                    .textFieldStyle(.roundedBorder)
+                                Button {
+                                    readCurrentCodexTitle()
+                                } label: {
+                                    if isReadingCodexTitle {
+                                        ProgressView().controlSize(.small)
+                                    } else {
+                                        Text("读取当前对话")
+                                    }
+                                }
+                                .disabled(isReadingCodexTitle)
+                                .help("激活 Codex 后读取当前主会话标题，最多等待 10 秒；不会输入或发送消息")
+                            }
+                        }
+                        GridRow {
+                            Text("项目文件夹名称").font(.caption).foregroundStyle(.secondary)
+                            TextField("可选，用于辅助确认，例如 AIRunner", text: $codexProjectName)
                                 .textFieldStyle(.roundedBorder)
                         }
                         GridRow {
-                            Text("线程标题").font(.caption).foregroundStyle(.secondary)
-                            TextField("Codex 侧边栏里的线程名", text: $codexThreadTitle)
-                                .textFieldStyle(.roundedBorder)
+                            Text("预设模型").font(.caption).foregroundStyle(.secondary)
+                            modelPicker
                         }
                         GridRow {
-                            Text("项目名 (可选)").font(.caption).foregroundStyle(.secondary)
-                            TextField("辅助信号, 提升匹配精度", text: $codexProjectName)
-                                .textFieldStyle(.roundedBorder)
+                            Text("思考程度").font(.caption).foregroundStyle(.secondary)
+                            reasoningPicker
                         }
                         GridRow {
-                            Text("App Bundle ID").font(.caption).foregroundStyle(.secondary)
-                            TextField("com.openai.chatgpt 等", text: $codexBundleID)
+                            Text("提示词").font(.caption).foregroundStyle(.secondary)
+                            TextField("发送到目标对话的内容", text: $codexPrompt)
                                 .textFieldStyle(.roundedBorder)
                         }
                     }
+
+                    Text("工作对话标题就是 Codex 左侧栏中这条对话显示的名称。必须完整一致；项目文件夹名称只用于辅助确认。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
 
                     HStack {
                         Button("保存绑定") {
                             saveCodexBinding()
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(codexDisplayTitle.isEmpty || codexThreadTitle.isEmpty || codexBundleID.isEmpty)
+                        .disabled(codexThreadTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                         Button("取消") {
                             showingCodexBindingForm = false
@@ -452,17 +680,15 @@ struct TaskDetailView: View {
                 }
             } else {
                 HStack(spacing: 10) {
-                    Text("尚未绑定 Codex 线程。绑定后可在账号交接后自动发送「继续」。")
+                    Text("尚未绑定 Codex 工作对话。填写左侧栏中的对话标题即可保存；项目文件夹名称可选。")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     Spacer()
                     Button {
+                        resetCodexForm()
                         showingCodexBindingForm = true
-                        if let pref = services.settings.codexPreferredApplicationBundleIdentifier {
-                            codexBundleID = pref
-                        }
                     } label: {
-                        Label("绑定 Codex 线程", systemImage: "link")
+                        Label("绑定 Codex 工作对话", systemImage: "link")
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.indigo)
@@ -516,7 +742,7 @@ struct TaskDetailView: View {
                 .disabled(task.status.isTerminal || manager.isRotatingAccount)
                 .help("先确认绑定线程没有生成内容，再走真实的 Codex 退出、Profile 轮换、OAuth 登录和自动恢复流程")
             }
-            Text("开启后，AIRunner 会持续检测额度耗尽或登录失效。只有任务已停止生成、页面处于空闲且异常连续确认后，才会自动退出当前 Codex 账号并切换下一个；切换完成后会自动发送一次「\(binding.resumeMessage)」。")
+            Text("开启后，AIRunner 会持续检测额度耗尽或登录失效。只有任务已停止生成、页面处于空闲且异常连续确认后，才会自动退出当前 Codex 账号并切换下一个；切换完成后会重新锁定目标对话与模型，再发送一次「\(binding.resumeMessage)」。")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -527,9 +753,19 @@ struct TaskDetailView: View {
     private func codexVerificationView(_ verification: CodexResumeVerification) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Divider()
-            Text("验证报告 (\(verification.passedGateCount)/12 通过)")
+            Text("验证报告 (\(verification.passedGateCount)/13 通过)")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
+            if verification.threadMatched,
+               verification.executionPreferenceMatched,
+               !verification.messageInserted {
+                Label(
+                    "锁定与模型测试会停在发送前；要验证提示词输入和“继续”，请点击“锁定并发送”。",
+                    systemImage: "info.circle"
+                )
+                .font(.caption2)
+                .foregroundStyle(.indigo)
+            }
             ScrollView {
                 Text(verification.report)
                     .font(.system(.caption2, design: .monospaced))
@@ -544,28 +780,150 @@ struct TaskDetailView: View {
 
     // MARK: Codex 绑定表单操作
 
+    private var modelPicker: some View {
+        Picker("预设模型", selection: $codexModelID) {
+            ForEach(codexModels, id: \.id) { model in
+                Text(model.name).tag(model.id)
+            }
+        }
+        .labelsHidden()
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var reasoningPicker: some View {
+        Picker("思考程度", selection: $codexReasoningEffort) {
+            ForEach(CodexReasoningEffort.allCases, id: \.self) { effort in
+                Text(effort.displayName).tag(effort)
+            }
+        }
+        .labelsHidden()
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func codexExecutionEditor(binding: CodexTaskBinding) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 6) {
+                GridRow {
+                    Text("工作对话标题").font(.caption).foregroundStyle(.secondary)
+                    TextField("Codex 左侧栏中显示的完整对话名称", text: $codexThreadTitle)
+                        .textFieldStyle(.roundedBorder)
+                }
+                GridRow {
+                    Text("项目文件夹名称").font(.caption).foregroundStyle(.secondary)
+                    TextField("可选，用于辅助确认", text: $codexProjectName)
+                        .textFieldStyle(.roundedBorder)
+                }
+                GridRow {
+                    Text("预设模型").font(.caption).foregroundStyle(.secondary)
+                    modelPicker
+                }
+                GridRow {
+                    Text("思考程度").font(.caption).foregroundStyle(.secondary)
+                    reasoningPicker
+                }
+                GridRow {
+                    Text("提示词").font(.caption).foregroundStyle(.secondary)
+                    TextField("发送到目标对话的内容", text: $codexPrompt)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+            HStack {
+                Button("保存绑定") {
+                    let title = codexThreadTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let projectName = codexProjectName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let prompt = codexPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                    var updated = binding
+                    updated.displayTitle = title
+                    updated.projectName = projectName.isEmpty ? nil : projectName
+                    updated.applicationBundleIdentifier = "com.openai.codex"
+                    updated.applicationName = "Codex"
+                    updated.fingerprint.threadTitle = title
+                    updated.fingerprint.projectName = projectName.isEmpty ? nil : projectName
+                    updated.fingerprint.applicationBundleIdentifier = "com.openai.codex"
+                    updated.resumeMessage = prompt.isEmpty ? "继续" : prompt
+                    updated.executionPreference = CodexExecutionPreference(
+                        modelID: codexModelID,
+                        reasoningEffort: codexReasoningEffort
+                    )
+                    updated.updatedAt = Date()
+                    if manager.saveCodexBinding(updated) {
+                        showingCodexExecutionEditor = false
+                        codexEditorBindingID = nil
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(codexThreadTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                Button("取消") {
+                    showingCodexExecutionEditor = false
+                    codexEditorBindingID = nil
+                }
+            }
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func loadCodexExecutionEditor(_ binding: CodexTaskBinding) {
+        codexEditorBindingID = binding.id
+        codexThreadTitle = binding.fingerprint.threadTitle ?? binding.displayTitle
+        codexProjectName = binding.projectName ?? binding.fingerprint.projectName ?? ""
+        codexPrompt = binding.resumeMessage
+        codexModelID = binding.executionPreference?.modelID ?? "gpt-5.6-sol"
+        codexReasoningEffort = binding.executionPreference?.reasoningEffort ?? .high
+        showingCodexExecutionEditor = true
+    }
+
     private func saveCodexBinding() {
+        let title = codexThreadTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return }
+        let projectName = codexProjectName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = codexPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let fingerprint = CodexTaskFingerprint(
-            threadTitle: codexThreadTitle.isEmpty ? nil : codexThreadTitle,
-            projectName: codexProjectName.isEmpty ? nil : codexProjectName,
-            applicationBundleIdentifier: codexBundleID.isEmpty ? nil : codexBundleID
+            threadTitle: title,
+            projectName: projectName.isEmpty ? nil : projectName,
+            applicationBundleIdentifier: "com.openai.codex"
         )
         let binding = CodexTaskBinding(
             taskID: task.id,
-            displayTitle: codexDisplayTitle,
-            applicationBundleIdentifier: codexBundleID,
-            fingerprint: fingerprint
+            displayTitle: title,
+            projectName: projectName.isEmpty ? nil : projectName,
+            applicationBundleIdentifier: "com.openai.codex",
+            applicationName: "Codex",
+            chromeProfileDirectory: selectedCodexProfileDirectory,
+            fingerprint: fingerprint,
+            resumeMessage: prompt.isEmpty ? "继续" : prompt,
+            executionPreference: CodexExecutionPreference(
+                modelID: codexModelID,
+                reasoningEffort: codexReasoningEffort
+            )
         )
-        manager.saveCodexBinding(binding)
-        showingCodexBindingForm = false
-        resetCodexForm()
+        if manager.saveCodexBinding(binding) {
+            showingCodexBindingForm = false
+            resetCodexForm()
+        }
     }
 
     private func resetCodexForm() {
-        codexDisplayTitle = ""
         codexThreadTitle = ""
         codexProjectName = ""
-        codexBundleID = ""
+        codexPrompt = "继续"
+        codexModelID = "gpt-5.6-sol"
+        codexReasoningEffort = .high
+    }
+
+    private func readCurrentCodexTitle() {
+        isReadingCodexTitle = true
+        Task {
+            defer { isReadingCodexTitle = false }
+            let title = await manager.readCurrentCodexThreadTitle()
+            // 读取动作需要短暂激活 Codex 以刷新 Electron 的 AX 树；读完后把
+            // AIRunner 窗口带回前台，让用户可以直接继续填写并保存绑定表单。
+            NSApp.activate(ignoringOtherApps: true)
+            if let title {
+                codexThreadTitle = title
+            }
+        }
     }
 
     /// 已完成的步骤数 (检查点记录的是"最后完成的 index", 这里换算成个数)。
