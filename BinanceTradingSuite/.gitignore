@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# 含真实密钥的本地文件 —— 绝对不要提交
+run.sh
+run.shy
+run.sh.*
+!run.sh.example
+trading_platform/start.sh
+!trading_platform/start.sh.example
+.env
+*.key
+*.pem
+secrets/
+
+# 数据与日志
+*.log
+*.pid
+*.sqlite3
+*.db
+.liq_harvest/
+liquidation_bar.json
+triangle_crash.json
+
+# 本地工作区元数据（含内网/集群信息，不对外）
+.workbuddy/
+.claude/
+
+# 编辑器
+.idea/
+.vscode/
+*.swp

@@ -5,11 +5,9 @@
 | 项目 | 定位 | 技术栈 |
 |------|------|--------|
 | [AIRunner](./AIRunner/) | **AI 长任务自动执行器**：拆成有序步骤逐步调 AI，额度/限流时**自动切换账号（零点击）**并自动续跑，每步落盘+检查点 | Swift 6 + SwiftUI + SwiftPM（零外部依赖） |
-| [LiqHarvest](./LiqHarvest/) | **完整系统**：实时行情驱动的自动化交易引擎（数据 / 策略 / 执行 / 风控 / 可视化全链路） | Python + asyncio + WebSocket + SQLite |
-| [LiquidationMonitor](./LiquidationMonitor/) | 子系统：全市场强平瀑布监控 + 箱体震荡/砸盘形态扫描 | Python + WebSocket + customtkinter |
-| [QuickTrade](./QuickTrade/) | 子系统：一键多空对冲交易终端（快速下单） | Python + aiohttp + Flask + 桌面 GUI |
+| [BinanceTradingSuite](./BinanceTradingSuite/) | **实时行情自动化交易套件**（含 3 个子系统）：LiqHarvest 完整交易引擎 / LiquidationMonitor 强平监控 / QuickTrade 对冲终端 | Python + asyncio + WebSocket + SQLite |
 
-> `LiquidationMonitor` 与 `QuickTrade` 是从 `LiqHarvest` 中抽取出来的两个子系统，各自配有独立 README 便于单独阅读；`LiqHarvest/` 是自包含的全量代码，可独立运行。`AIRunner/` 为零依赖 SwiftPM 工程，详见其自带 README。
+> `BinanceTradingSuite/` 内含三个可单独运行的子项目：`LiqHarvest`（自包含全量系统）、`LiquidationMonitor`（强平瀑布 + 形态扫描）、`QuickTrade`（一键多空对冲终端）。详见 [BinanceTradingSuite/README.md](./BinanceTradingSuite/README.md)。
 
 ---
 
@@ -21,45 +19,47 @@ Project-Demo/
 │   ├── Package.swift            # SwiftPM 清单（macOS 14+，零外部依赖）
 │   ├── Sources/AIRunnerCore/    # 零 UI 依赖核心：JobRunner / ModelRouter / RetryManager / Checkpoint / Persistence
 │   ├── Sources/AIRunner/        # SwiftUI 壳
-│   ├── Tests/AIRunnerCoreTests/ # 69 个测试
+│   ├── Tests/AIRunnerCoreTests/ # 测试套件
 │   ├── Scripts/make_app.sh      # 组装可双击 .app
 │   └── README.md                # 设计规则 / 架构 / 安全说明
-├── LiqHarvest/                  # 完整交易系统（自包含）
-│   ├── data_feed.py             # 数据层：3 路 WebSocket
-│   ├── strategy.py              # 策略：清算瀑布收割
-│   ├── mean_revert.py           # 策略：RSI 均值回归
-│   ├── scalp_harvester.py       # 策略：高频顺势剥头皮
-│   ├── three_wave_screener.py   # 策略：三浪下跌形态评分
-│   ├── bottom_fisher.py         # 策略：超跌反弹
-│   ├── scalp_move75x.py         # 策略：75x 双向剥头皮
-│   ├── executor.py              # 执行层：签名 / 精度缓存 / 下单
-│   ├── risk.py                  # 风控层：持仓 / 日亏损 / TP·SL
-│   ├── trade_db.py              # 持久化：SQLite 逐笔 + 日报
-│   ├── dashboard.py             # Web 控制面板
-│   ├── monitor.py               # 终端监控
-│   ├── notifier.py              # Telegram 通知
-│   ├── liquidation_bar.5s.py    # SwiftBar 菜单栏挂件
-│   ├── config.py                # 全系统参数
-│   └── README.md
-├── LiquidationMonitor/          # 子系统：行情形态监控
-│   ├── liquidation_daemon.py    # 守护进程：强平流 + 价格跌幅
-│   ├── triangle_crash_scanner.py# 形态扫描器：箱体/砸盘/突破/急跌
-│   ├── liquidation_viewer.py    # 桌面 GUI 面板
-│   └── README.md
-├── QuickTrade/                  # 子系统：对冲交易终端
-│   ├── trading_platform/        # 核心模块
-│   ├── run.sh.example           # 启动脚本模板（需填自己的 API Key）
-│   └── README.md
+├── BinanceTradingSuite/         # 实时行情自动化交易套件（Python）
+│   ├── LiqHarvest/              # 完整交易系统（自包含）
+│   │   ├── data_feed.py         # 数据层：3 路 WebSocket
+│   │   ├── strategy.py          # 策略：清算瀑布收割
+│   │   ├── mean_revert.py       # 策略：RSI 均值回归
+│   │   ├── scalp_harvester.py   # 策略：高频顺势剥头皮
+│   │   ├── three_wave_screener.py # 策略：三浪下跌形态评分
+│   │   ├── bottom_fisher.py     # 策略：超跌反弹
+│   │   ├── scalp_move75x.py     # 策略：75x 双向剥头皮
+│   │   ├── executor.py          # 执行层：签名 / 精度缓存 / 下单
+│   │   ├── risk.py              # 风控层：持仓 / 日亏损 / TP·SL
+│   │   ├── trade_db.py          # 持久化：SQLite 逐笔 + 日报
+│   │   ├── dashboard.py         # Web 控制面板
+│   │   ├── monitor.py           # 终端监控
+│   │   ├── notifier.py          # Telegram 通知
+│   │   ├── liquidation_bar.5s.py # SwiftBar 菜单栏挂件
+│   │   ├── config.py            # 全系统参数
+│   │   └── README.md
+│   ├── LiquidationMonitor/      # 子系统：行情形态监控
+│   │   ├── liquidation_daemon.py    # 守护进程：强平流 + 价格跌幅
+│   │   ├── triangle_crash_scanner.py# 形态扫描器：箱体/砸盘/突破/急跌
+│   │   ├── liquidation_viewer.py    # 桌面 GUI 面板
+│   │   └── README.md
+│   ├── QuickTrade/              # 子系统：对冲交易终端
+│   │   ├── trading_platform/    # 核心模块
+│   │   ├── run.sh.example       # 启动脚本模板（需填自己的 API Key）
+│   │   └── README.md
+│   └── README.md                # 套件总览 / 安全 / 免责声明
 └── README.md
 ```
 
 ---
 
-## 快速开始
+## 快速开始（BinanceTradingSuite · LiqHarvest 主系统）
 
 ```bash
 git clone https://github.com/amodestm/Project-Demo.git
-cd Project-Demo/LiqHarvest
+cd Project-Demo/BinanceTradingSuite/LiqHarvest
 pip install -r requirements.txt
 
 export BINANCE_API_KEY="你的key"
@@ -67,7 +67,7 @@ export BINANCE_API_SECRET="你的secret"
 PYTHONUNBUFFERED=1 python3 -u -m binance_liq_harvest.main
 ```
 
-未配置密钥时程序进入**模拟模式**，只打印不下单，可安全验证流程。
+未配置密钥时程序进入**模拟模式**，只打印不下单，可安全验证流程。其余两个子系统的启动方式见各自目录内的 README。
 
 ---
 
@@ -84,7 +84,7 @@ export BINANCE_API_KEY="你的key"
 export BINANCE_API_SECRET="你的secret"
 ```
 
-- `.gitignore` 已排除 `run.sh` / `run.shy` / `trading_platform/start.sh` / `.env` / `*.key` / `*.pem` / `*.sqlite3` / `*.log` / 本地工作区元数据。
+- 仓库级 `.gitignore` 已排除 `run.sh` / `run.shy` / `trading_platform/start.sh` / `.env` / `*.key` / `*.pem` / `*.sqlite3` / `*.log` / 本地工作区元数据。
 
 > 若你曾把真实密钥提交进仓库，请立即到 Binance 后台吊销（revoke）并重新生成。
 
@@ -93,8 +93,8 @@ export BINANCE_API_SECRET="你的secret"
 ## 环境要求
 
 - macOS（GUI 与菜单栏挂件部分依赖 macOS，核心逻辑跨平台）
-- Python 3.9+
-- 依赖：`aiohttp`、`aiohttp_socks`、`websockets`、`customtkinter`、`flask` 等
+- Python 3.9+（BinanceTradingSuite）；Xcode 15+ / Swift 6（AIRunner）
+- Python 依赖：`aiohttp`、`aiohttp_socks`、`websockets`、`customtkinter`、`flask` 等
 - 网络：需能访问 Binance 行情与交易接口（如处受限网络，脚本内置代理自动探测）
 
 ---
