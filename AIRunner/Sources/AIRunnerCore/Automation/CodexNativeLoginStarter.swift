@@ -84,11 +84,14 @@ public struct CodexNativeLoginStarter: CodexNativeLoginStarting {
             throw CodexBrowserOAuthError.codexLoginWindowFocusFailed
         }
         let activationDeadline = Date().addingTimeInterval(5)
-        while !codex.isActive, Date() < activationDeadline {
+        while !Self.isFrontmost(codex), Date() < activationDeadline {
             try Task.checkCancellation()
             try? await Task.sleep(for: .milliseconds(250))
         }
-        guard codex.isActive else {
+        // NSRunningApplication.isActive 在 Electron 窗口刚被 AXRaise 提升时可能
+        // 仍然滞后；同时检查 AXFrontmost/系统 frontmost，避免因为这个瞬时值
+        // 提前退出，导致“已经锁定 Profile 但没有点击继续登录”。
+        guard Self.isFrontmost(codex) else {
             throw CodexBrowserOAuthError.codexLoginWindowFocusFailed
         }
 
@@ -184,19 +187,42 @@ public struct CodexNativeLoginStarter: CodexNativeLoginStarting {
         guard let window else { return false }
 
         let root = AXUIElementCreateApplication(application.processIdentifier)
-        _ = AXUIElementSetAttributeValue(
+        let frontmostStatus = AXUIElementSetAttributeValue(
             root, kAXFrontmostAttribute as CFString, kCFBooleanTrue
         )
+        _ = application.unhide()
         _ = application.activate(options: [.activateAllWindows])
-        _ = AXUIElementSetAttributeValue(
+        let mainStatus = AXUIElementSetAttributeValue(
             window, kAXMainAttribute as CFString, kCFBooleanTrue
         )
-        _ = AXUIElementSetAttributeValue(
+        let focusedStatus = AXUIElementSetAttributeValue(
             window, kAXFocusedAttribute as CFString, kCFBooleanTrue
         )
-        return AXUIElementPerformAction(
+        let raiseStatus = AXUIElementPerformAction(
             window, kAXRaiseAction as CFString
-        ) == .success
+        )
+        // “已是主窗口”时 AXRaise 偶尔返回 failure，但 main/focused 设置已经
+        // 成功；只要至少有一个标准聚焦动作成功即可继续走后面的前台确认。
+        return frontmostStatus == .success
+            || mainStatus == .success
+            || focusedStatus == .success
+            || raiseStatus == .success
+    }
+
+    /// 判断 Codex 是否真的位于前台。NSRunningApplication.isActive 在 Electron
+    /// 切窗动画期间可能滞后，因此以系统 frontmost 和 AXFrontmost 任一确认为准。
+    private static func isFrontmost(_ application: NSRunningApplication) -> Bool {
+        if application.isActive { return true }
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier
+            == application.processIdentifier {
+            return true
+        }
+        let root = AXUIElementCreateApplication(application.processIdentifier)
+        var raw: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            root, kAXFrontmostAttribute as CFString, &raw
+        ) == .success else { return false }
+        return (raw as? NSNumber)?.boolValue == true
     }
 
     static func isChatGPTLoginControl(role: String, text: String) -> Bool {
@@ -261,17 +287,26 @@ public struct CodexNativeLoginStarter: CodexNativeLoginStarting {
         let status = AXUIElementCopyAttributeValue(
             root, kAXWindowsAttribute as CFString, &raw
         )
-        if status == .success, let windows = raw as? [AXUIElement], !windows.isEmpty {
+        if status == .success, let windows = raw as? [AXUIElement] {
+            let usableWindows = windows.filter(isContentWindow)
+            guard !usableWindows.isEmpty else { return [root] }
             var focusedRaw: CFTypeRef?
             if AXUIElementCopyAttributeValue(
                 root, kAXFocusedWindowAttribute as CFString, &focusedRaw
             ) == .success, let focusedRaw {
                 let focused = unsafeDowncast(focusedRaw, to: AXUIElement.self)
-                return [focused] + windows.filter { !CFEqual($0, focused) }
+                if isContentWindow(focused) {
+                    return [focused] + usableWindows.filter { !CFEqual($0, focused) }
+                }
             }
-            return windows
+            return usableWindows
         }
         return [root]
+    }
+
+    private static func isContentWindow(_ element: AXUIElement) -> Bool {
+        let role = CodexLoginAutomator.role(of: element)
+        return role == kAXWindowRole || role == "AXDialog"
     }
 
     private static func actionableControl(for element: AXUIElement) -> AXUIElement? {

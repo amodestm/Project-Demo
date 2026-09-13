@@ -18,13 +18,31 @@ struct TaskRowView: View {
                 StatusBadge(status: task.status)
             }
 
-            ProgressView(value: task.progress)
-                .progressViewStyle(.linear)
+            if task.executionMode == .codexDesktop {
+                HStack(spacing: 6) {
+                    Image(systemName: "bolt.horizontal.circle.fill")
+                        .foregroundStyle(.indigo)
+                    Text("Codex 自动监控")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+            } else {
+                ProgressView(value: task.progress)
+                    .progressViewStyle(.linear)
+            }
 
             HStack(spacing: 8) {
-                Text(task.progressText)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                if task.executionMode == .codexDesktop {
+                    Text(task.actionHint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    Text(task.progressText)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
 
                 if isActive {
                     HStack(spacing: 3) {
@@ -36,11 +54,13 @@ struct TaskRowView: View {
 
                 Spacer(minLength: 4)
 
-                Text("\(task.primaryProvider) / \(task.primaryModel)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                if task.executionMode != .codexDesktop {
+                    Text("\(task.primaryProvider) / \(task.primaryModel)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
 
             if let message = task.errorMessage,

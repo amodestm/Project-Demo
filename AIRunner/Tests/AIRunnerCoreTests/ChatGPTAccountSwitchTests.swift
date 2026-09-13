@@ -91,6 +91,84 @@ final class ChatGPTAccountSwitchTests: XCTestCase {
         ))
     }
 
+    func testCodexThreadTitleFilterRejectsComposerPlaceholder() {
+        XCTAssertFalse(
+            CodexUIAutomationDriver.isLikelyThreadTitleText("随心输入")
+        )
+        XCTAssertFalse(
+            CodexUIAutomationDriver.isLikelyThreadTitleText("Ask anything")
+        )
+        XCTAssertFalse(
+            CodexUIAutomationDriver.isLikelyThreadTitleText("GPT-5.6 Sol 高")
+        )
+        XCTAssertTrue(
+            CodexUIAutomationDriver.isLikelyThreadTitleText("真实工作对话")
+        )
+        XCTAssertFalse(
+            CodexUIAutomationDriver.isLikelyThreadTitleText(
+                "移除“截屏2026-09-13 18.50.54.png”"
+            )
+        )
+        XCTAssertFalse(
+            CodexUIAutomationDriver.isLikelyThreadTitleText("删除附件 report.pdf")
+        )
+        XCTAssertFalse(
+            CodexUIAutomationDriver.isLikelyThreadTitleText("Archive chat")
+        )
+        XCTAssertFalse(
+            CodexUIAutomationDriver.isLikelyThreadTitleText("输出内容")
+        )
+        XCTAssertFalse(
+            CodexUIAutomationDriver.isLikelyThreadTitleText("复制")
+        )
+        XCTAssertFalse(
+            CodexUIAutomationDriver.isLikelyThreadTitleText("Copy message")
+        )
+    }
+
+    func testCodexThreadTitleMustStayInWindowHeaderBand() {
+        let window = CGRect(x: 120, y: 40, width: 1_600, height: 1_000)
+        XCTAssertTrue(CodexUIAutomationDriver.isInThreadHeaderBand(
+            elementFrame: CGRect(x: 300, y: 55, width: 500, height: 28),
+            surfaceFrame: window
+        ))
+        XCTAssertFalse(CodexUIAutomationDriver.isInThreadHeaderBand(
+            elementFrame: CGRect(x: 1_100, y: 790, width: 280, height: 36),
+            surfaceFrame: window
+        ))
+        XCTAssertFalse(CodexUIAutomationDriver.isInThreadHeaderBand(
+            elementFrame: .zero,
+            surfaceFrame: window
+        ))
+    }
+
+    func testEmptyComposerPlaceholderIsNotTreatedAsTypedContent() {
+        XCTAssertNil(CodexUIAutomationDriver.normalizedComposerContent(
+            value: "\n随心输入",
+            placeholder: nil,
+            description: "随心输入"
+        ))
+        XCTAssertNil(CodexUIAutomationDriver.normalizedComposerContent(
+            value: "Ask anything",
+            placeholder: "Ask anything",
+            description: nil
+        ))
+    }
+
+    func testComposerKeepsRealTypedContentAndRequiresExactReadback() {
+        XCTAssertEqual(CodexUIAutomationDriver.normalizedComposerContent(
+            value: "继续",
+            placeholder: nil,
+            description: "随心输入"
+        ), "继续")
+        XCTAssertTrue(CodexUIAutomationDriver.composerContentMatches(
+            actual: "\n继续\n", expected: "继续"
+        ))
+        XCTAssertFalse(CodexUIAutomationDriver.composerContentMatches(
+            actual: "请继续分析", expected: "继续"
+        ))
+    }
+
     func testFakeNativeCodexLoginStarterRecordsTargetProfile() async throws {
         let starter = FakeCodexNativeLoginStarter()
         let profile = ChromeProfile(
@@ -321,7 +399,10 @@ final class ChatGPTAccountSwitchTests: XCTestCase {
         let services = try AppServices.bootstrap(
             databasePath: url.path, echoLogsToConsole: false
         )
-        XCTAssertEqual(try services.database.scalarInt("PRAGMA user_version;") ?? 0, 5)
+        XCTAssertEqual(
+            try services.database.scalarInt("PRAGMA user_version;") ?? 0,
+            DatabaseMigrator.currentVersion
+        )
 
         // 新列可用
         let task = try TestSupport.makeTask(services, name: "迁移", steps: 1)
@@ -600,6 +681,27 @@ final class ChatGPTAccountSwitchTests: XCTestCase {
             try services.accountRotationRepo.currentChatGPTAccount(taskID: task.id), first.id
         )
         XCTAssertNotNil(try services.steps.awaitingResultStep(taskID: task.id))
+    }
+
+    @MainActor
+    func testReadingCurrentCodexTitleActivatesCodexBeforeReading() async throws {
+        let driver = FakeCodexUIAutomationDriver()
+        driver.configureHappyPath(title: "当前工作对话")
+        let services = try AppServices(
+            database: try Database.inMemory(),
+            keychain: InMemoryKeychain(),
+            settingsStore: SettingsStore(defaults: AppServices.ephemeralDefaults()),
+            settingsOverride: TestSupport.mockSettings(),
+            codexDriver: driver,
+            echoLogsToConsole: false
+        )
+        let manager = TaskManager(services: services)
+
+        let title = await manager.readCurrentCodexThreadTitle()
+
+        XCTAssertEqual(title, "当前工作对话")
+        XCTAssertEqual(driver.activateCount, 1)
+        XCTAssertNil(manager.lastErrorMessage)
     }
 
     // MARK: - 错误文案

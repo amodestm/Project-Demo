@@ -150,13 +150,17 @@ public struct CodexTaskMatcher: Sendable {
     /// 这是整个自动化最关键的一道 Gate。点了 sidebar 上的候选项之后,
     /// 绝不能立刻输入消息 —— 必须回到主区域重新确认打开的确实是那一个。
     ///
-    /// 要求: 标题吻合 **且** 至少一个辅助信号吻合 (两个独立信号)。
+    /// 要求: 标题吻合 **且** 至少一个自动取得的辅助信号吻合。
+    /// 应用 bundle id 由运行中的 Codex 句柄取得，因此不要求用户填写技术字段。
     public func verifyOpenedThread(
         context: CodexOpenThreadContext,
         against fingerprint: CodexTaskFingerprint
     ) -> (passed: Bool, secondaryMatched: Bool, reason: String?) {
 
-        guard Self.equal(context.threadTitle, fingerprint.threadTitle) else {
+        // Codex 在打开重复标题的会话时，主区域可能给标题追加“ (2)”这类
+        // 实例后缀；侧栏候选仍保留原始标题。只在主区域二次校验时兼容该
+        // 明确格式，候选匹配仍要求原始标题完全一致，避免放宽同名线程选择。
+        guard Self.equalContextTitle(context.threadTitle, fingerprint.threadTitle) else {
             return (false, false, "主会话区的线程标题与绑定不一致 "
                     + "(期望「\(fingerprint.threadTitle ?? "nil")」, "
                     + "实际「\(context.threadTitle ?? "nil")」)")
@@ -167,27 +171,51 @@ public struct CodexTaskMatcher: Sendable {
             (context.projectName, fingerprint.projectName),
             (context.repositoryPath, fingerprint.repositoryPath),
             (context.worktreePath, fingerprint.worktreePath),
+            (context.applicationBundleIdentifier, fingerprint.applicationBundleIdentifier),
         ]
 
         var matched = 0
         var compared = 0
+        var mismatched = 0
         for (lhs, rhs) in pairs {
             guard let rhs, !rhs.isEmpty else { continue }
-            compared += 1
             guard let lhs, !lhs.isEmpty else { continue }
-            if Self.equal(lhs, rhs) { matched += 1 }
+            compared += 1
+            if Self.equal(lhs, rhs) {
+                matched += 1
+            } else {
+                mismatched += 1
+            }
+        }
+
+        if mismatched > 0 {
+            return (false, false, "标题吻合，但可读取的辅助上下文与绑定不一致")
         }
 
         if matched > 0 {
             return (true, true, nil)
         }
 
-        if compared == 0 {
+        if fingerprint.secondarySignalCount == 0 || compared == 0 {
             // 绑定里没有辅助信号可比 —— 只有标题这一个信号。
             // 定位可以放行 (Test Locate), 但发送门槛会因为这个 false 而拒绝。
             return (true, false, "只有标题这一个信号, 缺少第二个独立信号佐证")
         }
 
         return (false, false, "标题吻合, 但辅助上下文对不上 (可能打开的是同名线程)")
+    }
+
+    private static func equalContextTitle(_ actual: String?, _ expected: String?) -> Bool {
+        guard equal(actual, expected) else {
+            guard let actual, let expected else { return false }
+            let normalizedActual = actual.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedExpected = expected.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let suffixRange = normalizedActual.range(
+                of: #"\s+\(\d+\)$"#, options: .regularExpression
+            ) else { return false }
+            let base = String(normalizedActual[..<suffixRange.lowerBound])
+            return equal(base, normalizedExpected)
+        }
+        return true
     }
 }

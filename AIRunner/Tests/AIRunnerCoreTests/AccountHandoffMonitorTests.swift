@@ -22,6 +22,7 @@ final class AccountHandoffMonitorTests: XCTestCase {
     private func makeFixture(
         steps: Int = 3,
         cooldown: TimeInterval = 60,
+        executionPreference: CodexExecutionPreference? = nil,
         configureDriver: (FakeCodexUIAutomationDriver) -> Void = { _ in }
     ) async throws -> Fixture {
 
@@ -72,7 +73,8 @@ final class AccountHandoffMonitorTests: XCTestCase {
                 repositoryPath: "/Users/dev/airunner",
                 applicationBundleIdentifier: "com.openai.chat"
             ),
-            resumeMessage: "继续"
+            resumeMessage: "继续",
+            executionPreference: executionPreference
         )
         try bindings.insert(binding)
 
@@ -96,6 +98,21 @@ final class AccountHandoffMonitorTests: XCTestCase {
     }
 
     // MARK: - ① 等待认证期间 Codex 不可用 → 不发送
+
+    func testResumeDismissesPostLoginWelcomeOverlayBeforeLocatingThread() async throws {
+        let fixture = try await makeFixture { driver in
+            driver.blockingWelcomeOverlayPresent = true
+        }
+        try await armHandoff(fixture)
+
+        let outcome = await fixture.monitor.tick(taskID: fixture.taskID)
+
+        guard case .resumed = outcome else {
+            return XCTFail("关闭欢迎弹窗后应继续完成 Resume, 实际: \(outcome)")
+        }
+        XCTAssertEqual(fixture.driver.welcomeOverlayDismissCount, 1)
+        XCTAssertEqual(fixture.driver.insertedMessages, ["继续"])
+    }
 
     func testNoSendWhileCodexUnavailable() async throws {
         let fixture = try await makeFixture { driver in
@@ -262,6 +279,19 @@ final class AccountHandoffMonitorTests: XCTestCase {
         XCTAssertEqual(fixture.driver.sendCount, 1, "★ 仍然只发送了一次 ★")
     }
 
+    func testAccountHandoffResumeIsNotBlockedByPreviousAccountCooldown() async throws {
+        let fixture = try await makeFixture()
+        try fixture.bindings.markResumeSent(bindingID: fixture.bindingID, at: Date())
+        try await armHandoff(fixture)
+
+        let outcome = await fixture.monitor.tick(taskID: fixture.taskID)
+
+        guard case .resumed = outcome else {
+            return XCTFail("切换账号后的恢复不能被旧账号的冷却记录拦截, 实际: \(outcome)")
+        }
+        XCTAssertEqual(fixture.driver.sendCount, 1)
+    }
+
     // MARK: - ⑦ App 重启后监视被恢复
 
     func testMonitorIsRestoredAfterRestart() async throws {
@@ -374,6 +404,61 @@ final class AccountHandoffMonitorTests: XCTestCase {
     }
 
     // MARK: - 边界: 发送未确认
+
+    func testAppliesConfiguredModelBeforeSendingPrompt() async throws {
+        let preference = CodexExecutionPreference.gpt56SolHigh
+        let fixture = try await makeFixture(executionPreference: preference) { driver in
+            driver.executionSelection = CodexExecutionSelection(visibleTitle: "GPT-6 Astra 极高")
+        }
+        try await armHandoff(fixture)
+
+        let outcome = await fixture.monitor.tick(taskID: fixture.taskID)
+
+        guard case .resumed = outcome else {
+            return XCTFail("设置模型后应完成发送, 实际: \(outcome)")
+        }
+        XCTAssertEqual(fixture.driver.appliedPreferences, [preference])
+        XCTAssertEqual(fixture.driver.modelApplyCount, 1)
+        XCTAssertEqual(fixture.driver.insertedMessages, ["继续"])
+        XCTAssertEqual(fixture.driver.sendCount, 1)
+    }
+
+    func testPrepareExecutionSetsModelWithoutInsertingOrSending() async throws {
+        let preference = CodexExecutionPreference.gpt56SolHigh
+        let fixture = try await makeFixture(executionPreference: preference) { driver in
+            driver.executionSelection = CodexExecutionSelection(visibleTitle: "GPT-6 Astra 极高")
+        }
+
+        let verification = try await fixture.controller.prepareExecution(
+            bindingID: fixture.bindingID
+        )
+
+        XCTAssertTrue(verification.passesLocateGate)
+        XCTAssertTrue(verification.executionPreferenceMatched)
+        XCTAssertTrue(verification.composerFound)
+        XCTAssertTrue(verification.composerEditable)
+        XCTAssertEqual(fixture.driver.appliedPreferences, [preference])
+        XCTAssertEqual(fixture.driver.insertedMessages, [])
+        XCTAssertEqual(fixture.driver.sendCount, 0)
+    }
+
+    func testModelVerificationFailureDoesNotInsertOrSendPrompt() async throws {
+        let preference = CodexExecutionPreference.gpt56SolHigh
+        let fixture = try await makeFixture(executionPreference: preference) { driver in
+            driver.executionSelection = CodexExecutionSelection(visibleTitle: "GPT-6 Astra 极高")
+            driver.modelSelectionSucceeds = false
+        }
+        try await armHandoff(fixture)
+
+        let outcome = await fixture.monitor.tick(taskID: fixture.taskID)
+
+        guard case .failed = outcome else {
+            return XCTFail("模型回读不匹配时应停止, 实际: \(outcome)")
+        }
+        XCTAssertEqual(fixture.driver.modelApplyCount, 1)
+        XCTAssertEqual(fixture.driver.insertedMessages, [])
+        XCTAssertEqual(fixture.driver.sendCount, 0)
+    }
 
     func testUnconfirmedSendIsNotReportedAsConfirmed() async throws {
         let fixture = try await makeFixture { driver in

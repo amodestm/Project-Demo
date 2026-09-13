@@ -33,7 +33,7 @@ final class CodexQuotaMonitorTests: XCTestCase {
     ) async throws -> Fixture {
         let services = try TestSupport.makeServices()
         let driver = FakeCodexUIAutomationDriver()
-        driver.configureHappyPath()
+        driver.configureHappyPath(title: "Codex 自动切号")
         driver.accountIssue = issue
         driver.busyState = busyState
         driver.taskStoppedSignal = taskStoppedSignal
@@ -62,13 +62,21 @@ final class CodexQuotaMonitorTests: XCTestCase {
         )
 
         let rotation = FakeAccountRotation()
+        let resumeController = CodexResumeController(
+            driver: driver,
+            bindings: bindings,
+            leases: services.codexLeases,
+            logger: services.logger
+        )
         let monitor = CodexQuotaMonitor(
             driver: driver,
             bindings: bindings,
             tasks: services.tasks,
+            resumeController: resumeController,
             accountRotation: rotation,
             logger: services.logger,
-            pollInterval: .milliseconds(1)
+            pollInterval: .milliseconds(1),
+            retrySettleDelay: 0
         )
         await monitor.start(taskID: task.id, autoRun: false)
 
@@ -81,7 +89,7 @@ final class CodexQuotaMonitorTests: XCTestCase {
         )
     }
 
-    func testQuotaRequiresTwoIdleObservationsThenRotates() async throws {
+    func testQuotaRetriesOnceThenRequiresTwoMoreObservationsBeforeRotation() async throws {
         let fixture = try await makeFixture()
 
         let first = await fixture.monitor.tick(taskID: fixture.taskID)
@@ -91,10 +99,17 @@ final class CodexQuotaMonitorTests: XCTestCase {
         XCTAssertEqual(try fixture.services.tasks.fetch(id: fixture.taskID)?.status, .running)
 
         let second = await fixture.monitor.tick(taskID: fixture.taskID)
-        XCTAssertEqual(second, .rotationCompleted)
+        XCTAssertEqual(second, .retrySent)
+        XCTAssertEqual(fixture.driver.insertedMessages, ["继续"])
+        XCTAssertEqual(fixture.driver.sendCount, 1)
         let callsAfterSecond = await fixture.rotation.callCount
+        XCTAssertEqual(callsAfterSecond, 0)
+
+        let third = await fixture.monitor.tick(taskID: fixture.taskID)
+        XCTAssertEqual(third, .observed(.quotaExhausted))
+        let fourth = await fixture.monitor.tick(taskID: fixture.taskID)
+        XCTAssertEqual(fourth, .rotationCompleted)
         let rotatedTaskIDs = await fixture.rotation.taskIDs
-        XCTAssertEqual(callsAfterSecond, 1)
         XCTAssertEqual(rotatedTaskIDs, [fixture.taskID])
         XCTAssertEqual(
             try fixture.services.tasks.fetch(id: fixture.taskID)?.status,
@@ -109,11 +124,97 @@ final class CodexQuotaMonitorTests: XCTestCase {
 
         let first = await fixture.monitor.tick(taskID: fixture.taskID)
         let second = await fixture.monitor.tick(taskID: fixture.taskID)
+        let third = await fixture.monitor.tick(taskID: fixture.taskID)
+        let fourth = await fixture.monitor.tick(taskID: fixture.taskID)
 
         XCTAssertEqual(first, .observed(.quotaExhausted))
-        XCTAssertEqual(second, .rotationCompleted)
+        XCTAssertEqual(second, .retrySent)
+        XCTAssertEqual(third, .observed(.quotaExhausted))
+        XCTAssertEqual(fourth, .rotationCompleted)
         let calls = await fixture.rotation.callCount
         XCTAssertEqual(calls, 1)
+    }
+
+    func testQuotaDisappearingAfterRetryCancelsRotation() async throws {
+        let fixture = try await makeFixture()
+
+        _ = await fixture.monitor.tick(taskID: fixture.taskID)
+        let retry = await fixture.monitor.tick(taskID: fixture.taskID)
+        XCTAssertEqual(retry, .retrySent)
+
+        fixture.driver.accountIssue = nil
+        let firstClear = await fixture.monitor.tick(taskID: fixture.taskID)
+        let secondClear = await fixture.monitor.tick(taskID: fixture.taskID)
+        XCTAssertEqual(firstClear, .waitingForCodex)
+        XCTAssertEqual(secondClear, .waitingForCodex)
+        let calls = await fixture.rotation.callCount
+        XCTAssertEqual(calls, 0)
+    }
+
+    func testSingleEmptyRenderAfterRetryDoesNotAllowSecondRetry() async throws {
+        let fixture = try await makeFixture()
+
+        _ = await fixture.monitor.tick(taskID: fixture.taskID)
+        let retry = await fixture.monitor.tick(taskID: fixture.taskID)
+        XCTAssertEqual(retry, .retrySent)
+
+        fixture.driver.accountIssue = nil
+        _ = await fixture.monitor.tick(taskID: fixture.taskID)
+        fixture.driver.accountIssue = .quotaExhausted
+        let observed = await fixture.monitor.tick(taskID: fixture.taskID)
+        let rotated = await fixture.monitor.tick(taskID: fixture.taskID)
+
+        XCTAssertEqual(observed, .observed(.quotaExhausted))
+        XCTAssertEqual(rotated, .rotationCompleted)
+        XCTAssertEqual(fixture.driver.sendCount, 1)
+    }
+
+    func testAuthenticationFailureStillRotatesWithoutSendingRetry() async throws {
+        let fixture = try await makeFixture(issue: .authenticationRequired)
+
+        let first = await fixture.monitor.tick(taskID: fixture.taskID)
+        let second = await fixture.monitor.tick(taskID: fixture.taskID)
+
+        XCTAssertEqual(first, .observed(.authenticationRequired))
+        XCTAssertEqual(second, .rotationCompleted)
+        XCTAssertEqual(fixture.driver.sendCount, 0)
+        let calls = await fixture.rotation.callCount
+        XCTAssertEqual(calls, 1)
+    }
+
+    func testConfirmedQuotaRetryBypassesOrdinaryResumeCooldownOnce() async throws {
+        let fixture = try await makeFixture()
+        let binding = try XCTUnwrap(
+            CodexTaskBindingRepository(db: fixture.services.database)
+                .fetchByTask(taskID: fixture.taskID)
+        )
+        try CodexTaskBindingRepository(db: fixture.services.database)
+            .markResumeSent(bindingID: binding.id, at: Date())
+
+        _ = await fixture.monitor.tick(taskID: fixture.taskID)
+        let retry = await fixture.monitor.tick(taskID: fixture.taskID)
+
+        XCTAssertEqual(retry, .retrySent)
+        XCTAssertEqual(fixture.driver.insertedMessages, ["继续"])
+        XCTAssertEqual(fixture.driver.sendCount, 1)
+    }
+
+    func testGeneratingAfterQuotaRetryDoesNotAllowSecondRetry() async throws {
+        let fixture = try await makeFixture()
+
+        _ = await fixture.monitor.tick(taskID: fixture.taskID)
+        let retry = await fixture.monitor.tick(taskID: fixture.taskID)
+        XCTAssertEqual(retry, .retrySent)
+
+        fixture.driver.busyState = .generating
+        let generating = await fixture.monitor.tick(taskID: fixture.taskID)
+        XCTAssertEqual(generating, .generating)
+        fixture.driver.busyState = .idle
+        let postGenerationObservation = await fixture.monitor.tick(taskID: fixture.taskID)
+        XCTAssertEqual(postGenerationObservation, .observed(.quotaExhausted))
+        let rotation = await fixture.monitor.tick(taskID: fixture.taskID)
+        XCTAssertEqual(rotation, .rotationCompleted)
+        XCTAssertEqual(fixture.driver.sendCount, 1)
     }
 
     func testGeneratingNeverRotatesEvenWhenQuotaTextIsVisible() async throws {
@@ -127,22 +228,28 @@ final class CodexQuotaMonitorTests: XCTestCase {
         XCTAssertEqual(try fixture.services.tasks.fetch(id: fixture.taskID)?.status, .running)
     }
 
-    func testQuotaCanRotateFromUnknownBusyStateOnlyWithStoppedSignal() async throws {
+    func testQuotaCanRotateFromUnknownBusyStateWhenQuotaBannerIsTerminal() async throws {
         let fixture = try await makeFixture(
-            busyState: .unknown,
-            taskStoppedSignal: true
+            busyState: .unknown
         )
 
         let first = await fixture.monitor.tick(taskID: fixture.taskID)
         let second = await fixture.monitor.tick(taskID: fixture.taskID)
+        let third = await fixture.monitor.tick(taskID: fixture.taskID)
+        let fourth = await fixture.monitor.tick(taskID: fixture.taskID)
         XCTAssertEqual(first, .observed(.quotaExhausted))
-        XCTAssertEqual(second, .rotationCompleted)
+        XCTAssertEqual(second, .retrySent)
+        XCTAssertEqual(third, .observed(.quotaExhausted))
+        XCTAssertEqual(fourth, .rotationCompleted)
         let calls = await fixture.rotation.callCount
         XCTAssertEqual(calls, 1)
     }
 
-    func testUnknownBusyStateWithoutStoppedSignalWaits() async throws {
-        let fixture = try await makeFixture(busyState: .unknown)
+    func testAuthenticationUnknownBusyStateWithoutStoppedSignalWaits() async throws {
+        let fixture = try await makeFixture(
+            issue: .authenticationRequired,
+            busyState: .unknown
+        )
 
         let outcome = await fixture.monitor.tick(taskID: fixture.taskID)
 
@@ -209,8 +316,22 @@ final class CodexQuotaMonitorTests: XCTestCase {
         ), .quotaExhausted)
     }
 
+    func testLatestIssueClassifierKeepsCurrentQuotaBannerOutsideTail() {
+        var configuration = CodexDriverConfiguration.default
+        configuration.accountIssueTailLimit = 4
+        XCTAssertEqual(CodexUIAutomationDriver.classifyLatestAccountIssue(
+            [
+                "你已达到使用上限。升级套餐或充值额度以继续，或在 2026年9月19日16:15 后重试。",
+                "工具栏", "模型", "历史消息", "编辑", "复制", "重试", "随心输入"
+            ],
+            configuration: configuration
+        ), .quotaExhausted)
+    }
+
     func testCompletedRotationIsLatchedUntilOldIssueDisappears() async throws {
         let fixture = try await makeFixture()
+        _ = await fixture.monitor.tick(taskID: fixture.taskID)
+        _ = await fixture.monitor.tick(taskID: fixture.taskID)
         _ = await fixture.monitor.tick(taskID: fixture.taskID)
         let firstRotation = await fixture.monitor.tick(taskID: fixture.taskID)
         XCTAssertEqual(firstRotation, .rotationCompleted)
@@ -228,6 +349,9 @@ final class CodexQuotaMonitorTests: XCTestCase {
         fixture.driver.accountIssue = .quotaExhausted
         let nextFirstObservation = await fixture.monitor.tick(taskID: fixture.taskID)
         XCTAssertEqual(nextFirstObservation, .observed(.quotaExhausted))
+        let nextRetry = await fixture.monitor.tick(taskID: fixture.taskID)
+        XCTAssertEqual(nextRetry, .retrySent)
+        _ = await fixture.monitor.tick(taskID: fixture.taskID)
         let nextRotation = await fixture.monitor.tick(taskID: fixture.taskID)
         XCTAssertEqual(nextRotation, .rotationCompleted)
         let callsAfterNewIssue = await fixture.rotation.callCount
@@ -238,6 +362,13 @@ final class CodexQuotaMonitorTests: XCTestCase {
         XCTAssertEqual(
             CodexUIAutomationDriver.classifyAccountIssue(["Usage limit reached"]),
             .quotaExhausted
+        )
+        XCTAssertEqual(
+            CodexUIAutomationDriver.classifyAccountIssue([
+                "你已达到使用上限。升级套餐或充值额度以继续，或在 2026年9月19日16:15 后重试。"
+            ]),
+            .quotaExhausted,
+            "带具体重试日期的额度横幅必须触发额度识别"
         )
         XCTAssertEqual(
             CodexUIAutomationDriver.classifyAccountIssue(["Session expired, sign in to continue"]),
@@ -251,5 +382,14 @@ final class CodexQuotaMonitorTests: XCTestCase {
             CodexUIAutomationDriver.classifyAccountIssue(["Stop", "停止", "Generating"]),
             "生成按钮和普通停止按钮不能单独触发账号轮换"
         )
+    }
+
+    func testWelcomeOverlayMatcherRequiresIntroductionAndActionSemantics() {
+        XCTAssertTrue(CodexUIAutomationDriver.isBlockingWelcomeOverlay([
+            "GPT-6 Astra 简介", "继续使用当前模型", "立即试用 GPT-6 Astra"
+        ]))
+        XCTAssertFalse(CodexUIAutomationDriver.isBlockingWelcomeOverlay([
+            "GPT-6 Astra 简介", "随心输入"
+        ]), "普通页面文本不能触发关闭弹窗")
     }
 }

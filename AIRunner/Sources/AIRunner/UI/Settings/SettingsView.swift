@@ -16,7 +16,7 @@ struct SettingsView: View {
                         .tabItem { Label("模型路由", systemImage: "arrow.triangle.branch") }
 
                     ChatGptWebSettingsView(services: services)
-                        .tabItem { Label("ChatGPT Web", systemImage: "safari") }
+                        .tabItem { Label("执行方式", systemImage: "arrow.triangle.branch") }
 
                     CodexSettingsView(services: services)
                         .tabItem { Label("Codex 自动恢复", systemImage: "bolt.horizontal.circle") }
@@ -41,7 +41,7 @@ struct SettingsView: View {
     }
 }
 
-// MARK: - ChatGPT Web
+// MARK: - 执行方式
 
 struct ChatGptWebSettingsView: View {
 
@@ -50,7 +50,7 @@ struct ChatGptWebSettingsView: View {
     @State private var urlText = ""
     @State private var copyPrompt = true
     @State private var openBrowser = true
-    @State private var defaultMode: ExecutionMode = .chatGPTWeb
+    @State private var defaultMode: ExecutionMode = .codexDesktop
     @State private var statusMessage: String?
 
     var body: some View {
@@ -59,8 +59,7 @@ struct ChatGptWebSettingsView: View {
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("执行通道").font(.headline)
-                    Text("新建任务默认使用哪种方式执行。ChatGPT Web 是主流程 —— "
-                         + "启动时可通过独立 Chrome Profile 和 Codex 浏览器授权切换账号; API 是可选的直连后端。")
+                    Text("新建任务默认使用哪种方式执行。推荐使用 Codex 自动执行：任务绑定已有 Codex 工作对话，主界面直接监控额度并按邮箱选择 Profile 切换账号。旧 Web 剪贴板回填和 API 仍保留为兼容选项。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
@@ -78,37 +77,35 @@ struct ChatGptWebSettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                Divider()
+                if defaultMode == .chatGPTWeb {
+                    Divider()
 
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("ChatGPT 地址").font(.headline)
-                    TextField("https://chatgpt.com/", text: $urlText)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.body, design: .monospaced))
-                    Text("点「打开 ChatGPT」时使用的地址。可改成区域域名或自建网关。")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("生成 Prompt 后的自动动作").font(.headline)
-                    Toggle("自动把续跑 prompt 复制到剪贴板", isOn: $copyPrompt)
-                    Toggle("自动打开 ChatGPT", isOn: $openBrowser)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("兼容 Web 设置").font(.headline)
+                        TextField("https://chatgpt.com/", text: $urlText)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+                        Text("仅在选择“Web 手动回填（兼容）”时使用。")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                        Toggle("生成 Prompt 后复制到剪贴板", isOn: $copyPrompt)
+                        Toggle("生成 Prompt 后打开 ChatGPT", isOn: $openBrowser)
+                    }
                 }
 
                 Divider()
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("自动登录与续跑").font(.headline)
-                    Text("""
-                    AIRunner 会:
-                     · 保存任务状态、已完成步骤与检查点
-                     · 根据检查点生成自包含的续跑 prompt
-                     · 用户从任务详情点击开始后，才按需完成 Codex 浏览器授权
-                     · 账号受限时切换 Profile，并从检查点续跑
+                    Text(defaultMode == .codexDesktop ? """
+                    Codex 自动执行任务会:
+                     · 只使用你绑定的 Codex 工作对话，不会因新建任务自动打开网页
+                     · 在主界面选择邮箱对应的 Chrome Profile
+                     · 监视额度耗尽/登录失效信号，确认已停止后安全退出并切换账号
+                     · 切换完成后重新锁定目标对话、模型和提示词，再发送一次「继续」
                      · 遇到验证码、两步验证或安全挑战时停止并提示你处理
+                    """ : """
+                    兼容 Web 任务会保存检查点、生成续跑 Prompt，并等待你手动提交和回填结果。
                     """)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -467,6 +464,7 @@ struct CodexSettingsView: View {
     @State private var useCodexBrowserOAuthRotation = false
     @State private var availableChromeProfiles: [ChromeProfile] = []
     @State private var selectedChromeProfileDirectories: Set<String> = []
+    @State private var profileAliases: [String: String] = [:]
     @State private var profileScanMessage: String?
     @State private var isTestingOAuthLogin = false
     @State private var oauthTestMessage: String?
@@ -551,7 +549,7 @@ struct CodexSettingsView: View {
                         .controlSize(.small)
                     }
 
-                    Text("每个勾选项都应在 chatgpt.com 保持一个不同的 ChatGPT 账号登录。Chrome 个人资料无需登录 Google 账号；创建时可选“保持未登录状态”。轮换顺序按下列顺序循环。")
+                    Text("每个勾选项都应在 chatgpt.com 保持一个不同的 ChatGPT 账号登录。Chrome 个人资料无需登录 Google 账号；创建时可选“保持未登录状态”。可为 Profile 填写账号邮箱作为显示名称，轮换顺序按下列顺序循环。保存后请在任务详情的“Codex 账号”选择器中执行切换；这里仅负责配置 Profile 和做独立登录测试。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
@@ -562,18 +560,41 @@ struct CodexSettingsView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     } else {
                         ForEach(availableChromeProfiles) { profile in
-                            Toggle(profile.label, isOn: Binding(
-                                get: {
-                                    selectedChromeProfileDirectories.contains(profile.directoryName)
-                                },
-                                set: { selected in
-                                    if selected {
-                                        selectedChromeProfileDirectories.insert(profile.directoryName)
-                                    } else {
-                                        selectedChromeProfileDirectories.remove(profile.directoryName)
-                                    }
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(spacing: 8) {
+                                    Toggle(profileDisplayName(for: profile), isOn: Binding(
+                                        get: {
+                                            selectedChromeProfileDirectories.contains(profile.directoryName)
+                                        },
+                                        set: { selected in
+                                            if selected {
+                                                selectedChromeProfileDirectories.insert(profile.directoryName)
+                                            } else {
+                                                selectedChromeProfileDirectories.remove(profile.directoryName)
+                                            }
+                                        }
+                                    ))
+
+                                    Spacer()
                                 }
-                            ))
+
+                                HStack(spacing: 8) {
+                                    Text("账号邮箱")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 56, alignment: .leading)
+                                    TextField(
+                                        "可选，例如 name@example.com",
+                                        text: profileAliasBinding(for: profile.directoryName)
+                                    )
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.caption)
+                                    Text(profile.directoryName)
+                                        .font(.caption2.monospaced())
+                                        .foregroundStyle(.tertiary)
+                                }
+                                .padding(.leading, 26)
+                            }
                         }
 
                         let selectedCount = selectedChromeProfileDirectories.count
@@ -589,6 +610,7 @@ struct CodexSettingsView: View {
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
+
                 }
 
                 Divider()
@@ -683,6 +705,7 @@ struct CodexSettingsView: View {
             selectedChromeProfileDirectories = Set(
                 services.settings.accountRotationProfileDirectories
             )
+            profileAliases = services.settings.accountRotationProfileAliases
             scanChromeProfiles(selectNewProfiles: selectedChromeProfileDirectories.isEmpty)
         }
     }
@@ -723,6 +746,10 @@ struct CodexSettingsView: View {
         settings.accountRotationProfileDirectories = availableChromeProfiles
             .filter { selectedChromeProfileDirectories.contains($0.directoryName) }
             .map(\.directoryName)
+        settings.accountRotationProfileAliases = profileAliases.reduce(into: [:]) { result, pair in
+            let email = pair.value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !email.isEmpty { result[pair.key] = email }
+        }
 
         if useCodexBrowserOAuthRotation,
            settings.accountRotationProfileDirectories.count < 2 {
@@ -802,6 +829,23 @@ struct CodexSettingsView: View {
             profileScanMessage = "检测失败：\(AppError.normalize(error).userMessage)"
         }
     }
+
+    private func profileDisplayName(for profile: ChromeProfile) -> String {
+        let alias = profileAliases[profile.directoryName]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !alias.isEmpty { return alias }
+        return profile.label
+    }
+
+    private func profileAliasBinding(for directoryName: String) -> Binding<String> {
+        Binding(
+            get: { profileAliases[directoryName] ?? "" },
+            set: { newValue in
+                profileAliases[directoryName] = newValue
+            }
+        )
+    }
+
 }
 
 // MARK: - 凭据自动登录 (兼容回退)

@@ -27,7 +27,7 @@ public final class AppServices: @unchecked Sendable {
     public let runner: JobRunner
     public let recovery: RecoveryManager
 
-    /// ChatGPT Web 执行通道 (主流程)。
+    /// ChatGPT Web 执行通道（兼容旧版）。
     public let web: WebExecutionCoordinator
     /// 剪贴板与浏览器桥接 —— 具体实现由 App 层注入, Core 不依赖 AppKit。
     public let clipboard: any ClipboardServicing
@@ -122,7 +122,7 @@ public final class AppServices: @unchecked Sendable {
             }
         )
 
-        // ★ ChatGPT Web 主通道 ★
+        // ★ ChatGPT Web 兼容通道 ★
         let web = WebExecutionCoordinator(
             tasks: tasks,
             steps: steps,
@@ -198,6 +198,7 @@ public final class AppServices: @unchecked Sendable {
             driver: driver,
             bindings: codexBindingRepo,
             tasks: tasks,
+            resumeController: codexController,
             accountRotation: accountRotation,
             logger: logger,
             pollInterval: .seconds(max(2, loaded.codexMonitorPollInterval)),

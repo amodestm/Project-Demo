@@ -227,7 +227,7 @@ public actor AccountRotationManager {
         let outcome = AccountRotationOutcome(
             fromProfile: current,
             toProfile: next.directoryName,
-            toProfileDisplayName: next.displayName,
+            toProfileDisplayName: accountDisplayLabel(for: next),
             browserOpened: true,
             windowFocused: focused,
             focusFailureReason: focusReason
@@ -510,8 +510,7 @@ public actor AccountRotationManager {
                     ])
                 )
                 return ChatGPTAccountSwitchOutcome(
-                    accountLabel: candidate.displayName.isEmpty
-                        ? candidate.directoryName : candidate.displayName,
+                    accountLabel: accountDisplayLabel(for: candidate),
                     pageReloaded: true
                 )
             } catch let error as CodexBrowserOAuthError {
@@ -532,11 +531,89 @@ public actor AccountRotationManager {
         throw AppError.invalidRequest("Chrome Profile 轮换池为空")
     }
 
+    /// 手动指定一个已配置的 Chrome Profile 完成 Codex 账号切换。
+    ///
+    /// 与自动轮换共用完全相同的安全链路：Codex 原生退出确认 → 登录入口 →
+    /// 指定 Profile 的官方 OAuth。不会修改任务检查点，也不会发送任务消息。
+    public func switchCodexAccount(to profileDirectory: String) async throws -> ChatGPTAccountSwitchOutcome {
+        guard settingsBox().useCodexBrowserOAuthRotation else {
+            throw AppError.invalidRequest(
+                "请先开启“使用 Chrome Profile + Codex 浏览器授权切换”并保存设置。"
+            )
+        }
+        let pool = oauthRotationPool()
+        guard let profile = pool.first(where: { $0.directoryName == profileDirectory }) else {
+            throw AppError.invalidRequest(
+                "指定的 Chrome Profile 不在当前轮换列表中，请先重新检测并勾选它。"
+            )
+        }
+
+        logger.info(
+            .accountRotationStarted,
+            "手动指定 Chrome Profile 切换 Codex 账号: \(profile.label)",
+            metadata: .object([
+                "kind": .string("codex_oauth_manual_profile_switch"),
+                "profile": .string(profile.directoryName),
+            ])
+        )
+
+        try await codexBrowserOAuth.reauthenticate(using: profile)
+
+        logger.info(
+            .accountRotationCompleted,
+            "Codex 已通过指定 Chrome Profile 完成账号切换: \(profile.label)",
+            metadata: .object([
+                "kind": .string("codex_oauth_manual_profile_switch"),
+                "profile": .string(profile.directoryName),
+            ])
+        )
+
+        return ChatGPTAccountSwitchOutcome(
+            accountLabel: accountDisplayLabel(for: profile),
+            pageReloaded: true
+        )
+    }
+
+    /// 为指定任务切换 Codex 账号。
+    ///
+    /// 账号认证成功后才写入任务的当前 Profile 和非敏感账号指针。这样主界面
+    /// 的手动选择与额度监视器的自动轮换共享同一条认证链路，失败时不会把任务
+    /// 错误地标记成已经切换。
+    public func switchCodexAccount(
+        taskID: String,
+        to profileDirectory: String
+    ) async throws -> ChatGPTAccountSwitchOutcome {
+        let outcome = try await switchCodexAccount(to: profileDirectory)
+        try repository.update(taskID: taskID, currentProfile: profileDirectory)
+        try repository.recordChatGPTAccount(
+            taskID: taskID,
+            account: "profile:\(profileDirectory)"
+        )
+        return outcome
+    }
+
+    /// 返回一个 Profile 的用户可读名称（邮箱别名优先）。
+    public func profileDisplayName(directory: String) -> String? {
+        guard let profile = rotationPool().first(where: { $0.directoryName == directory }) else {
+            return nil
+        }
+        return accountDisplayLabel(for: profile)
+    }
+
     private static func profileDirectory(fromAccountPointer pointer: String) -> String? {
         let prefix = "profile:"
         guard pointer.hasPrefix(prefix) else { return nil }
         let directory = String(pointer.dropFirst(prefix.count))
         return directory.isEmpty ? nil : directory
+    }
+
+    /// 用户在设置页确认的邮箱别名优先用于状态和结果展示；没有别名时回退到
+    /// Chrome Profile 名称或目录名。别名只影响显示，不参与认证或账号选择。
+    private func accountDisplayLabel(for profile: ChromeProfile) -> String {
+        let alias = settingsBox().accountRotationProfileAliases[profile.directoryName]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !alias.isEmpty { return alias }
+        return profile.displayName.isEmpty ? profile.directoryName : profile.displayName
     }
 
     /// 选择下一个独立 Chrome Profile，再用 Codex 官方浏览器 OAuth 重新认证。
@@ -592,8 +669,7 @@ public actor AccountRotationManager {
                     ])
                 )
                 return ChatGPTAccountSwitchOutcome(
-                    accountLabel: candidate.displayName.isEmpty
-                        ? candidate.directoryName : candidate.displayName,
+                    accountLabel: accountDisplayLabel(for: candidate),
                     pageReloaded: true
                 )
             } catch let error as CodexBrowserOAuthError {

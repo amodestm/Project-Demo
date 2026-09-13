@@ -6,6 +6,8 @@ public enum CodexQuotaMonitorOutcome: Sendable, Equatable {
     case waitingForCodex
     case generating
     case observed(CodexAccountIssue)
+    case retrySent
+    case retryFailed(String)
     case rotationCompleted
     case rotationFailed(String)
     case stopped
@@ -13,27 +15,35 @@ public enum CodexQuotaMonitorOutcome: Sendable, Equatable {
 
 /// 只在 Codex 已停止生成且连续观察到明确额度/认证信号时轮换账号。
 ///
-/// 监视器不发送消息、不读取 Cookie/token，也不把“任务已停止”单独解释为额度耗尽。
+/// 额度耗尽会先在原线程补发一次「继续」；等待后仍连续看到额度耗尽才轮换。
+/// 监视器不读取 Cookie/token，也不把“任务已停止”单独解释为额度耗尽。
 /// 轮换前先将任务安全置为 `waitingForAccount`，因此检查点和未提交步骤都能保留。
 public actor CodexQuotaMonitor {
 
     private struct Candidate: Sendable {
         let issue: CodexAccountIssue
         var observations: Int
+        var retrySentAt: Date?
+        var postRetryObservations: Int
     }
 
     private let driver: any CodexUIAutomationDriving
     private let bindings: CodexTaskBindingRepository
     private let tasks: TaskRepository
+    private let resumeController: CodexResumeController
     private let accountRotation: any CodexAccountRotating
     private let logger: LoggerService
     private let pollInterval: Duration
+    private let retrySettleDelay: TimeInterval
+    private let now: @Sendable () -> Date
     private let onRotationComplete: @Sendable (String) async -> Void
 
     private var monitored: Set<String> = []
     private var inFlight: Set<String> = []
     private var loops: [String: Task<Void, Never>] = [:]
     private var candidates: [String: Candidate] = [:]
+    /// 补发后异常文本可能在页面重绘时短暂消失；连续两次无异常才清除补发状态。
+    private var issueClearObservations: [String: Int] = [:]
     private var lastObserved: [String: CodexAccountIssue] = [:]
     /// 一次轮换完成后，必须先看到异常从最新输出中消失，才能再次对同一任务切号。
     private var rotationLatched: Set<String> = []
@@ -42,17 +52,23 @@ public actor CodexQuotaMonitor {
         driver: any CodexUIAutomationDriving,
         bindings: CodexTaskBindingRepository,
         tasks: TaskRepository,
+        resumeController: CodexResumeController,
         accountRotation: any CodexAccountRotating,
         logger: LoggerService,
         pollInterval: Duration = .seconds(5),
+        retrySettleDelay: TimeInterval = 10,
+        now: @escaping @Sendable () -> Date = { Date() },
         onRotationComplete: @escaping @Sendable (String) async -> Void = { _ in }
     ) {
         self.driver = driver
         self.bindings = bindings
         self.tasks = tasks
+        self.resumeController = resumeController
         self.accountRotation = accountRotation
         self.logger = logger
         self.pollInterval = pollInterval
+        self.retrySettleDelay = retrySettleDelay
+        self.now = now
         self.onRotationComplete = onRotationComplete
     }
 
@@ -76,6 +92,7 @@ public actor CodexQuotaMonitor {
         loops.removeValue(forKey: taskID)?.cancel()
         inFlight.remove(taskID)
         candidates.removeValue(forKey: taskID)
+        issueClearObservations.removeValue(forKey: taskID)
         lastObserved.removeValue(forKey: taskID)
         rotationLatched.remove(taskID)
         logger.info(.accountHandoffMonitoring, "已停止 Codex 额度监视: \(reason)", taskID: taskID)
@@ -140,15 +157,24 @@ public actor CodexQuotaMonitor {
         do {
             issue = try await driver.detectAccountIssue(app)
         } catch {
-            candidates.removeValue(forKey: taskID)
+            if candidates[taskID]?.retrySentAt == nil {
+                candidates.removeValue(forKey: taskID)
+            }
             return .waitingForCodex
         }
         guard let issue else {
+            if candidates[taskID]?.retrySentAt != nil {
+                let clearCount = (issueClearObservations[taskID] ?? 0) + 1
+                issueClearObservations[taskID] = clearCount
+                guard clearCount >= 2 else { return .waitingForCodex }
+            }
             candidates.removeValue(forKey: taskID)
+            issueClearObservations.removeValue(forKey: taskID)
             lastObserved.removeValue(forKey: taskID)
             rotationLatched.remove(taskID)
             return .waitingForCodex
         }
+        issueClearObservations.removeValue(forKey: taskID)
 
 
         // 新账号恢复后，原线程历史里可能暂时仍显示上一账号留下的错误。
@@ -182,35 +208,109 @@ public actor CodexQuotaMonitor {
         }
         switch busy {
         case .generating:
-            candidates.removeValue(forKey: taskID)
+            // 补发后 Codex 可能短暂进入生成态；不能丢掉“已补发”标记，
+            // 否则生成结束后同一条旧限额提示会再次触发补发。
+            if candidates[taskID]?.retrySentAt == nil {
+                candidates.removeValue(forKey: taskID)
+            }
             return .generating
         case .idle:
             break
         case .unknown:
-            // 额度错误页常常没有可识别的 Stop/Generating 控件。此时只有
-            // 页面明确写出“任务已停止”才算安全结束；否则继续等待。
+            // 额度横幅本身就是 Codex 已停止生成、要求升级或稍后重试的
+            // 终止信号；这类页面经常同时隐藏 Stop/Generating 控件，因此
+            // 可以安全进入“同线程补发一次继续”的门控。其他异常仍必须
+            // 看到明确“任务已停止”文本，避免未知状态下误退出账号。
+            if issue == .quotaExhausted {
+                break
+            }
             let stopped: Bool
             do {
                 stopped = try await driver.detectTaskStopped(app)
             } catch {
-                candidates.removeValue(forKey: taskID)
+                if candidates[taskID]?.retrySentAt == nil {
+                    candidates.removeValue(forKey: taskID)
+                }
                 return .waitingForCodex
             }
             guard stopped else {
-                candidates.removeValue(forKey: taskID)
+                if candidates[taskID]?.retrySentAt == nil {
+                    candidates.removeValue(forKey: taskID)
+                }
                 return .waitingForCodex
             }
         }
 
-        if var candidate = candidates[taskID], candidate.issue == issue {
-            candidate.observations += 1
-            candidates[taskID] = candidate
+        var candidate: Candidate
+        if let existing = candidates[taskID], existing.issue == issue {
+            candidate = existing
         } else {
-            candidates[taskID] = Candidate(issue: issue, observations: 1)
+            candidate = Candidate(
+                issue: issue,
+                observations: 0,
+                retrySentAt: nil,
+                postRetryObservations: 0
+            )
         }
-        guard candidates[taskID]?.observations ?? 0 >= 2 else {
+
+        // 额度耗尽先在同一绑定线程真实补发一次。发送完成后保留候选状态，
+        // 等页面有时间生成新结果，再以两次稳定观察确认仍然受限。
+        if issue == .quotaExhausted, let retrySentAt = candidate.retrySentAt {
+            guard now().timeIntervalSince(retrySentAt) >= retrySettleDelay else {
+                candidates[taskID] = candidate
+                return .observed(issue)
+            }
+            candidate.postRetryObservations += 1
+            candidates[taskID] = candidate
+            guard candidate.postRetryObservations >= 2 else {
+                return .observed(issue)
+            }
+            candidates.removeValue(forKey: taskID)
+            return await transitionAndRotate(taskID: taskID, issue: issue, simulated: false)
+        }
+
+        candidate.observations += 1
+        candidates[taskID] = candidate
+        guard candidate.observations >= 2 else {
             return .observed(issue)
         }
+
+        if issue == .quotaExhausted {
+            do {
+                let result = try await resumeController.resumeAfterConfirmedQuota(
+                    bindingID: binding.id,
+                    message: binding.resumeMessage
+                )
+                candidate.retrySentAt = result.sentAt
+                candidate.postRetryObservations = 0
+                candidates[taskID] = candidate
+                logger.warning(
+                    .accountHandoffDetected,
+                    "额度耗尽已稳定确认；已在原绑定线程补发一次「\(result.sentMessage)」，等待新结果",
+                    taskID: taskID,
+                    metadata: .object([
+                        "issue": .string(issue.eventName),
+                        "quotaRetry": .bool(true),
+                        "sendConfirmed": .bool(result.isConfirmed),
+                    ])
+                )
+                return .retrySent
+            } catch {
+                candidates.removeValue(forKey: taskID)
+                let message = AppError.normalize(error).userMessage
+                logger.error(
+                    .codexResumeAborted,
+                    "额度耗尽后的单次补发失败，未切换账号: \(message)",
+                    taskID: taskID,
+                    metadata: .object([
+                        "issue": .string(issue.eventName),
+                        "quotaRetry": .bool(true),
+                    ])
+                )
+                return .retryFailed(message)
+            }
+        }
+
         candidates.removeValue(forKey: taskID)
 
         return await transitionAndRotate(taskID: taskID, issue: issue, simulated: false)

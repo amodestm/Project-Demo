@@ -27,6 +27,9 @@ final class FakeCodexUIAutomationDriver: CodexUIAutomationDriving, @unchecked Se
         var anyTaskGenerating = false
         var accountIssue: CodexAccountIssue?
         var taskStoppedSignal = false
+        var blockingWelcomeOverlayPresent = false
+        var executionSelection = CodexExecutionSelection(visibleTitle: "GPT-5.6 Sol 高")
+        var modelSelectionSucceeds = true
 
         var composerAvailable = true
         var composerEditable = true
@@ -45,6 +48,9 @@ final class FakeCodexUIAutomationDriver: CodexUIAutomationDriving, @unchecked Se
         var probeCount = 0
         var focusCount = 0
         var activateCount = 0
+        var welcomeOverlayDismissCount = 0
+        var modelApplyCount = 0
+        var appliedPreferences: [CodexExecutionPreference] = []
     }
 
     private var box = Box()
@@ -107,6 +113,21 @@ final class FakeCodexUIAutomationDriver: CodexUIAutomationDriving, @unchecked Se
         set { mutate { $0.taskStoppedSignal = newValue } }
     }
 
+    var blockingWelcomeOverlayPresent: Bool {
+        get { read { $0.blockingWelcomeOverlayPresent } }
+        set { mutate { $0.blockingWelcomeOverlayPresent = newValue } }
+    }
+
+    var executionSelection: CodexExecutionSelection {
+        get { read { $0.executionSelection } }
+        set { mutate { $0.executionSelection = newValue } }
+    }
+
+    var modelSelectionSucceeds: Bool {
+        get { read { $0.modelSelectionSucceeds } }
+        set { mutate { $0.modelSelectionSucceeds = newValue } }
+    }
+
     var composerAvailable: Bool {
         get { read { $0.composerAvailable } }
         set { mutate { $0.composerAvailable = newValue } }
@@ -152,7 +173,10 @@ final class FakeCodexUIAutomationDriver: CodexUIAutomationDriving, @unchecked Se
     var openedThreads: [String] { read { $0.openedThreads } }
     var probeCount: Int { read { $0.probeCount } }
     var activateCount: Int { read { $0.activateCount } }
+    var welcomeOverlayDismissCount: Int { read { $0.welcomeOverlayDismissCount } }
     var composerFocusCount: Int { read { $0.focusCount } }
+    var modelApplyCount: Int { read { $0.modelApplyCount } }
+    var appliedPreferences: [CodexExecutionPreference] { read { $0.appliedPreferences } }
 
     func reset() {
         mutate {
@@ -162,6 +186,9 @@ final class FakeCodexUIAutomationDriver: CodexUIAutomationDriving, @unchecked Se
             $0.probeCount = 0
             $0.focusCount = 0
             $0.activateCount = 0
+            $0.welcomeOverlayDismissCount = 0
+            $0.modelApplyCount = 0
+            $0.appliedPreferences = []
         }
     }
 
@@ -188,6 +215,8 @@ final class FakeCodexUIAutomationDriver: CodexUIAutomationDriving, @unchecked Se
             $0.busyState = .idle
             $0.accountIssue = nil
             $0.taskStoppedSignal = false
+            $0.executionSelection = CodexExecutionSelection(visibleTitle: "GPT-5.6 Sol 高")
+            $0.modelSelectionSucceeds = true
             $0.composerAvailable = true
             $0.composerEditable = true
             $0.composerValue = nil
@@ -238,6 +267,15 @@ final class FakeCodexUIAutomationDriver: CodexUIAutomationDriving, @unchecked Se
         }
     }
 
+    func dismissBlockingWelcomeOverlay(_ app: CodexAppHandle) async throws -> Bool {
+        mutate {
+            guard $0.blockingWelcomeOverlayPresent else { return false }
+            $0.blockingWelcomeOverlayPresent = false
+            $0.welcomeOverlayDismissCount += 1
+            return true
+        }
+    }
+
     func locateThreadCandidates(
         _ app: CodexAppHandle,
         fingerprint: CodexTaskFingerprint
@@ -268,6 +306,26 @@ final class FakeCodexUIAutomationDriver: CodexUIAutomationDriving, @unchecked Se
 
     func detectAccountIssue(_ app: CodexAppHandle) async throws -> CodexAccountIssue? {
         read { $0.accountIssue }
+    }
+
+    func applyExecutionPreference(
+        _ preference: CodexExecutionPreference,
+        in app: CodexAppHandle
+    ) async throws -> CodexExecutionSelection {
+        mutate {
+            $0.modelApplyCount += 1
+            $0.appliedPreferences.append(preference)
+            if $0.modelSelectionSucceeds {
+                $0.executionSelection = CodexExecutionSelection(
+                    visibleTitle: "\(preference.modelDisplayName) \(preference.reasoningEffort.displayName)"
+                )
+            }
+            return $0.executionSelection
+        }
+    }
+
+    func readExecutionSelection(_ app: CodexAppHandle) async throws -> CodexExecutionSelection {
+        read { $0.executionSelection }
     }
 
     func locateComposer(_ app: CodexAppHandle) async throws -> CodexComposerHandle {

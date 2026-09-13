@@ -148,9 +148,9 @@ final class AccountRotationTests: XCTestCase {
             echoLogsToConsole: false
         )
 
-        // user_version = 5 (v4 之后又加了 ChatGPT 网页账号指针)
+        // 后续迁移仍应保留 V4 的账号轮换表。
         let version = try services.database.scalarInt("PRAGMA user_version;") ?? 0
-        XCTAssertEqual(version, 5)
+        XCTAssertEqual(version, DatabaseMigrator.currentVersion)
 
         // account_rotation_state 表存在且可写
         let task = try TestSupport.makeTask(services, name: "迁移", steps: 3)
@@ -181,12 +181,16 @@ final class AccountRotationTests: XCTestCase {
             displayTitle: "有 profile",
             applicationBundleIdentifier: "com.google.Chrome",
             chromeProfileDirectory: "Profile 3",
-            fingerprint: CodexTaskFingerprint(threadTitle: "X")
+            fingerprint: CodexTaskFingerprint(threadTitle: "X"),
+            resumeMessage: "完成剩余任务",
+            executionPreference: .gpt56SolHigh
         )
         try services.codexBindings.insert(binding)
 
         let fetched = try services.codexBindings.fetchByTask(taskID: task.id)
         XCTAssertEqual(fetched?.chromeProfileDirectory, "Profile 3")
+        XCTAssertEqual(fetched?.resumeMessage, "完成剩余任务")
+        XCTAssertEqual(fetched?.executionPreference, .gpt56SolHigh)
 
         // 更新为 nil (清除)
         var updated = binding
@@ -194,6 +198,57 @@ final class AccountRotationTests: XCTestCase {
         try services.codexBindings.update(updated)
         let after = try services.codexBindings.fetchByTask(taskID: task.id)
         XCTAssertNil(after?.chromeProfileDirectory)
+        XCTAssertEqual(after?.executionPreference, .gpt56SolHigh)
+    }
+
+    func testMinimalCodexBindingRoundTripsWithOnlyUserFacingRequiredTitle() throws {
+        let services = try TestSupport.makeServices()
+        let task = try TestSupport.makeTask(services, name: "最简绑定", steps: 1)
+        let binding = CodexTaskBinding(
+            taskID: task.id,
+            displayTitle: "实现 AIRunner",
+            applicationBundleIdentifier: "com.openai.codex",
+            applicationName: "Codex",
+            fingerprint: CodexTaskFingerprint(
+                threadTitle: "实现 AIRunner",
+                applicationBundleIdentifier: "com.openai.codex"
+            ),
+            resumeMessage: "继续",
+            executionPreference: .gpt56SolHigh
+        )
+
+        try services.codexBindings.insert(binding)
+        let fetched = try XCTUnwrap(
+            services.codexBindings.fetchByTask(taskID: task.id)
+        )
+        XCTAssertEqual(fetched.displayTitle, "实现 AIRunner")
+        XCTAssertEqual(fetched.fingerprint.threadTitle, "实现 AIRunner")
+        XCTAssertEqual(fetched.applicationBundleIdentifier, "com.openai.codex")
+        XCTAssertEqual(fetched.resumeMessage, "继续")
+        XCTAssertEqual(fetched.executionPreference, .gpt56SolHigh)
+    }
+
+    func testExecutionSelectionRequiresExactReasoningEffort() {
+        let high = CodexExecutionPreference.gpt56SolHigh
+        XCTAssertTrue(CodexExecutionSelection(visibleTitle: "GPT-5.6 Sol 高").matches(high))
+        XCTAssertFalse(CodexExecutionSelection(visibleTitle: "GPT-5.6 Sol 极高").matches(high))
+        XCTAssertFalse(CodexExecutionSelection(visibleTitle: "GPT-6 Astra 高").matches(high))
+    }
+
+    func testExecutionSelectionDistinguishesHighestAndUltraEffort() {
+        let maximum = CodexExecutionPreference(
+            modelID: "gpt-5.6-sol", reasoningEffort: .max
+        )
+        XCTAssertTrue(CodexExecutionSelection(visibleTitle: "GPT-5.6 Sol 最高").matches(maximum))
+        XCTAssertFalse(CodexExecutionSelection(visibleTitle: "GPT-5.6 Sol Ultra").matches(maximum))
+        XCTAssertFalse(CodexExecutionSelection(visibleTitle: "GPT-5.6 Sol 极高").matches(maximum))
+
+        let ultra = CodexExecutionPreference(
+            modelID: "gpt-5.6-sol", reasoningEffort: .ultra
+        )
+        XCTAssertTrue(CodexExecutionSelection(visibleTitle: "GPT-5.6 Sol ultra").matches(ultra))
+        XCTAssertTrue(CodexExecutionSelection(visibleTitle: "GPT-5.6 Sol Ultra").matches(ultra))
+        XCTAssertFalse(CodexExecutionSelection(visibleTitle: "GPT-5.6 Sol 最高").matches(ultra))
     }
 
     // MARK: - 轮换池配置
@@ -209,11 +264,17 @@ final class AccountRotationTests: XCTestCase {
     func testSettingsRoundTripsRotationDirectories() throws {
         var settings = AppSettings.default
         settings.accountRotationProfileDirectories = ["Profile 1", "Default"]
+        settings.accountRotationProfileAliases = [
+            "Profile 1": "second@example.com",
+            "Default": "first@example.com",
+        ]
 
         let text = try JSONCoding.encodeToString(settings)
         let decoded = try JSONCoding.decode(AppSettings.self, from: text)
 
         XCTAssertEqual(Set(decoded.accountRotationProfileDirectories), ["Profile 1", "Default"])
+        XCTAssertEqual(decoded.accountRotationProfileAliases["Profile 1"], "second@example.com")
+        XCTAssertEqual(decoded.accountRotationProfileAliases["Default"], "first@example.com")
     }
 
     func testOldSettingsDecodeWithoutRotationField() throws {

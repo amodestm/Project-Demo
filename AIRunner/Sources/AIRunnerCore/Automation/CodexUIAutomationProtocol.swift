@@ -232,6 +232,10 @@ public protocol CodexUIAutomationDriving: Sendable {
     func activate(_ app: CodexAppHandle) async throws
     func ensureCodexViewPresent(_ app: CodexAppHandle) async throws
 
+    /// 关闭登录后偶发出现、会遮挡侧边栏和 Composer 的产品介绍弹窗。
+    /// 只能在弹窗语义明确且关闭按钮唯一时执行；没有弹窗时返回 false。
+    func dismissBlockingWelcomeOverlay(_ app: CodexAppHandle) async throws -> Bool
+
     /// 在 sidebar / 列表中找出候选线程。
     func locateThreadCandidates(
         _ app: CodexAppHandle,
@@ -287,6 +291,10 @@ public protocol CodexUIAutomationDriving: Sendable {
 }
 
 public extension CodexUIAutomationDriving {
+    func dismissBlockingWelcomeOverlay(_ app: CodexAppHandle) async throws -> Bool {
+        false
+    }
+
     /// 兼容测试替身和第三方实现；真实 AX 驱动会扫描全部 Codex 窗口。
     func detectAnyTaskGenerating(_ app: CodexAppHandle) async throws -> Bool {
         try await detectBusyState(app) == .generating

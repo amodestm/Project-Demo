@@ -1011,7 +1011,13 @@ public struct CodexLoginAutomator: CodexLoginAutomating {
         guard let frame = Self.frame(of: element), frame.width > 1, frame.height > 1 else {
             return false
         }
-        let point = CGPoint(x: frame.midX, y: frame.midY)
+        return click(point: CGPoint(x: frame.midX, y: frame.midY))
+    }
+
+    /// 在已验证的 AXFrame 内点击指定位置。仅供滑动条等没有可用 AXPress
+    /// 的语义控件使用，调用方必须先把点限制在控件边框内。
+    @discardableResult
+    static func click(point: CGPoint) -> Bool {
         let previous = CGEvent(source: nil)?.location
         guard let down = CGEvent(
             mouseEventSource: nil,
