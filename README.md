@@ -4,15 +4,36 @@
 
 | 项目 | 定位 | 技术栈 |
 |------|------|--------|
-| [AIRunner](./AIRunner/) | **AI 长任务自动执行器**：拆成有序步骤逐步调 AI，额度/限流时**自动切换账号（零点击）**并自动续跑，每步落盘+检查点；另含**多账号 AI 讨论组**（多账号扮演互斥角色，论述 → 质询 → 收敛） | Swift 6 + SwiftUI + SwiftPM（零外部依赖） |
+| [AIRunner](./AIRunner/) | **AI 长任务自动执行器**：拆成有序步骤逐步调 AI，额度/限流时**自动切换账号（零点击）**并自动续跑，每步落盘+检查点；含**多账号 AI 讨论组**与**额度感知选号**（真实额度快照按 Profile 落库），自带 **MCP 服务端**供 Codex 查额度 / 请求切号续跑 | Swift 6 + SwiftUI + SwiftPM（零外部依赖） |
 | [AIDiscussion](./AIDiscussion/) | **AI 议事会**：把讨论组独立外置成单独应用——多账号扮演立场互斥的角色，独立论述 → 交叉质询 → 收敛决策。**100% 静默后台运行**（不抢前台焦点、窗口可移出屏幕视野），支持「继续讨论」断点续跑；内置 **MCP 服务端**，可被 Codex 等外部 AI 调用 | Swift 5.9 + SwiftUI + SwiftPM（零外部依赖） |
 | [BinanceTradingSuite](./BinanceTradingSuite/) | **实时行情自动化交易套件**（含 3 个子系统）：LiqHarvest 完整交易引擎 / LiquidationMonitor 强平监控 / QuickTrade 对冲终端 | Python + asyncio + WebSocket + SQLite |
 
 > `BinanceTradingSuite/` 内含三个可单独运行的子项目：`LiqHarvest`（自包含全量系统）、`LiquidationMonitor`（强平瀑布 + 形态扫描）、`QuickTrade`（一键多空对冲终端）。详见 [BinanceTradingSuite/README.md](./BinanceTradingSuite/README.md)。
 >
-> `AIRunner/` 内含两条执行线：**长任务执行**（步骤化调用 + 零点击切号 + 崩溃续跑）与**多账号 AI 讨论组**（多个已登录账号扮演立场互斥的角色，按可配置议程独立论述 → 交叉质询 → 收敛决策）。讨论组详见 [AIRunner/docs/AI_DISCUSSION.md](./AIRunner/docs/AI_DISCUSSION.md)。
+> `AIRunner/` 内含两条执行线：**长任务执行**（步骤化调用 + 零点击切号 + 崩溃续跑）与**多账号 AI 讨论组**（多个已登录账号扮演立场互斥的角色，按可配置议程独立论述 → 交叉质询 → 收敛决策）。讨论组详见 [AIRunner/docs/AI_DISCUSSION.md](./AIRunner/docs/AI_DISCUSSION.md)。它自带 **MCP 服务端**（`Scripts/mcp/airunner_mcp.py`），Codex 可以主动查额度、看轮换池、请求切号或续跑 —— 详见 [AIRunner/README.md](./AIRunner/README.md) 的「让 Codex 调用（MCP）」与「能做什么」两节。
 >
 > `AIDiscussion/` 是讨论组的**独立外置版**：单独应用、单独数据库，额外支持静默后台运行（不抢前台焦点、窗口可移出屏幕视野）、自动切到高推理强度、「继续讨论」断点续跑与联网搜索过渡态识别。它自带 **MCP 服务端**，Codex 等外部 AI 可以直接组一场讨论拿到结论后继续工作——详见 [AIDiscussion/README.md](./AIDiscussion/README.md) 的「让 Codex 调用（MCP）」章节。
+
+---
+
+## 能做什么
+
+两个 Swift 项目都自带 **MCP 服务端**，所以它们不只是“给人和命令行用的工具”，而是**能被 Codex 这类 MCP 客户端直接调用的能力**。
+
+| 想做的事 | 用什么 | 关键工具 |
+|---|---|---|
+| 让任务跑过夜，额度耗尽自己换号接着跑 | AIRunner | `quota_status` → `report_quota_exhausted` / `request_account_switch` |
+| 按“谁先恢复”挑账号，而不是环形轮换 | AIRunner | `list_rotation_accounts`、`quota_history` |
+| 拿数据决定要不要加号 / 升 plan | AIRunner | `quota_history` |
+| 动大改前先被否决一次 | AIDiscussion | `discussion_run`（批判者 / 风险官） |
+| 对着已定方案做红队评审 | AIDiscussion | `discussion_run` + 自定义 `role` |
+| 方案二选一，要一个可追溯的投票结论 | AIDiscussion | `discussion_run` + `consensus: majorityVote` |
+| 长讨论丢后台跑，回头取结论 | AIDiscussion | `discussion_start` → `discussion_status` → `discussion_result` |
+
+各项目的详细用法、配置方式与更多预想场景：
+
+- AIRunner：[README.md](./AIRunner/README.md) 的「让 Codex 调用（MCP）」「能做什么（预想用法）」
+- AIDiscussion：[README.md](./AIDiscussion/README.md) 的「让 Codex 调用（MCP）」「能做什么（预想用法）」
 
 ---
 
