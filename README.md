@@ -5,14 +5,14 @@
 | 项目 | 定位 | 技术栈 |
 |------|------|--------|
 | [AIRunner](./AIRunner/) | **AI 长任务自动执行器**：拆成有序步骤逐步调 AI，额度/限流时**自动切换账号（零点击）**并自动续跑，每步落盘+检查点；另含**多账号 AI 讨论组**（多账号扮演互斥角色，论述 → 质询 → 收敛） | Swift 6 + SwiftUI + SwiftPM（零外部依赖） |
-| [AIDiscussion](./AIDiscussion/) | **AI 议事会**：把讨论组独立外置成单独应用——多账号扮演立场互斥的角色，独立论述 → 交叉质询 → 收敛决策。**100% 静默后台运行**（不抢前台焦点、窗口可移出屏幕视野），支持「继续讨论」断点续跑 | Swift 5.9 + SwiftUI + SwiftPM（零外部依赖） |
+| [AIDiscussion](./AIDiscussion/) | **AI 议事会**：把讨论组独立外置成单独应用——多账号扮演立场互斥的角色，独立论述 → 交叉质询 → 收敛决策。**100% 静默后台运行**（不抢前台焦点、窗口可移出屏幕视野），支持「继续讨论」断点续跑；内置 **MCP 服务端**，可被 Codex 等外部 AI 调用 | Swift 5.9 + SwiftUI + SwiftPM（零外部依赖） |
 | [BinanceTradingSuite](./BinanceTradingSuite/) | **实时行情自动化交易套件**（含 3 个子系统）：LiqHarvest 完整交易引擎 / LiquidationMonitor 强平监控 / QuickTrade 对冲终端 | Python + asyncio + WebSocket + SQLite |
 
 > `BinanceTradingSuite/` 内含三个可单独运行的子项目：`LiqHarvest`（自包含全量系统）、`LiquidationMonitor`（强平瀑布 + 形态扫描）、`QuickTrade`（一键多空对冲终端）。详见 [BinanceTradingSuite/README.md](./BinanceTradingSuite/README.md)。
 >
 > `AIRunner/` 内含两条执行线：**长任务执行**（步骤化调用 + 零点击切号 + 崩溃续跑）与**多账号 AI 讨论组**（多个已登录账号扮演立场互斥的角色，按可配置议程独立论述 → 交叉质询 → 收敛决策）。讨论组详见 [AIRunner/docs/AI_DISCUSSION.md](./AIRunner/docs/AI_DISCUSSION.md)。
 >
-> `AIDiscussion/` 是讨论组的**独立外置版**：单独应用、单独数据库，额外支持静默后台运行（不抢前台焦点、窗口可移出屏幕视野）、自动切到高推理强度、「继续讨论」断点续跑与联网搜索过渡态识别。详见 [AIDiscussion/README.md](./AIDiscussion/README.md)。
+> `AIDiscussion/` 是讨论组的**独立外置版**：单独应用、单独数据库，额外支持静默后台运行（不抢前台焦点、窗口可移出屏幕视野）、自动切到高推理强度、「继续讨论」断点续跑与联网搜索过渡态识别。它自带 **MCP 服务端**，Codex 等外部 AI 可以直接组一场讨论拿到结论后继续工作——详见 [AIDiscussion/README.md](./AIDiscussion/README.md) 的「让 Codex 调用（MCP）」章节。
 
 ---
 
@@ -28,14 +28,18 @@ Project-Demo/
 │   ├── Scripts/make_app.sh      # 组装可双击 .app
 │   ├── docs/AI_DISCUSSION.md    # 多账号 AI 讨论组说明
 │   └── README.md                # 功能 / 架构 / 安全说明
-├── AIDiscussion/                # AI 议事会：多账号讨论组独立应用（Swift 5.9 / SwiftUI）
+├── AIDiscussion/                # AI 议事会：多账号讨论组独立应用 + MCP 服务端（Swift 5.9 / SwiftUI）
 │   ├── Package.swift            # SwiftPM 清单（macOS 14+，零外部依赖）
-│   ├── Sources/AIDiscussionCore/  # 零 UI 依赖核心：编排 / 会话驱动 / profile 扫描 / 持久化
-│   ├── Sources/AIDiscussion/    # SwiftUI 壳（讨论组列表 · 配置 · 运行）
-│   ├── Tests/AIDiscussionCoreTests/
+│   ├── Sources/AIDiscussionCore/  # 零 UI 依赖核心：编排 / 会话驱动 / profile 扫描 / 持久化 / 本地桥接服务端
+│   ├── Sources/AIDiscussionBridge/ # app 与 MCP 共用的线协议（Foundation-only）
+│   ├── Sources/AIDiscussionMCPKit/ # MCP 协议 · 工具面 · 桥接客户端
+│   ├── Sources/AIDiscussionMCP/  # stdio 服务端可执行文件（供 Codex 调用）
+│   ├── Sources/AIDiscussion/    # SwiftUI 壳（讨论组列表 · 配置 · 运行 · 桥接面板）
+│   ├── Tests/                   # 四个测试目标（线协议 / 规格校验 / MCP 会话 / 工具层）
 │   ├── Scripts/make_discussion_app.sh  # 组装 .app + ad-hoc 签名 + 安装
+│   ├── Scripts/install_mcp_config.sh   # 打印/写入 Codex 的 MCP 配置片段
 │   ├── 启动 AI议事会.command     # 双击启动（未打包则自动编译）
-│   └── README.md                # 功能 / 配置模型 / 议程 / 收敛规则 / 架构 / 安全
+│   └── README.md                # 功能 / 配置模型 / 议程 / 收敛规则 / MCP / 架构 / 安全
 ├── BinanceTradingSuite/         # 实时行情自动化交易套件（Python）
 │   ├── LiqHarvest/              # 完整交易系统（自包含）
 │   │   ├── data_feed.py         # 数据层：3 路 WebSocket
@@ -97,6 +101,9 @@ bash Scripts/make_app.sh release
 cd ../AIDiscussion
 swift build && swift test
 bash Scripts/make_discussion_app.sh release   # 组装 .app、ad-hoc 签名并安装到 /Applications
+
+# 让 Codex 能调用讨论组（可选，需要先 swift build -c release）
+bash Scripts/install_mcp_config.sh            # 先打印配置片段，确认后加 --apply 落盘
 ```
 
 两个 Swift 项目均为**零外部依赖**的 SwiftPM 工程，也可用 Xcode 直接打开 `Package.swift` 运行。首次使用需在系统设置中授予**辅助功能**权限（驱动网页 UI 所必需），并在 Chrome 中为每个待用账号建立独立的 Profile。

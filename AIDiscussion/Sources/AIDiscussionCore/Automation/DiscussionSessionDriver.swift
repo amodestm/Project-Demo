@@ -170,6 +170,13 @@ public final class RoutingDiscussionSessionProvider: DiscussionSessionProviding,
         self.scriptedProvider = ScriptedSessionProvider(group: group)
     }
 
+    /// 将指定成员的 Chrome 窗口提升到栈顶（仅真实 Chrome 模式下生效）。
+    public func raiseSpeakingSession(for participant: DiscussionParticipant) async {
+        guard mode == .realChrome,
+              let chrome = realProvider as? ChromeDiscussionSessionProvider else { return }
+        await chrome.raiseSpeakingSession(for: participant)
+    }
+
     public func session(for participant: DiscussionParticipant) async throws -> any DiscussionSessionDriving {
         let currentMode = self.mode
         switch currentMode {

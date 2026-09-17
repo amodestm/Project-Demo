@@ -4,7 +4,9 @@ import AIDiscussionCore
 /// 讨论组总览 —— 左侧讨论组列表, 右侧选中讨论的运行界面。
 struct DiscussionHubView: View {
 
-    let services: DiscussionServices
+    /// 用 `@ObservedObject`（而非 `let`）才能跟着桥接状态刷新 ——
+    /// 侧边栏底部的 MCP 面板要显示 `bridgeError` / `bridgeHub` 的变化。
+    @ObservedObject var services: DiscussionServices
     @Environment(\.dismiss) private var dismiss
 
     @State private var groups: [DiscussionGroup] = []
@@ -78,6 +80,10 @@ struct DiscussionHubView: View {
                 }
                 .listStyle(.inset)
             }
+
+            Divider()
+
+            DiscussionMCPBridgePanel(services: services)
 
             Divider()
 

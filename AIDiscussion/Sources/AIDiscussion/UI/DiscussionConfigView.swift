@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import AIDiscussionCore
 
 /// 讨论组配置 —— 议题、成员、议程、收敛规则。
@@ -20,6 +21,7 @@ struct DiscussionConfigView: View {
     @State private var isPreloadingWindows = false
     @State private var preloadedCount = 0
     @State private var preloadStatusMessage: String?
+    @State private var draggedParticipant: DiscussionParticipant?
 
     @Environment(\.dismiss) private var dismiss
 
@@ -116,14 +118,76 @@ struct DiscussionConfigView: View {
 
     private var participantsSection: some View {
         Section {
-            ForEach(draft.participants) { participant in
-                HStack(spacing: 10) {
+            ForEach(Array(draft.participants.enumerated()), id: \.element.id) { index, participant in
+                HStack(spacing: 8) {
+                    // 1. 拖拽把手与快速上下微调
+                    HStack(spacing: 3) {
+                        Image(systemName: "line.3.horizontal")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.tertiary)
+                            .frame(width: 14, height: 26)
+                            .contentShape(Rectangle())
+                            .help("按住上下拖拽滑动，调整发言顺序")
+
+                        VStack(spacing: 1) {
+                            Button {
+                                moveParticipant(from: index, to: index - 1)
+                            } label: {
+                                Image(systemName: "chevron.up")
+                                    .font(.system(size: 8, weight: .bold))
+                                    .frame(width: 13, height: 10)
+                                    .foregroundStyle(index == 0 ? Color.secondary.opacity(0.2) : Color.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(index == 0)
+                            .help("点击上移一位发言位次")
+
+                            Button {
+                                moveParticipant(from: index, to: index + 1)
+                            } label: {
+                                Image(systemName: "chevron.down")
+                                    .font(.system(size: 8, weight: .bold))
+                                    .frame(width: 13, height: 10)
+                                    .foregroundStyle(index == draft.participants.count - 1 ? Color.secondary.opacity(0.2) : Color.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(index == draft.participants.count - 1)
+                            .help("点击下移一位发言位次")
+                        }
+                    }
+                    .onDrag {
+                        self.draggedParticipant = participant
+                        return NSItemProvider(object: participant.id as NSString)
+                    }
+
+                    // 2. 发言序号指示徽章
+                    ZStack {
+                        if participant.enabled {
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(Color.accentColor.opacity(0.12))
+                                .frame(width: 22, height: 22)
+                            Text("\(index + 1)")
+                                .font(.system(size: 11, weight: .bold, design: .rounded))
+                                .foregroundStyle(Color.accentColor)
+                        } else {
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(Color.secondary.opacity(0.08))
+                                .frame(width: 22, height: 22)
+                            Text("-")
+                                .font(.system(size: 11, weight: .medium, design: .rounded))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .help(participant.enabled ? "讨论发言顺序第 \(index + 1) 位\(index == 0 ? "（默认主持收敛）" : "")" : "已禁用（不参与讨论发言）")
+
+                    // 3. 成员头像
                     AgentAvatar(
                         symbol: participant.avatarSymbol,
                         hex: participant.accentHex,
                         size: 30
                     )
 
+                    // 4. 成员名与角色设定
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
                             Text(participant.displayName)
@@ -140,6 +204,7 @@ struct DiscussionConfigView: View {
 
                     Spacer()
 
+                    // 5. 操作区（启用开关、编辑、快捷登录、删除）
                     Toggle("", isOn: Binding(
                         get: { participant.enabled },
                         set: { newValue in
@@ -177,6 +242,15 @@ struct DiscussionConfigView: View {
                     .buttonStyle(.plain)
                 }
                 .padding(.vertical, 3)
+                .contentShape(Rectangle())
+                .onDrop(
+                    of: [.text],
+                    delegate: ParticipantDropDelegate(
+                        item: participant,
+                        participants: $draft.participants,
+                        draggedItem: $draggedParticipant
+                    )
+                )
             }
 
             HStack {
@@ -247,15 +321,21 @@ struct DiscussionConfigView: View {
                 .padding(.vertical, 2)
             }
         } header: {
-            Text("成员 (\(draft.participants.count))")
+            HStack {
+                Text("成员与发言顺序 (\(draft.participants.count))")
+                Spacer()
+                Text("可按住 ≡ 拖拽滑动，或点击 ↑↓ 调序")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
         } footer: {
             if draft.enabledParticipants.count < 2 {
                 Text("⚠️ 至少需要 2 位**立场互斥**的成员, 否则讨论会变成自我附和。"
                      + "预设角色的职责刻意互斥 (批判者不提建议、成本专家不谈体验)。")
                     .foregroundStyle(.orange)
             } else {
-                Text("每位成员绑定一个已登录 ChatGPT 的 Chrome Profile。"
-                     + "默认按 Profile 显示名称校验；只有实际邮箱不同才需要单独填写。")
+                Text("成员将严格按上方从上到下的顺序依次发言。可通过按住 ≡ 拖拽滑动或点击 ↑↓ 随心调整发言顺序。"
+                     + "每位成员绑定一个已登录 ChatGPT 的 Chrome Profile。")
             }
         }
     }
@@ -521,6 +601,52 @@ struct DiscussionConfigView: View {
                 preloadStatusMessage = "全部 \(targets.count) 个成员窗口已提前就绪并隐形待命，讨论时绝不弹窗"
             }
         }
+    }
+
+    // MARK: - 成员调序
+
+    private func moveParticipant(from: Int, to: Int) {
+        guard from != to,
+              draft.participants.indices.contains(from),
+              draft.participants.indices.contains(to) else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            let item = draft.participants.remove(at: from)
+            draft.participants.insert(item, at: to)
+        }
+    }
+}
+
+// MARK: - 成员拖拽排序 Delegate
+
+private struct ParticipantDropDelegate: DropDelegate {
+    let item: DiscussionParticipant
+    @Binding var participants: [DiscussionParticipant]
+    @Binding var draggedItem: DiscussionParticipant?
+
+    func dropEntered(info: DropInfo) {
+        guard let dragged = draggedItem,
+              dragged.id != item.id,
+              let from = participants.firstIndex(where: { $0.id == dragged.id }),
+              let to = participants.firstIndex(where: { $0.id == item.id }) else {
+            return
+        }
+        if from != to {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                participants.move(
+                    fromOffsets: IndexSet(integer: from),
+                    toOffset: to > from ? to + 1 : to
+                )
+            }
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggedItem = nil
+        return true
     }
 }
 

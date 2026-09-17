@@ -1,4 +1,5 @@
 import Foundation
+import AIDiscussionBridge
 
 /// 统一的 JSON 编解码入口。
 ///

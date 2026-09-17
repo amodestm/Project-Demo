@@ -109,6 +109,17 @@ public enum JSONValue: Codable, Sendable, Hashable {
         return nil
     }
 
+    /// 字符串数组；非字符串元素会被拒绝（返回 nil），避免静默吞掉类型错误。
+    public var stringArrayValue: [String]? {
+        guard case .array(let items) = self else { return nil }
+        var out: [String] = []
+        for item in items {
+            guard case .string(let s) = item else { return nil }
+            out.append(s)
+        }
+        return out
+    }
+
     public subscript(key: String) -> JSONValue? {
         guard case .object(let dict) = self else { return nil }
         return dict[key]
@@ -172,7 +183,7 @@ public enum JSONValue: Codable, Sendable, Hashable {
     }
 
     public var prettyDescription: String {
-        (try? JSONCoding.encodeToString(self, pretty: true)) ?? "<unencodable>"
+        BridgeJSON.prettyString(self) ?? "<unencodable>"
     }
 }
 

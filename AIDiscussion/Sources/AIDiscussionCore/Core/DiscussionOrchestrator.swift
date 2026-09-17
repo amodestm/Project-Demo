@@ -319,6 +319,12 @@ public final class DiscussionOrchestrator: ObservableObject {
         thinkingParticipantID = speaker.id
         try persistRun()
 
+        // 如果"窗口显示"模式已开启，将该成员的 Chrome 窗口自动提升到 Chrome 窗口栈顶
+        // 使得用户切换到 Chrome 时，第一眼看到的就是当前正在输入/回答的那个账号页面
+        if let router = sessions as? RoutingDiscussionSessionProvider {
+            await router.raiseSpeakingSession(for: speaker)
+        }
+
         let response: String
         do {
             response = try await session.send(prompt: prompt)

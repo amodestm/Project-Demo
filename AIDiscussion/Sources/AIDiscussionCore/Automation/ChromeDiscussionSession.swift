@@ -38,6 +38,16 @@ public actor ChromeDiscussionSessionProvider: DiscussionSessionProviding {
         }
     }
 
+    /// 当"窗口已显示"模式下，将正在发言的成员窗口提升到 Chrome 窗口栈顶（第一个）。
+    /// 仅在 isWindowsVisible = true 时生效；静默模式下窗口在屏幕外，无需也不应调整层级。
+    public func raiseSpeakingSession(for participant: DiscussionParticipant) {
+        guard isWindowsVisible else { return }
+        let profile = participant.profileDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        let email = participant.emailHint.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionKey = "\(participant.id)|\(profile)|\(email.lowercased())"
+        sessions[sessionKey]?.raiseFront()
+    }
+
     public func session(
         for participant: DiscussionParticipant
     ) async throws -> DiscussionSessionDriving {
@@ -622,6 +632,14 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
         }
     }
 
+    /// 将此窗口提升到 Chrome 所有窗口栈的最顶层（不移动位置、不抢 app 焦点）。
+    /// 适用于"显示模式"下让正在发言的成员窗口自动跳到第一个，
+    /// 用户切换到 Chrome 时直接看到正在输入/思考的那个页面。
+    public func raiseFront() {
+        guard isValid else { return }
+        _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    }
+
     private func rememberVerified(_ account: String) {
         verifiedAccount = account
     }
@@ -765,16 +783,14 @@ enum AX {
 
             if r == "AXStaticText" || r == "AXHeading" || r == "AXButton" {
                 let text = (textValue(el, kAXValueAttribute) ?? string(el, kAXTitleAttribute) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                if text == "正在思考" || text == "thinking..." || text.hasPrefix("已思考") || text.hasPrefix("thought for") || text == "●" {
+                if text == "正在思考" || text == "thinking..." || text == "●" {
                     return true
                 }
                 if text.contains("正在搜索")
                     || text.contains("搜索网站")
                     || text.contains("搜索网页")
                     || text.contains("searching the web")
-                    || text.contains("searching...")
-                    || (text.hasPrefix("searched") && text.count < 30)
-                    || (text.hasPrefix("已搜索") && text.count < 25) {
+                    || text.contains("searching...") {
                     return true
                 }
             }

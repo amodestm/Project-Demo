@@ -20,6 +20,8 @@ macOS 原生应用：把**多个已登录的 ChatGPT 账号**组成一个可配�
 - **身份校验 fail closed**：每次发言前核对目标窗口的登录账号，不匹配就立即停止整场讨论——发错人等于整场讨论作废。
 - **发言收到即落盘**：每条发言在收到回复的瞬间原子写入数据库，崩溃或强杀后可恢复。
 - **零外部依赖**：纯 SwiftPM 工程，Xcode 直接打开即可构建，无需 resolve 任何 package。
+- **可被 Codex 等 MCP 客户端调用**：内置 MCP 服务端，外部 AI 能自带角色临时组一场讨论、
+  拿到结论后接着干自己的活，或复用界面里配好的讨论组。详见 [让 Codex 调用（MCP）](#让-codex-调用mcp)。
 
 ---
 
@@ -123,19 +125,124 @@ open /Applications/AIDiscussion.app
 
 ---
 
+## 让 Codex 调用（MCP）
+
+讨论组可以作为一个 **MCP 服务端**被外部客户端调用。配置之后，Codex（或任何 MCP 客户端）能直接：
+
+- 自带角色设定、临时组一个讨论组，跑完拿到结论，然后**接着干它自己的活**；
+- 也可以复用你在这个 app 里已经配好的讨论组，只换一个议题；
+- 长讨论可以异步起、轮询查进度、最后取结论。
+
+### 它是怎么接起来的
+
+```
+Codex / 其它 MCP 客户端
+   │  stdio（换行分隔 JSON-RPC）
+   ▼
+AIDiscussionMCP 可执行文件          ← 只是代理，不碰浏览器
+   │  Unix domain socket（0600 + 随机 token）
+   ▼
+AIDiscussion.app                    ← 持有辅助功能权限，真正驱动 Chrome
+```
+
+三个关键点：
+
+- **权限在 app 上，不在 MCP 上**。驱动网页 UI 依赖辅助功能权限，而那个授权给的是 app。
+  所以 MCP 只是转发，你**不需要**再给命令行程序单独授权。
+- **app 没跑会自动拉起**。MCP 会先试 `open -b com.aidiscussion.app`，再回退到
+  `/Applications/AIDiscussion.app` 和仓库里的 `dist/AIDiscussion.app`，然后等桥接就绪。
+- **讨论跑在 app 里，不在 MCP 进程里**。所以 Codex 那边中断了，讨论照样跑完并落盘，
+  事后用 `discussion_result` 取结论即可（界面侧边栏也会实时显示进度）。
+
+### 配置
+
+```bash
+# 1. 构建 MCP 服务端
+swift build -c release --disable-sandbox
+
+# 2. 打印要写进 ~/.codex/config.toml 的配置（默认只打印，不改文件）
+bash Scripts/install_mcp_config.sh
+
+# 3. 确认无误后再落盘（幂等：已有同名段落则不动）
+bash Scripts/install_mcp_config.sh --apply
+```
+
+写入的内容形如：
+
+```toml
+[mcp_servers.aidiscussion]
+command = "/绝对路径/.build/release/AIDiscussionMCP"
+args = []
+startup_timeout_sec = 60
+```
+
+然后**重启 Codex**。注意 `command` 指向的是构建产物；如果执行过 `swift package clean`，
+需要重新构建（或把该二进制拷到一个不会被清理的固定路径，再改这行）。
+
+也可以手工把上面这段贴进 `~/.codex/config.toml` —— 脚本默认只打印，就是为了避免
+在你正在用的配置里自动动刀。
+
+### 工具
+
+| 工具 | 作用 | 关键参数 |
+|---|---|---|
+| `discussion_run` | 跑完一场讨论并直接给结论（**阻塞**） | `topic`、`participants`／`group`、`rounds`、`consensus`、`timeoutSeconds` |
+| `discussion_start` | 异步起一场讨论，立刻返回 `jobId` | 同上（无 `timeoutSeconds`） |
+| `discussion_status` | 查进度；**不带 `jobId` 时返回桥接状态**（app 是否在跑、权限、可用 Profile、在跑的任务） | `jobId`（可选） |
+| `discussion_result` | 取结论 + 每位成员发言全文 + 账号审计 | `jobId`、`maxCharsPerUtterance` |
+| `discussion_cancel` | 取消任务（已完成的发言保留） | `jobId` |
+| `discussion_roles` | 列出 6 个内置角色模板 | — |
+| `discussion_profiles` | 列出可绑定的 Chrome Profile 与建议账号标识 | — |
+| `discussion_groups` | 列出你在界面里配好的讨论组 | — |
+
+成员（`participants`）每项至少要给 `name`，角色用 `role`（自定义）或 `preset`（内置模板名）；
+`profile` 不给就自动分配一个未占用的；`account` 不给就取该 Profile 的显示名。
+
+### 怎么用才不浪费
+
+- **阻塞还是异步**：预计 10 分钟以内用 `discussion_run`；更长的用
+  `discussion_start` + `discussion_status` 轮询，避开客户端工具超时。
+  `discussion_run` 超时**不等于失败**，任务仍在跑 —— 按返回的 `jobId` 改用轮询即可。
+- **角色必须互斥**。所有账号背后是同一个模型，若每个角色都写"客观全面地分析"，
+  讨论必然退化成互相附和。写清「专门负责挑什么毛病」+「不许越界谈什么」。
+  不确定就用 `discussion_roles` 的模板。
+- **别用它查事实**。决策、取舍、风险评估才值得开会；查资料直接查。
+
+### 权限与故障排查
+
+| 现象 | 原因与处理 |
+|---|---|
+| `discussion_status` 说"辅助功能权限：未授予" | 到「系统设置 → 隐私与安全性 → 辅助功能」勾选 AIDiscussion |
+| 工具报"未在运行，且无法自动启动" | 手动打开 AIDiscussion.app 后重试；app 必须至少启动过一次 |
+| 工具报 `login_required` | 某位成员没登录：在 app 里点「一键跳转登录」，或按返回的 `loginURL` 登录该 Profile |
+| 工具报 `invalid_request` 且提到 Profile | 先调 `discussion_profiles`，用返回的 `directory` 值 |
+| 想确认到底连没连上 | 调 `discussion_status`（不带参数），它会报 app 版本、协议版本与权限状态 |
+
+### 安全边界
+
+- 桥接只监听**本机文件系统里的 Unix socket**，不占端口、不经网络。
+- `bridge.sock` 与 `bridge.token` 都是 `0600`，只有当前用户可读写；
+  请求还要带 64 位随机 token（app 每次启动重新生成），其它本机程序无法顺手驱动你的讨论。
+- MCP 侧不读取任何凭据，也不联网；它只把 JSON 转给 app。
+
 ## 架构概览
 
 ```
 AIDiscussionApp (SwiftUI)
-  └─ DiscussionHubView                 讨论组列表 + 运行界面
+  └─ DiscussionHubView                 讨论组列表 + 运行界面 + MCP 桥接面板
        ├─ DiscussionConfigView          成员 / 议程 / 收敛规则配置
        └─ DiscussionOrchestrator        按议程串行推进，逐成员发言
             ├─ DiscussionSessionProviding  会话提供方抽象
             │    └─ ChromeDiscussionSession 锁窗 · 身份校验 · 写入 · 提交 · 读回
             │         └─ ChromeProfileScanner  读取 Chrome profile / 按 profile 开窗
             └─ DiscussionRepository     → SQLite（发言收到即原子落盘）
+  └─ DiscussionBridgeServer            Unix socket 桥接（外部调用入口）
+       └─ DiscussionBridgeHub          任务注册表 · op 分发 · 进度快照
 
-AIDiscussionCore    零 UI 依赖（可单独作为 library 使用）
+AIDiscussionMCP（可执行）              MCP stdio 服务端 → 连上面的 socket
+AIDiscussionMCPKit（库）               MCP 协议 · 工具面 · 桥接客户端
+AIDiscussionBridge（库）               与 app 共用的线协议
+AIDiscussionCore（库）                 零 UI 依赖，可单独引用
 ```
 
 ### 为什么是串行
