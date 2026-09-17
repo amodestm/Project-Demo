@@ -77,6 +77,26 @@ public struct ChromeProfileScanner: Sendable {
             case .brave:        return "BraveSoftware/Brave-Browser"
             }
         }
+        /// Chromium 系浏览器的主可执行文件路径。
+        /// 优先通过 NSWorkspace 动态定位已安装 App 的内部主二进制，回退到默认标准路径。
+        public var executablePath: String {
+            if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: rawValue),
+               let execURL = Bundle(url: appURL)?.executableURL {
+                return execURL.path
+            }
+            switch self {
+            case .chrome:
+                return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            case .chromeCanary:
+                return "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"
+            case .chromium:
+                return "/Applications/Chromium.app/Contents/MacOS/Chromium"
+            case .edge:
+                return "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+            case .brave:
+                return "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+            }
+        }
     }
 
     private let homeDirectory: String
@@ -123,8 +143,11 @@ public struct ChromeProfileScanner: Sendable {
 
     /// 用指定 profile 打开一个 URL。
     ///
-    /// 通过 `open -b <bundle-id> --args --profile-directory=<name>`。
-    /// 浏览器已经在那个 profile 里登录着, 所以不会要求再次输入密码。
+    /// ## 为什么 newWindow 时直接调用可执行文件：
+    /// 在 macOS 中，当 Chrome 已经运行时，`/usr/bin/open` 附带的 `--args`
+    /// 会被系统完全丢弃，不会传递给已运行的 Chrome 实例。
+    /// 因此在需要以指定 profile 打开新窗口时，必须直接执行 Chrome 二进制，
+    /// 才能可靠传递 `--new-window`、`--profile-directory` 以及 URL。
     @discardableResult
     public func open(
         url: URL,
@@ -132,9 +155,26 @@ public struct ChromeProfileScanner: Sendable {
         kind: ChromeKind = .chrome,
         newWindow: Bool = false
     ) -> Bool {
-        var arguments = ["-g", "-b", kind.rawValue, "--args"]
         if newWindow {
-            arguments.append("--new-window")
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: kind.executablePath)
+            process.arguments = ["--new-window"]
+                + (profile.map { ["--profile-directory=\($0.directoryName)"] } ?? [])
+                + [url.absoluteString]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            do {
+                try process.run()
+                // Chrome 首次启动或已运行时主进程由系统调度，成功创建进程即已派发请求
+                return true
+            } catch {
+                return false
+            }
+        }
+
+        var arguments = ["-g", "-b", kind.rawValue]
+        if profile != nil {
+            arguments.append("--args")
         }
         if let profile {
             arguments.append("--profile-directory=\(profile.directoryName)")

@@ -1,5 +1,25 @@
 import Foundation
 
+/// 成员登录态异常或未登录详情。
+public struct DiscussionLoginIssue: Sendable, Equatable, Hashable {
+    public let participantName: String
+    public let profileDirectory: String
+    public let accountHint: String
+    public let loginURL: URL
+
+    public init(
+        participantName: String,
+        profileDirectory: String,
+        accountHint: String,
+        loginURL: URL = URL(string: "https://chatgpt.com/auth/login")!
+    ) {
+        self.participantName = participantName
+        self.profileDirectory = profileDirectory
+        self.accountHint = accountHint
+        self.loginURL = loginURL
+    }
+}
+
 /// 全项目统一错误类型。
 ///
 /// 设计原则: **绝不允许"所有错误一律重试"**。
@@ -12,13 +32,11 @@ public enum AppError: Error, Sendable {
     case providerUnavailable
     case modelUnavailable
     case authentication
+    case loginRequired(DiscussionLoginIssue)
     case billingRequired
     case invalidRequest(String)
     case contextTooLong
     case invalidOutput(String)
-    /// 乐观并发冲突: 目标行的状态在本次操作期间被改动了 (CAS 失败)。
-    ///
-    /// 典型场景是"同一份结果被提交两次"。绝不能重试 —— 必须让调用方重新读取状态。
     case concurrentModification(String)
     case cancelled
     case database(String)
@@ -59,7 +77,7 @@ extension AppError {
             return .shrinkContext
         case .invalidOutput:
             return .retrySame          // 附加"请只返回合法 JSON"提示后重试
-        case .authentication, .billingRequired:
+        case .authentication, .loginRequired, .billingRequired:
             return .pauseTask
         case .invalidRequest, .concurrentModification:
             return .failStep
@@ -75,7 +93,7 @@ extension AppError {
             return true
         case .providerUnavailable, .modelUnavailable:
             return true   // 可重试, 但方式必须是换 backend
-        case .authentication, .billingRequired, .invalidRequest,
+        case .authentication, .loginRequired, .billingRequired, .invalidRequest,
              .concurrentModification,
              .contextTooLong, .cancelled, .database, .fatal:
             return false
@@ -87,7 +105,7 @@ extension AppError {
     /// 网络抖动不该熔断 Provider; 认证失败/余额耗尽则必须 —— 继续调用只是浪费时间和额度。
     public var tripsProviderCircuit: Bool {
         switch self {
-        case .providerUnavailable, .authentication, .billingRequired:
+        case .providerUnavailable, .authentication, .loginRequired, .billingRequired:
             return true
         case .network, .timeout, .rateLimit, .modelUnavailable, .invalidRequest,
              .concurrentModification,
@@ -99,7 +117,7 @@ extension AppError {
     /// 是否属于"永久性"故障 —— 换 backend 也没用, 只能靠用户修配置。
     public var isTerminalForProvider: Bool {
         switch self {
-        case .authentication, .billingRequired:
+        case .authentication, .loginRequired, .billingRequired:
             return true
         default:
             return false
@@ -117,6 +135,10 @@ extension AppError {
         case .providerUnavailable:   return "Provider 暂时不可用"
         case .modelUnavailable:      return "模型不可用"
         case .authentication:        return "认证失败, 请检查 API Key"
+        case .loginRequired(let issue):
+            let who = issue.participantName.isEmpty ? issue.accountHint : issue.participantName
+            let profileStr = issue.profileDirectory.isEmpty ? "" : " (Profile: \(issue.profileDirectory))"
+            return "成员「\(who)」\(profileStr) 的 ChatGPT 处于未登录状态或登录已过期，请先登录。"
         case .billingRequired:       return "余额/额度不足, 已熔断该 Provider"
         case .invalidRequest(let m): return "请求非法: \(m)"
         case .concurrentModification(let m): return "并发冲突 (状态已被改动): \(m)"
@@ -137,6 +159,7 @@ extension AppError {
         case .providerUnavailable:  return "PROVIDER_UNAVAILABLE"
         case .modelUnavailable:     return "MODEL_UNAVAILABLE"
         case .authentication:       return "AUTHENTICATION_ERROR"
+        case .loginRequired:        return "LOGIN_REQUIRED"
         case .billingRequired:      return "BILLING_REQUIRED"
         case .invalidRequest:       return "INVALID_REQUEST"
         case .concurrentModification: return "CONCURRENT_MODIFICATION"
@@ -151,6 +174,12 @@ extension AppError {
     /// 便捷: 取限流等待时间。
     public var retryAfter: TimeInterval? {
         if case .rateLimit(let after) = self { return after }
+        return nil
+    }
+
+    /// 便捷: 取登录问题详情。
+    public var loginIssue: DiscussionLoginIssue? {
+        if case .loginRequired(let issue) = self { return issue }
         return nil
     }
 

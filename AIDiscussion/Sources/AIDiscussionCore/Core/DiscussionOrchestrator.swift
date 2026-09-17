@@ -1,5 +1,7 @@
-import Foundation
+import AppKit
+import ApplicationServices
 import Combine
+import Foundation
 
 /// 讨论组编排器 —— 按议程串行推进, 让多个账号轮流"说话"并收敛出决策。
 ///
@@ -24,6 +26,23 @@ public final class DiscussionOrchestrator: ObservableObject {
     /// 正在"思考"(已发送、等回复)的成员 —— UI 靠它显示打字动画。
     @Published public private(set) var thinkingParticipantID: String?
     @Published public private(set) var isRunning = false
+    /// 当前活跃的登录异常信息，UI 提供一键跳转登录按钮
+    @Published public private(set) var activeLoginIssue: DiscussionLoginIssue?
+
+    public struct PreloadProgress: Sendable, Equatable {
+        public let current: Int
+        public let total: Int
+        public let participantName: String
+
+        public init(current: Int, total: Int, participantName: String) {
+            self.current = current
+            self.total = total
+            self.participantName = participantName
+        }
+    }
+
+    /// 会话预热进度：集中在开始时提前打开并静默就绪全部成员窗口，杜绝讨论过程中弹窗频繁跳出
+    @Published public private(set) var preloadProgress: PreloadProgress?
 
     /// 是否存在已中断但可继续推进的讨论上下文（断点续跑）
     public var canResume: Bool {
@@ -76,6 +95,8 @@ public final class DiscussionOrchestrator: ObservableObject {
         if run.startedAt == nil { run.startedAt = Date() }
         run.state = .running
         run.errorMessage = nil
+        activeLoginIssue = nil
+        preloadProgress = nil
         do {
             try persistRun()
             logger.info(
@@ -83,17 +104,25 @@ public final class DiscussionOrchestrator: ObservableObject {
                 "开始讨论「\(group.name)」: \(group.enabledParticipants.count) 个成员 / "
                 + "\(group.rounds.count) 轮 / 收敛方式 \(group.consensus.displayName)"
             )
+            // 集中预热就绪全部成员窗口，确保后续多轮讨论在后台静默运行，无需反复跳弹窗打扰用户
+            try await preloadSessions()
             try await runAgenda()
         } catch {
+            preloadProgress = nil
             if run.state != .cancelled {
+                let appError = AppError.normalize(error)
+                if case let .loginRequired(issue) = appError {
+                    activeLoginIssue = issue
+                }
                 run.state = .failed
-                run.errorMessage = AppError.normalize(error).userMessage
+                run.errorMessage = appError.userMessage
                 run.finishedAt = Date()
                 logger.error(.discussionFailed, run.errorMessage ?? "讨论失败")
             }
         }
 
         thinkingParticipantID = nil
+        preloadProgress = nil
         isRunning = false
         do {
             try persistRun()
@@ -106,6 +135,7 @@ public final class DiscussionOrchestrator: ObservableObject {
 
     public func cancel() {
         cancelled = true
+        preloadProgress = nil
         guard !run.state.isTerminal else { return }
         run.state = .cancelled
         run.finishedAt = Date()
@@ -124,7 +154,56 @@ public final class DiscussionOrchestrator: ObservableObject {
         run = DiscussionRun(groupID: group.id)
         utterances = []
         thinkingParticipantID = nil
+        preloadProgress = nil
         cancelled = false
+    }
+
+    // MARK: - 会话预热 (杜绝讨论中弹窗频繁弹出)
+
+    /// 提前集中打开并就绪所有参与成员的 Chrome 窗口，并在就绪后隐形待命。
+    public func preloadSessions() async throws {
+        let targets = group.enabledParticipants
+        guard !targets.isEmpty else { return }
+
+        for (index, speaker) in targets.enumerated() {
+            if cancelled { return }
+            // 仅对已配置 profile 的成员进行预热
+            if !speaker.profileDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                preloadProgress = PreloadProgress(
+                    current: index + 1,
+                    total: targets.count,
+                    participantName: speaker.displayName
+                )
+                do {
+                    let session = try await sessions.session(for: speaker)
+                    guard try await session.verifyIdentity(emailHint: speaker.emailHint) else {
+                        let actual = (try? await session.currentAccount()) ?? "未知"
+                        logger.error(
+                            .discussionIdentityFailed,
+                            "成员「\(speaker.displayName)」窗口账号不匹配: 期望 \(speaker.emailHint), 实际 \(actual)"
+                        )
+                        throw AppError.invalidRequest(
+                            "成员「\(speaker.displayName)」的窗口账号不匹配"
+                            + "(期望 \(speaker.emailHint), 实际 \(actual))。已停止, 不会把发言发到错误的账号。"
+                        )
+                    }
+                } catch let appErr as AppError {
+                    preloadProgress = nil
+                    if case .loginRequired(let issue) = appErr {
+                        throw AppError.loginRequired(
+                            DiscussionLoginIssue(
+                                participantName: speaker.displayName,
+                                profileDirectory: speaker.profileDirectory,
+                                accountHint: speaker.emailHint,
+                                loginURL: issue.loginURL
+                            )
+                        )
+                    }
+                    throw appErr
+                }
+            }
+        }
+        preloadProgress = nil
     }
 
     // MARK: - 议程推进
@@ -181,19 +260,33 @@ public final class DiscussionOrchestrator: ObservableObject {
             return
         }
 
-        let session = try await sessions.session(for: speaker)
-
-        // ★ 铁律 1: 身份校验 fail closed ★
-        guard try await session.verifyIdentity(emailHint: speaker.emailHint) else {
-            let actual = (try? await session.currentAccount()) ?? "未知"
-            logger.error(
-                .discussionIdentityFailed,
-                "成员「\(speaker.displayName)」窗口账号不匹配: 期望 \(speaker.emailHint), 实际 \(actual)"
-            )
-            throw AppError.invalidRequest(
-                "成员「\(speaker.displayName)」的窗口账号不匹配"
-                + "(期望 \(speaker.emailHint), 实际 \(actual))。已停止, 不会把发言发到错误的账号。"
-            )
+        let session: any DiscussionSessionDriving
+        do {
+            session = try await sessions.session(for: speaker)
+            // ★ 铁律 1: 身份校验 fail closed ★
+            guard try await session.verifyIdentity(emailHint: speaker.emailHint) else {
+                let actual = (try? await session.currentAccount()) ?? "未知"
+                logger.error(
+                    .discussionIdentityFailed,
+                    "成员「\(speaker.displayName)」窗口账号不匹配: 期望 \(speaker.emailHint), 实际 \(actual)"
+                )
+                throw AppError.invalidRequest(
+                    "成员「\(speaker.displayName)」的窗口账号不匹配"
+                    + "(期望 \(speaker.emailHint), 实际 \(actual))。已停止, 不会把发言发到错误的账号。"
+                )
+            }
+        } catch let appErr as AppError {
+            if case .loginRequired(let issue) = appErr {
+                throw AppError.loginRequired(
+                    DiscussionLoginIssue(
+                        participantName: speaker.displayName,
+                        profileDirectory: speaker.profileDirectory,
+                        accountHint: speaker.emailHint,
+                        loginURL: issue.loginURL
+                    )
+                )
+            }
+            throw appErr
         }
 
         let prompt = buildPrompt(round: round, speaker: speaker)
@@ -442,5 +535,82 @@ public final class DiscussionOrchestrator: ObservableObject {
     private func persistRun() throws {
         guard let repository else { return }
         try repository.save(run)
+    }
+
+    // MARK: - 登录支持与一键跳转
+
+    /// 获取当前生效或推断的登录问题（用于在报错时展示一键跳转登录按钮）
+    public var currentOrInferredLoginIssue: DiscussionLoginIssue? {
+        if let active = activeLoginIssue {
+            return active
+        }
+        guard let error = run.errorMessage else {
+            return nil
+        }
+        let lower = error.lowercased()
+        let isExplicitLoginError = lower.contains("未登录")
+            || lower.contains("请先登录")
+            || lower.contains("需要登录")
+            || lower.contains("登录已过期")
+            || lower.contains("not logged in")
+            || lower.contains("login required")
+
+        guard isExplicitLoginError else {
+            return nil
+        }
+        if let curID = run.currentParticipantID,
+           let p = group.participants.first(where: { $0.id == curID }) {
+            return DiscussionLoginIssue(
+                participantName: p.displayName,
+                profileDirectory: p.profileDirectory,
+                accountHint: p.emailHint
+            )
+        }
+        for p in group.participants {
+            if error.contains(p.displayName)
+                || (!p.emailHint.isEmpty && error.contains(p.emailHint))
+                || (!p.profileDirectory.isEmpty && error.contains(p.profileDirectory)) {
+                return DiscussionLoginIssue(
+                    participantName: p.displayName,
+                    profileDirectory: p.profileDirectory,
+                    accountHint: p.emailHint
+                )
+            }
+        }
+        if let first = group.enabledParticipants.first(where: { !$0.profileDirectory.isEmpty }) {
+            return DiscussionLoginIssue(
+                participantName: first.displayName,
+                profileDirectory: first.profileDirectory,
+                accountHint: first.emailHint
+            )
+        }
+        return nil
+    }
+
+    /// 一键跳转指定成员 Profile 的 ChatGPT 登录页面，并将窗口唤起至主屏幕前台
+    public func openLoginWindow(for issue: DiscussionLoginIssue) {
+        let scanner = ChromeProfileScanner()
+        let profile = ChromeProfile(directoryName: issue.profileDirectory, displayName: "")
+        scanner.open(url: issue.loginURL, profile: profile, kind: .chrome, newWindow: true)
+
+        if let app = NSRunningApplication.runningApplications(
+            withBundleIdentifier: ChromeProfileScanner.ChromeKind.chrome.rawValue
+        ).first(where: { !$0.isTerminated }) {
+            app.activate()
+
+            // 将所有屏幕外的 Chrome 窗口还原到主屏幕 (100, 80)
+            let root = AXUIElementCreateApplication(app.processIdentifier)
+            var val: CFTypeRef?
+            if AXUIElementCopyAttributeValue(root, kAXWindowsAttribute as CFString, &val) == .success,
+               let windows = val as? [AXUIElement] {
+                for window in windows {
+                    var point = CGPoint(x: 100, y: 80)
+                    if let posVal = AXValueCreate(.cgPoint, &point) {
+                        _ = AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, posVal)
+                    }
+                    _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+                }
+            }
+        }
     }
 }

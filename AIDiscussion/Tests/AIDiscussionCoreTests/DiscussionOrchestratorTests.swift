@@ -37,14 +37,16 @@ final class DiscussionOrchestratorTests: XCTestCase {
     private func makeOrchestrator(
         group: DiscussionGroup,
         sessions: DiscussionSessionProviding,
-        repository: DiscussionRepository? = nil
+        repository: DiscussionRepository? = nil,
+        run: DiscussionRun? = nil
     ) throws -> DiscussionOrchestrator {
         let services = try DiscussionServices.inMemory()
         return DiscussionOrchestrator(
             group: group,
             sessions: sessions,
             repository: repository,
-            logger: services.logger
+            logger: services.logger,
+            run: run
         )
     }
 
@@ -498,6 +500,9 @@ final class DiscussionOrchestratorTests: XCTestCase {
         XCTAssertFalse(AX.isValidAssistantResponse("●", prompt: prompt))
         XCTAssertFalse(AX.isValidAssistantResponse("Something went wrong while generating the response.", prompt: prompt))
         XCTAssertFalse(AX.isValidAssistantResponse(prompt, prompt: prompt))
+        // 必须拒绝营销/推广宣传卡片
+        XCTAssertFalse(AX.isValidAssistantResponse("将你的工作内容打造成精美的文档、演示文稿、电子表格、报告或网站。", prompt: prompt))
+        XCTAssertFalse(AX.isValidAssistantResponse("在 ChatGPT Work 中进一步推进", prompt: prompt))
 
         // 真实正文必须通过
         let realResponse = "我的判断是：AIDD短期最可能提升的是靶点筛选与分子生成。"
@@ -561,9 +566,89 @@ final class DiscussionOrchestratorTests: XCTestCase {
         let activeLatest = try services.discussionRepo.latestRun(groupID: group.id)
         XCTAssertEqual(activeLatest?.id, runC.id, "有活跃运行中任务时应最高优先级返回")
     }
+
+    func testLoginRequiredErrorIsSurfacedWithDirectJumpDetails() async throws {
+        let group = makeGroup()
+        let participant = group.participants[0]
+
+        let orch = try makeOrchestrator(
+            group: group,
+            sessions: LoginRequiredSessionProvider(profile: participant.profileDirectory, account: participant.emailHint)
+        )
+
+        await orch.start()
+
+        XCTAssertEqual(orch.run.state, DiscussionRunState.failed)
+        let errorMsg = orch.run.errorMessage ?? ""
+        XCTAssertTrue(errorMsg.contains("未登录"), "未登录时应直接报错并提示登录状态")
+
+        let issue = orch.currentOrInferredLoginIssue
+        XCTAssertNotNil(issue, "应能提取出登录问题结构体")
+        XCTAssertEqual(issue?.participantName, participant.displayName)
+        XCTAssertEqual(issue?.profileDirectory, participant.profileDirectory)
+        XCTAssertEqual(issue?.loginURL, URL(string: "https://chatgpt.com/auth/login")!)
+    }
+
+    func testComposerTimeoutDoesNotInferLoginIssue() throws {
+        let group = makeGroup()
+
+        // 1. 输入框超时文案包含“已登录”或无未登录关键词，绝不可误判为登录问题
+        let runTimeout1 = DiscussionRun(
+            groupID: group.id,
+            errorMessage: "请求非法: ChatGPT 页面已打开，但没有找到消息输入框（页面加载超时或被遮挡）。"
+        )
+        let orch1 = try makeOrchestrator(
+            group: group,
+            sessions: ScriptedSessionProvider(group: group, replyDelay: .zero),
+            run: runTimeout1
+        )
+        XCTAssertNil(orch1.currentOrInferredLoginIssue, "输入框超时报错绝不应误判为未登录")
+
+        let runTimeoutOld = DiscussionRun(
+            groupID: group.id,
+            errorMessage: "请求非法: ChatGPT 页面已打开，但没有找到消息输入框。请确认该 Profile 已登录且页面加载完成。"
+        )
+        let orchOld = try makeOrchestrator(
+            group: group,
+            sessions: ScriptedSessionProvider(group: group, replyDelay: .zero),
+            run: runTimeoutOld
+        )
+        XCTAssertNil(orchOld.currentOrInferredLoginIssue, "即使旧文案含'已登录'字样，也不应误推断为未登录")
+
+        // 2. 真正的未登录报错必须准确推断
+        let runLogin = DiscussionRun(
+            groupID: group.id,
+            errorMessage: "成员「批判者」的 ChatGPT 处于未登录状态或登录已过期，请先登录。"
+        )
+        let orchLogin = try makeOrchestrator(
+            group: group,
+            sessions: ScriptedSessionProvider(group: group, replyDelay: .zero),
+            run: runLogin
+        )
+        let loginIssue = orchLogin.currentOrInferredLoginIssue
+        XCTAssertNotNil(loginIssue, "显式未登录报错必须能够推断出登录问题")
+        XCTAssertEqual(loginIssue?.participantName, "批判者")
+    }
 }
 
 // MARK: - 测试替身
+
+/// 抛出登录异常的会话提供方 —— 用于验证登录问题直报与一键跳转。
+private struct LoginRequiredSessionProvider: DiscussionSessionProviding {
+    let profile: String
+    let account: String
+
+    func session(for participant: DiscussionParticipant) async throws -> DiscussionSessionDriving {
+        throw AppError.loginRequired(
+            DiscussionLoginIssue(
+                participantName: participant.displayName,
+                profileDirectory: profile,
+                accountHint: account,
+                loginURL: URL(string: "https://chatgpt.com/auth/login")!
+            )
+        )
+    }
+}
 
 /// 永远校验失败的会话 —— 用于验证 fail closed。
 private struct WrongIdentityProvider: DiscussionSessionProviding {

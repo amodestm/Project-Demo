@@ -6,7 +6,7 @@ import Foundation
 public struct ChromeDiscussionSessionConfiguration: Sendable, Equatable {
     public var browserKind: ChromeProfileScanner.ChromeKind = .chrome
     public var chatGPTURL: URL = URL(string: "https://chatgpt.com/")!
-    public var windowOpenTimeout: TimeInterval = 30
+    public var windowOpenTimeout: TimeInterval = 45
     public var pageReadyTimeout: TimeInterval = 45
     public var responseTimeout: TimeInterval = 300
     public var pollInterval: Duration = .seconds(1)
@@ -88,6 +88,7 @@ public actor ChromeDiscussionSessionProvider: DiscussionSessionProviding {
 public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked Sendable {
     private let application: NSRunningApplication
     private let window: AXUIElement
+    public let profile: ChromeProfile
     private let expectedAccount: String
     private let configuration: ChromeDiscussionSessionConfiguration
     private var verifiedAccount: String?
@@ -108,11 +109,13 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
     private init(
         application: NSRunningApplication,
         window: AXUIElement,
+        profile: ChromeProfile,
         expectedAccount: String,
         configuration: ChromeDiscussionSessionConfiguration
     ) {
         self.application = application
         self.window = window
+        self.profile = profile
         self.expectedAccount = expectedAccount
         self.configuration = configuration
     }
@@ -128,6 +131,40 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
             throw AppError.invalidRequest("macOS 辅助功能 (Accessibility) 权限未开启，请在「系统设置 -> 隐私与安全性 -> 辅助功能」中为 AIDiscussion 开启授权。")
         }
 
+        // 1. 优先在已运行的 Chrome 窗口中寻找匹配该账号或 Profile 的已有窗口 (实现即时复用，彻底避免重复弹窗与超时)
+        if let app = NSRunningApplication.runningApplications(
+            withBundleIdentifier: configuration.browserKind.rawValue
+        ).first(where: { !$0.isTerminated }) {
+            for window in AX.windows(in: app) {
+                let title = AX.string(window, kAXTitleAttribute) ?? ""
+                let doc = AX.string(window, kAXDocumentAttribute) ?? ""
+                let matchesAccount = AX.identityMatches(title, expected: expectedAccount)
+                    || AX.identityMatches(doc, expected: expectedAccount)
+                    || (!profile.displayName.isEmpty && AX.identityMatches(title, expected: profile.displayName))
+                let isChatGPT = doc.localizedCaseInsensitiveContains("chatgpt")
+                    || doc.localizedCaseInsensitiveContains("openai")
+                    || title.localizedCaseInsensitiveContains("chatgpt")
+                if matchesAccount && isChatGPT {
+                    let session = ChromeDiscussionSession(
+                        application: app,
+                        window: window,
+                        profile: profile,
+                        expectedAccount: expectedAccount,
+                        configuration: configuration
+                    )
+                    do {
+                        // 快速探测已有窗口是否就绪可用（3秒轻量级探测），若该已有窗口卡死、未加载或不含输入框，则尝试下一个或回退至新开干净窗口
+                        try await session.waitUntilPageReady(timeout: 3.0)
+                        session.setWindowVisible(false)
+                        return session
+                    } catch {
+                        continue
+                    }
+                }
+            }
+        }
+
+        // 2. 若没有现成匹配的窗口，生成标记并请求启动/打开窗口
         let marker = UUID().uuidString.lowercased()
         guard let markedURL = markedURL(configuration.chatGPTURL, marker: marker) else {
             throw AppError.invalidRequest("ChatGPT 地址无效：\(configuration.chatGPTURL.absoluteString)")
@@ -157,34 +194,49 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
             if let app = NSRunningApplication.runningApplications(
                 withBundleIdentifier: configuration.browserKind.rawValue
             ).first(where: { !$0.isTerminated }) {
+                // A. 优先匹配带一次性 marker 的窗口
                 if let target = AX.findWindow(in: app, documentContaining: marker) {
                     let session = ChromeDiscussionSession(
                         application: app,
                         window: target,
+                        profile: profile,
                         expectedAccount: expectedAccount,
                         configuration: configuration
                     )
-                    session.setWindowVisible(false)
                     try await session.waitUntilPageReady()
+                    session.setWindowVisible(false)
                     return session
                 }
+
+                // B. 遍历所有窗口，检查匹配账号或新弹出的 ChatGPT 窗口
                 for window in AX.windows(in: app) {
                     let hash = CFHash(window as CFTypeRef)
-                    if !existingHashes.contains(hash) {
-                        let title = AX.string(window, kAXTitleAttribute) ?? ""
-                        let doc = AX.string(window, kAXDocumentAttribute) ?? ""
-                        if doc.localizedCaseInsensitiveContains("chatgpt")
-                            || doc.localizedCaseInsensitiveContains("openai")
-                            || title.localizedCaseInsensitiveContains("chatgpt") {
-                            let session = ChromeDiscussionSession(
-                                application: app,
-                                window: window,
-                                expectedAccount: expectedAccount,
-                                configuration: configuration
-                            )
+                    let title = AX.string(window, kAXTitleAttribute) ?? ""
+                    let doc = AX.string(window, kAXDocumentAttribute) ?? ""
+                    let isChatGPT = doc.localizedCaseInsensitiveContains("chatgpt")
+                        || doc.localizedCaseInsensitiveContains("openai")
+                        || title.localizedCaseInsensitiveContains("chatgpt")
+
+                    let matchesAccount = AX.identityMatches(title, expected: expectedAccount)
+                        || AX.identityMatches(doc, expected: expectedAccount)
+                        || (!profile.displayName.isEmpty && AX.identityMatches(title, expected: profile.displayName))
+
+                    let isNewChatGPTWindow = !existingHashes.contains(hash) && isChatGPT
+
+                    if isChatGPT && (matchesAccount || isNewChatGPTWindow) {
+                        let session = ChromeDiscussionSession(
+                            application: app,
+                            window: window,
+                            profile: profile,
+                            expectedAccount: expectedAccount,
+                            configuration: configuration
+                        )
+                        do {
+                            try await session.waitUntilPageReady(timeout: 4.0)
                             session.setWindowVisible(false)
-                            try await session.waitUntilPageReady()
                             return session
+                        } catch {
+                            continue
                         }
                     }
                 }
@@ -204,6 +256,13 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
         try raise()
         try checkSessionHealth()
 
+        // 0. 优先检查窗口标题 (Chrome 标题通常包含: "... - Google Chrome - <account>")
+        if let windowTitle = AX.string(window, kAXTitleAttribute),
+           AX.identityMatches(windowTitle, expected: expected) {
+            rememberVerified(expected)
+            return true
+        }
+
         if AX.allTexts(in: window, configuration: configuration)
             .contains(where: { AX.identityMatches($0, expected: expected) }) {
             rememberVerified(expected)
@@ -212,7 +271,10 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
 
         guard let accountButton = AX.findAccountButton(
             in: window, configuration: configuration
-        ) else { return false }
+        ) else {
+            try checkSessionHealth()
+            return false
+        }
         guard AX.pressOrClick(accountButton) else { return false }
 
         defer { AX.postEscape(to: application.processIdentifier) }
@@ -227,11 +289,21 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
             }
             try await Task.sleep(for: .milliseconds(400))
         }
+        try checkSessionHealth()
         return false
     }
 
     public func currentAccount() async throws -> String? {
-        return verifiedAccount
+        if let verified = verifiedAccount {
+            return verified
+        }
+        if let title = AX.string(window, kAXTitleAttribute) {
+            let parts = title.components(separatedBy: " - ")
+            if parts.count >= 2 {
+                return parts.last?.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return nil
     }
 
     public func send(prompt: String) async throws -> String {
@@ -295,38 +367,57 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
             let lower = doc.lowercased()
             if lower.contains("/auth/") || lower.contains("/uc/") || lower.contains("/login")
                 || lower.contains("/mfa") || lower.contains("/challenge") {
-                throw AppError.invalidRequest(
-                    "目标 Profile (\(expectedAccount)) 的 ChatGPT 处于未登录或验证状态（当前页面：\(doc)）。请先在 Chrome 中完成登录。"
+                let loginURL = URL(string: doc) ?? URL(string: "https://chatgpt.com/auth/login")!
+                throw AppError.loginRequired(
+                    DiscussionLoginIssue(
+                        participantName: "",
+                        profileDirectory: profile.directoryName,
+                        accountHint: expectedAccount,
+                        loginURL: loginURL
+                    )
                 )
             }
         }
         if let webArea = AX.findWebArea(in: window) {
             let buttons = AX.allButtonsText(in: webArea)
             if buttons.contains(where: { $0 == "登录" || $0 == "log in" || $0 == "sign in" }) {
-                throw AppError.invalidRequest(
-                    "目标 Profile (\(expectedAccount)) 的 ChatGPT 处于未登录状态（页面显示登录按钮）。请先在 Chrome 中登录该账号。"
+                throw AppError.loginRequired(
+                    DiscussionLoginIssue(
+                        participantName: "",
+                        profileDirectory: profile.directoryName,
+                        accountHint: expectedAccount,
+                        loginURL: URL(string: "https://chatgpt.com/auth/login")!
+                    )
                 )
             }
         }
     }
 
-    private func waitUntilPageReady() async throws {
+    private func waitUntilPageReady(timeout: TimeInterval? = nil) async throws {
         try checkSessionHealth()
-        _ = try await waitForComposer(timeout: configuration.pageReadyTimeout)
+        AX.dismissPromptsAndModals(in: window, pid: application.processIdentifier, configuration: configuration)
+        _ = try await waitForComposer(timeout: timeout ?? configuration.pageReadyTimeout)
         try checkSessionHealth()
     }
 
     private func waitForComposer(timeout: TimeInterval? = nil) async throws -> AXUIElement {
         let deadline = Date().addingTimeInterval(timeout ?? configuration.pageReadyTimeout)
+        var ticks = 0
         while Date() < deadline {
             try Task.checkCancellation()
             if let composer = AX.findComposer(in: window, configuration: configuration) {
                 return composer
             }
+            try checkSessionHealth()
+            ticks += 1
+            if ticks >= 3 {
+                AX.dismissPromptsAndModals(in: window, pid: application.processIdentifier, configuration: configuration)
+            }
             try await Task.sleep(for: configuration.pollInterval)
         }
+        try checkSessionHealth()
         throw AppError.invalidRequest(
-            "ChatGPT 页面已打开，但没有找到消息输入框。请确认该 Profile 已登录且页面加载完成。"
+            "ChatGPT 页面已打开，但没有找到消息输入框（页面加载超时或被遮挡）。"
         )
     }
 
@@ -561,18 +652,34 @@ enum AX {
         configuration: ChromeDiscussionSessionConfiguration
     ) -> AXUIElement? {
         let searchRoot = findWebArea(in: root) ?? root
-        let candidates = collect(in: searchRoot, configuration: configuration) { element in
+        var queue = [searchRoot]
+        var candidates: [AXUIElement] = []
+        var budget = 1500
+        while !queue.isEmpty && budget > 0 {
+            let element = queue.removeFirst()
+            budget -= 1
             let role = string(element, kAXRoleAttribute) ?? ""
-            guard role == "AXTextArea" || role == "AXTextField" else { return false }
-            let text = searchableText(element)
-            if text.contains("地址") || text.contains("address") || text.contains("omnibox")
-                || text.contains("search") || text.contains("搜索") {
-                return false
+            if role == "AXTextArea" || role == "AXTextField" {
+                let text = searchableText(element)
+                let isExcluded: Bool
+                if role == "AXTextField" {
+                    isExcluded = text.contains("地址") || text.contains("address") || text.contains("omnibox")
+                        || text.contains("search") || text.contains("搜索")
+                } else {
+                    isExcluded = text.contains("地址") || text.contains("address") || text.contains("omnibox")
+                }
+                let editable = bool(element, kAXEnabledAttribute) != false
+                let semantic = ["prompt-textarea", "message", "消息", "询问", "chatgpt", "聊天", "与 chatgpt 聊天", "问问 chatgpt"]
+                    .contains { text.contains($0) }
+                if !isExcluded && editable && (semantic || role == "AXTextArea") {
+                    candidates.append(element)
+                }
             }
-            let editable = bool(element, kAXEnabledAttribute) != false
-            let semantic = ["prompt-textarea", "message", "消息", "询问", "chatgpt", "聊天", "与 chatgpt 聊天", "问问 chatgpt"]
-                .contains { text.contains($0) }
-            return editable && (semantic || role == "AXTextArea")
+            let subrole = string(element, kAXSubroleAttribute) ?? ""
+            if role == "AXGroup" && (subrole == "AXNavigation" || searchableText(element).contains("历史记录")) {
+                continue
+            }
+            queue.append(contentsOf: children(element, attribute: kAXChildrenAttribute))
         }
         return candidates.max { composerScore($0) < composerScore($1) }
     }
@@ -597,17 +704,37 @@ enum AX {
         near composer: AXUIElement,
         configuration: ChromeDiscussionSessionConfiguration
     ) -> AXUIElement? {
+        let searchRoot = findWebArea(in: root) ?? root
         let composerFrame = frame(composer)
-        let candidates = collect(in: root, configuration: configuration) { element in
-            guard (string(element, kAXRoleAttribute) ?? "") == "AXButton",
-                  bool(element, kAXEnabledAttribute) != false else { return false }
-            let text = searchableText(element)
-            let semantic = ["send", "发送", "submit", "提交", "composer-submit"]
-                .contains { text == $0 || text.contains($0) }
-            guard semantic else { return false }
-            guard let composerFrame, let buttonFrame = frame(element) else { return true }
-            return composerFrame.insetBy(dx: -500, dy: -220).intersects(buttonFrame)
+        var candidates: [AXUIElement] = []
+        var queue = [searchRoot]
+        var visited = 0
+
+        while !queue.isEmpty && visited < 1500 {
+            visited += 1
+            let el = queue.removeFirst()
+            let r = string(el, kAXRoleAttribute) ?? ""
+
+            if r == "AXButton", bool(el, kAXEnabledAttribute) != false {
+                let text = searchableText(el)
+                let semantic = ["send", "发送", "submit", "提交", "composer-submit"]
+                    .contains { text == $0 || text.contains($0) }
+                if semantic {
+                    if let composerFrame, let buttonFrame = frame(el) {
+                        if composerFrame.insetBy(dx: -500, dy: -220).intersects(buttonFrame) {
+                            candidates.append(el)
+                        }
+                    } else {
+                        candidates.append(el)
+                    }
+                }
+            }
+
+            if r != "AXNavigation" {
+                queue.append(contentsOf: children(el, attribute: kAXChildrenAttribute))
+            }
         }
+
         return candidates.max { sendScore($0, composer: composerFrame) < sendScore($1, composer: composerFrame) }
     }
 
@@ -615,43 +742,49 @@ enum AX {
         in root: AXUIElement,
         configuration: ChromeDiscussionSessionConfiguration
     ) -> Bool {
+        let searchRoot = findWebArea(in: root) ?? root
         let stopHints = [
             "stop generating", "停止生成", "stop streaming", "停止回答", "停止响应",
             "停止思考", "stop reasoning", "停止", "stop"
         ]
-        let foundStopButton = collect(in: root, configuration: configuration) { element in
-            guard (string(element, kAXRoleAttribute) ?? "") == "AXButton" else { return false }
-            let text = searchableText(element)
-            return stopHints.contains { text == $0 || text.contains($0) }
-        }.isEmpty == false
 
-        if foundStopButton { return true }
+        var queue = [searchRoot]
+        var visited = 0
 
-        // 检查页面是否存在明显的“正在思考”活跃状态或动画圆点
-        let foundThinking = collect(in: root, configuration: configuration) { element in
-            let r = string(element, kAXRoleAttribute) ?? ""
-            guard r == "AXStaticText" || r == "AXHeading" else { return false }
-            let text = (textValue(element, kAXValueAttribute) ?? string(element, kAXTitleAttribute) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return text == "正在思考" || text == "thinking..." || text.hasPrefix("已思考") || text.hasPrefix("thought for") || text == "●"
-        }.isEmpty == false
+        while !queue.isEmpty && visited < 1500 {
+            visited += 1
+            let el = queue.removeFirst()
+            let r = string(el, kAXRoleAttribute) ?? ""
 
-        if foundThinking { return true }
+            if r == "AXButton" {
+                let text = searchableText(el)
+                if stopHints.contains(where: { text == $0 || text.contains($0) }) {
+                    return true
+                }
+            }
 
-        // 检查页面是否存在明显的“正在搜索”活跃状态（如“正在搜索 2 个网站”、“Searching the web”）
-        let foundSearching = collect(in: root, configuration: configuration) { element in
-            let r = string(element, kAXRoleAttribute) ?? ""
-            guard r == "AXStaticText" || r == "AXHeading" || r == "AXButton" else { return false }
-            let text = (textValue(element, kAXValueAttribute) ?? string(element, kAXTitleAttribute) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return text.contains("正在搜索")
-                || text.contains("搜索网站")
-                || text.contains("搜索网页")
-                || text.contains("searching the web")
-                || text.contains("searching...")
-                || (text.hasPrefix("searched") && text.count < 30)
-                || (text.hasPrefix("已搜索") && text.count < 25)
-        }.isEmpty == false
+            if r == "AXStaticText" || r == "AXHeading" || r == "AXButton" {
+                let text = (textValue(el, kAXValueAttribute) ?? string(el, kAXTitleAttribute) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if text == "正在思考" || text == "thinking..." || text.hasPrefix("已思考") || text.hasPrefix("thought for") || text == "●" {
+                    return true
+                }
+                if text.contains("正在搜索")
+                    || text.contains("搜索网站")
+                    || text.contains("搜索网页")
+                    || text.contains("searching the web")
+                    || text.contains("searching...")
+                    || (text.hasPrefix("searched") && text.count < 30)
+                    || (text.hasPrefix("已搜索") && text.count < 25) {
+                    return true
+                }
+            }
 
-        return foundSearching
+            if r != "AXNavigation" {
+                queue.append(contentsOf: children(el, attribute: kAXChildrenAttribute))
+            }
+        }
+
+        return false
     }
 
     static func isValidAssistantResponse(_ text: String, prompt: String) -> Bool {
@@ -675,6 +808,15 @@ enum AX {
             return false
         }
 
+        // 排除营销/推广浮层与底部推荐卡片文案（如 ChatGPT Work / Canvas 宣传语）
+        let marketingBanners = [
+            "精美的文档", "演示文稿", "电子表格", "chatgpt work", "在 chatgpt work 中",
+            "打造成精美的文档", "将你的工作内容打造成"
+        ]
+        if marketingBanners.contains(where: { lower.contains($0) }) {
+            return false
+        }
+
         // 排除单纯的提示词回显
         if normalized(trimmed) == normalized(prompt) {
             return false
@@ -689,23 +831,49 @@ enum AX {
         pid: pid_t,
         configuration: ChromeDiscussionSessionConfiguration
     ) {
+        // 核心防护：必须且仅在 AXWebArea 网页内容区域内部查找，严禁触碰外部浏览器窗口或标签页按钮！
+        guard let webArea = findWebArea(in: root) else { return }
+
         let dismissHints = [
             "关闭", "知道了", "稍后", "以后再说", "跳过", "close", "dismiss",
-            "not now", "got it", "取消", "继续"
+            "not now", "got it", "取消", "skip", "stay logged out", "保持退出状态"
         ]
 
-        let buttons = collect(in: root, configuration: configuration) { element in
-            guard (string(element, kAXRoleAttribute) ?? "") == "AXButton" else { return false }
-            let text = searchableText(element)
-            return dismissHints.contains { text == $0 || text.contains($0) }
+        var queue = [webArea]
+        var visited = 0
+        var buttons: [AXUIElement] = []
+
+        while !queue.isEmpty && visited < 400 {
+            visited += 1
+            let el = queue.removeFirst()
+            let r = string(el, kAXRoleAttribute) ?? ""
+
+            if r == "AXButton" {
+                let text = searchableText(el)
+                if !text.isEmpty &&
+                    !text.contains("侧边栏") &&
+                    !text.contains("sidebar") &&
+                    !text.contains("标签页") &&
+                    !text.contains("tab") &&
+                    !text.contains("全屏") {
+                    let matched = dismissHints.contains { h in
+                        text == h || (text.contains(h) && text.count <= 8)
+                    }
+                    if matched {
+                        buttons.append(el)
+                    }
+                }
+            }
+
+            if r != "AXNavigation" {
+                queue.append(contentsOf: children(el, attribute: kAXChildrenAttribute))
+            }
         }
 
-        for button in buttons.prefix(3) {
+        for button in buttons.prefix(2) {
             _ = pressOrClick(button)
             Thread.sleep(forTimeInterval: 0.1)
         }
-
-        postEscape(to: pid)
     }
 
     static func ensureHighReasoningEffort(
@@ -746,8 +914,6 @@ enum AX {
             }
             if let target = highOptions.first {
                 _ = pressOrClick(target)
-            } else {
-                postEscape(to: pid)
             }
         }
     }
@@ -834,11 +1000,25 @@ enum AX {
                 || lower.contains("message")
             if isDisclaimerOrInput { continue }
 
-            if lower.contains("chatgpt 说") || lower.contains("chatgpt said") {
+            // 严格排除营销卡片/功能推广的标题（例如“在 ChatGPT Work 中进一步推进”、“ChatGPT Plus”等）
+            let isMarketing = lower.contains("work")
+                || lower.contains("plus")
+                || lower.contains("team")
+                || lower.contains("推进")
+                || lower.contains("精美")
+                || lower.contains("打造成")
+                || lower.contains("新功能")
+                || lower.contains("what's new")
+                || lower.contains("canvas")
+                || lower.contains("探索")
+            if isMarketing { continue }
+
+            // 真实的 ChatGPT 回复头
+            if lower.starts(with: "chatgpt 说") || lower.starts(with: "chatgpt said") {
                 startIdx = i
                 break
             }
-            if el.role == "AXHeading" && (lower == "chatgpt" || lower.contains("chatgpt")) {
+            if el.role == "AXHeading" && (lower == "chatgpt" || lower == "chatgpt:" || lower == "chatgpt：") {
                 startIdx = i
                 break
             }
@@ -862,17 +1042,28 @@ enum AX {
         var parts: [String] = []
         for el in elements[(validStart + 1)...] {
             let lower = el.text.lowercased()
-            // 遇到页面底部免责声明或输入框立即截断，防止混入外部提示
+            // 遇到页面底部免责声明、输入框、或底部营销推荐卡片时立即截断，防止混入外部提示
             if lower.contains("可能会犯错")
                 || lower.contains("核查重要信息")
                 || lower.contains("can make mistakes")
                 || lower.contains("问问 chatgpt")
                 || lower.contains("message chatgpt")
-                || lower.contains("给 chatgpt 发送消息") {
+                || lower.contains("给 chatgpt 发送消息")
+                || lower.contains("chatgpt work")
+                || lower.contains("在 chatgpt work")
+                || lower.contains("打造成精美的文档") {
+                break
+            }
+            // 遇到下一个“你说：”或“ChatGPT 说：”等对话块头部时截断
+            if el.role == "AXHeading" && (lower.starts(with: "你说") || lower.starts(with: "you said") || lower.starts(with: "chatgpt")) {
                 break
             }
             // 排除与 Header 完全重复的文本
             if el.text == elements[validStart].text { continue }
+            // 排除营销文本自身
+            if lower.contains("精美的文档") || lower.contains("打造成精美的文档") {
+                continue
+            }
             // 排除按钮文本
             if el.text == "复制" || el.text == "copy" || el.text == "分享" || el.text == "share" {
                 continue
@@ -1118,11 +1309,13 @@ enum AX {
         return nil
     }
 
-    static func allButtonsText(in root: AXUIElement) -> [String] {
+    static func allButtonsText(in root: AXUIElement, budget: Int = 400) -> [String] {
         var result: [String] = []
         var queue = [root]
-        while !queue.isEmpty {
+        var remaining = budget
+        while !queue.isEmpty && remaining > 0 {
             let el = queue.removeFirst()
+            remaining -= 1
             var rRef: CFTypeRef?
             if AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &rRef) == .success,
                let r = rRef as? String, r == "AXButton" {

@@ -17,6 +17,9 @@ struct DiscussionConfigView: View {
     @State private var editingParticipant: DiscussionParticipant?
     @State private var showingRolePicker = false
     @State private var errorMessage: String?
+    @State private var isPreloadingWindows = false
+    @State private var preloadedCount = 0
+    @State private var preloadStatusMessage: String?
 
     @Environment(\.dismiss) private var dismiss
 
@@ -152,6 +155,16 @@ struct DiscussionConfigView: View {
                     Button("编辑") { editingParticipant = participant }
                         .controlSize(.small)
 
+                    if !participant.profileDirectory.isEmpty {
+                        Button {
+                            openLogin(for: participant)
+                        } label: {
+                            Image(systemName: "arrow.up.right.square")
+                        }
+                        .buttonStyle(.plain)
+                        .help("以 \(participant.profileDirectory) 打开 ChatGPT 登录页面")
+                    }
+
                     Button {
                         draft.participants.removeAll { $0.id == participant.id }
                         if draft.moderatorParticipantID == participant.id {
@@ -204,7 +217,34 @@ struct DiscussionConfigView: View {
                 .controlSize(.small)
                 .help("随机打乱可用 Chrome Profile 池并重新分配，避开固定批次或失效账号")
 
+                Button {
+                    preloadAllWindows()
+                } label: {
+                    if isPreloadingWindows {
+                        HStack(spacing: 4) {
+                            ProgressView().controlSize(.small)
+                            Text("正在提前就绪 (\(preloadedCount)/\(draft.enabledParticipants.count))...")
+                        }
+                    } else {
+                        Label("提前打开全部窗口", systemImage: "macwindow.on.rectangle")
+                    }
+                }
+                .controlSize(.small)
+                .disabled(isPreloadingWindows || draft.enabledParticipants.isEmpty)
+                .help("集中提前打开所有已配置成员的 Chrome 窗口并静默后置，讨论时绝不反复弹窗")
+
                 Spacer()
+            }
+
+            if let msg = preloadStatusMessage {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text(msg)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 2)
             }
         } header: {
             Text("成员 (\(draft.participants.count))")
@@ -435,6 +475,50 @@ struct DiscussionConfigView: View {
                     )
                     used.insert(free.directoryName)
                 }
+            }
+        }
+    }
+
+    private func openLogin(for participant: DiscussionParticipant) {
+        let scanner = ChromeProfileScanner()
+        let profile = ChromeProfile(directoryName: participant.profileDirectory, displayName: "")
+        scanner.open(url: URL(string: "https://chatgpt.com/auth/login")!, profile: profile, kind: .chrome, newWindow: true)
+        if let app = NSRunningApplication.runningApplications(
+            withBundleIdentifier: ChromeProfileScanner.ChromeKind.chrome.rawValue
+        ).first(where: { !$0.isTerminated }) {
+            app.activate()
+        }
+    }
+
+    private func preloadAllWindows() {
+        applyDefaultAccountIdentities()
+        let targets = draft.enabledParticipants.filter {
+            !$0.profileDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard !targets.isEmpty else { return }
+
+        isPreloadingWindows = true
+        preloadedCount = 0
+        preloadStatusMessage = nil
+
+        Task {
+            for (idx, p) in targets.enumerated() {
+                do {
+                    _ = try await services.discussionSessions.session(for: p)
+                    await MainActor.run {
+                        preloadedCount = idx + 1
+                    }
+                } catch {
+                    await MainActor.run {
+                        isPreloadingWindows = false
+                        errorMessage = "预热「\(p.displayName)」窗口失败：\(AppError.normalize(error).userMessage)"
+                    }
+                    return
+                }
+            }
+            await MainActor.run {
+                isPreloadingWindows = false
+                preloadStatusMessage = "全部 \(targets.count) 个成员窗口已提前就绪并隐形待命，讨论时绝不弹窗"
             }
         }
     }

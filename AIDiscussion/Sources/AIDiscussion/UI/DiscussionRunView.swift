@@ -73,7 +73,12 @@ struct DiscussionRunView: View {
             get: { errorMessage != nil },
             set: { if !$0 { errorMessage = nil } }
         )) {
-            if let msg = errorMessage, msg.contains("辅助功能") || msg.contains("Accessibility") {
+            if let issue = orchestrator.currentOrInferredLoginIssue {
+                Button("一键跳转登录 (\(issue.participantName))") {
+                    orchestrator.openLoginWindow(for: issue)
+                    errorMessage = nil
+                }
+            } else if let msg = errorMessage, msg.contains("辅助功能") || msg.contains("Accessibility") {
                 Button("打开系统设置") {
                     if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
                         NSWorkspace.shared.open(url)
@@ -219,6 +224,45 @@ struct DiscussionRunView: View {
                 }
             }
 
+            // 登录异常提示卡与一键跳转
+            if let issue = orchestrator.currentOrInferredLoginIssue {
+                HStack(spacing: 8) {
+                    Image(systemName: "person.crop.circle.badge.exclamationmark")
+                        .foregroundStyle(.red)
+                    Text("成员「\(issue.participantName)」\(issue.profileDirectory.isEmpty ? "" : "(Profile: \(issue.profileDirectory))") 处于未登录状态")
+                        .font(.caption.bold())
+                        .foregroundStyle(.red)
+                    Spacer()
+                    Button {
+                        orchestrator.openLoginWindow(for: issue)
+                    } label: {
+                        Label("一键跳转登录", systemImage: "arrow.up.right.square.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.red.opacity(0.12))
+                .cornerRadius(6)
+            }
+
+            // 预热阶段提示卡
+            if let preload = orchestrator.preloadProgress {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在提前加载并就绪「\(preload.participantName)」窗口 (\(preload.current)/\(preload.total))... 就绪后自动隐形，后续全静默无需弹窗")
+                        .font(.caption.bold())
+                        .foregroundStyle(.blue)
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.blue.opacity(0.12))
+                .cornerRadius(6)
+            }
+
             // 实时活动或续跑提示
             if let detail = progressDetailMessage {
                 HStack(spacing: 6) {
@@ -289,6 +333,9 @@ struct DiscussionRunView: View {
     }
 
     private var progressStatusTitle: String {
+        if orchestrator.preloadProgress != nil {
+            return "成员窗口预热就绪中"
+        }
         if orchestrator.run.state == .converged {
             return "讨论已达成决议（共 \(group.rounds.count) 轮已收敛）"
         }
@@ -310,6 +357,9 @@ struct DiscussionRunView: View {
     }
 
     private var progressDetailMessage: String? {
+        if let preload = orchestrator.preloadProgress {
+            return "正在提前打开并隐藏「\(preload.participantName)」的窗口 (\(preload.current)/\(preload.total))，后续讨论全静默运行..."
+        }
         if let thinkingID = orchestrator.thinkingParticipantID,
            let participant = group.participants.first(where: { $0.id == thinkingID }) {
             return "正在等待「\(participant.displayName)」发言（思考强度：高，Chrome 静默执行中）..."
@@ -437,6 +487,16 @@ struct DiscussionRunView: View {
                     .foregroundStyle(.red)
                     .lineLimit(1)
                     .help(message)
+            }
+
+            if let issue = orchestrator.currentOrInferredLoginIssue {
+                Button {
+                    orchestrator.openLoginWindow(for: issue)
+                } label: {
+                    Label("一键跳转登录", systemImage: "arrow.up.right.square")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
 
             if orchestrator.isRunning {
