@@ -49,6 +49,10 @@ final class AppState: ObservableObject {
             // SwiftUI 场景恢复时的兜底。didHandleRequestedTask 保证只启动一次。
             startRequestedTaskIfNeeded()
 
+            // 启动 Codex 主动请求通道：Codex 可以自行查询额度、上报额度耗尽、
+            // 请求续跑或切换账号。请求落地后复用同一条经过验证的安全链路。
+            Task { await services.mcpRouter.start() }
+
             // 恢复 Codex 账号交接监视器: 仍处于 waitingForAccount 且有绑定的任务重新纳入监视。
             // 该行为由设置里的全局开关控制；关闭后仍可在任务详情里手动 Resume。
             if services.settings.autoResumeAfterManualAuthentication {

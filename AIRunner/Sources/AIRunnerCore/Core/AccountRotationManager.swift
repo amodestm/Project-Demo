@@ -75,6 +75,10 @@ public actor AccountRotationManager {
     private let codexAccountVault: CodexAccountVaulting
     /// 使用独立 Chrome Profile 完成 Codex 官方浏览器 OAuth。
     private let codexBrowserOAuth: CodexBrowserOAuthAuthenticating
+    /// 实时额度探测。额度接口只能查询当前登录账号, 因此只在切换前后各采一次。
+    private let quotaProbe: any CodexQuotaProbing
+    /// 额度快照落库。nil 时只是不记录, 不影响轮换本身。
+    private let quotaSnapshots: CodexQuotaSnapshotRepository?
     /// 设置页连续测试时使用的进程内指针。
     private var settingsTestCurrentProfileDirectory: String?
     /// 测试指针需要跨 AIRunner 重启保存，否则每次都会重新选中 Default。
@@ -94,6 +98,8 @@ public actor AccountRotationManager {
         codexLogin: CodexLoginAutomating = CodexLoginAutomator(),
         codexAccountVault: CodexAccountVaulting = InMemoryCodexAccountVault(),
         codexBrowserOAuth: CodexBrowserOAuthAuthenticating = FakeCodexBrowserOAuthAuthenticator(),
+        quotaProbe: any CodexQuotaProbing = CodexQuotaProbe(),
+        quotaSnapshots: CodexQuotaSnapshotRepository? = nil,
         settleDelay: Duration = .seconds(2),
         loadSettingsTestProfileDirectory: @escaping @Sendable () -> String? = {
             UserDefaults.standard.string(
@@ -118,6 +124,8 @@ public actor AccountRotationManager {
         self.codexLogin = codexLogin
         self.codexAccountVault = codexAccountVault
         self.codexBrowserOAuth = codexBrowserOAuth
+        self.quotaProbe = quotaProbe
+        self.quotaSnapshots = quotaSnapshots
         self.settleDelay = settleDelay
         self.loadSettingsTestProfileDirectory = loadSettingsTestProfileDirectory
         self.saveSettingsTestProfileDirectory = saveSettingsTestProfileDirectory
@@ -313,6 +321,58 @@ public actor AccountRotationManager {
         oauthCandidates(startingWith: first, in: pool).first {
             !activeAccountKeys.contains("profile:\($0.directoryName)")
         }
+    }
+
+    /// 结合额度快照给候选排序。
+    ///
+    /// 优先级（越靠前越先被尝试）：
+    /// 1. 不处于冷却、且快照显示额度**尚未耗尽**的账号 —— 按已用额度从少到多；
+    /// 2. 快照显示额度已耗尽、但恢复时间最早会到来的账号 —— 按恢复时间从早到晚；
+    /// 3. 还没有任何快照、情况未知的账号。
+    ///
+    /// 同档内保持原有环形顺序，因此用户配置的顺序仍然是稳定的兜底次序，
+    /// 不会因为某次查询失败就被打乱。
+    public static func quotaAwareCandidates(
+        startingWith first: ChromeProfile?,
+        in pool: [ChromeProfile],
+        standings: [String: CodexQuotaStanding],
+        activeAccountKeys: Set<String> = [],
+        at date: Date = Date()
+    ) -> [ChromeProfile] {
+        oauthCandidates(startingWith: first, in: pool)
+            .enumerated()
+            .sorted { lhs, rhs in
+                let left = quotaOrderKey(
+                    lhs.element, standings: standings,
+                    activeAccountKeys: activeAccountKeys, at: date
+                )
+                let right = quotaOrderKey(
+                    rhs.element, standings: standings,
+                    activeAccountKeys: activeAccountKeys, at: date
+                )
+                if left != right { return left < right }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
+    }
+
+    /// 排序键: (是否冷却中, 额度档位, 档内次序)。
+    private static func quotaOrderKey(
+        _ profile: ChromeProfile,
+        standings: [String: CodexQuotaStanding],
+        activeAccountKeys: Set<String>,
+        at date: Date
+    ) -> (Int, Int, Double) {
+        let blocked = activeAccountKeys.contains("profile:\(profile.directoryName)") ? 1 : 0
+        guard let standing = standings[profile.directoryName] else {
+            return (blocked, 2, 0)
+        }
+        if standing.isBlocked(at: date) {
+            let resetAt = standing.primaryResetAt.map { Double($0) }
+                ?? Double.greatestFiniteMagnitude
+            return (blocked, 1, resetAt)
+        }
+        return (blocked, 0, standing.primaryUsedPercent ?? 0)
     }
 
     /// 列出所有浏览器里的 profile (设置页展示用)。
@@ -670,6 +730,9 @@ public actor AccountRotationManager {
         )
 
         try await codexBrowserOAuth.reauthenticate(using: profile)
+        await captureQuotaSnapshot(
+            profileDirectory: profile.directoryName, source: "manual-switch"
+        )
 
         logger.info(
             .accountRotationCompleted,
@@ -728,6 +791,55 @@ public actor AccountRotationManager {
         return profile.displayName.isEmpty ? profile.directoryName : profile.displayName
     }
 
+    // MARK: - 额度快照
+
+    /// 采集当前 Codex 登录账号的实时额度并落库。
+    ///
+    /// 额度接口只能查询**当前登录**账号，因此调用时机很关键：账号切换成功后立即
+    /// 采集，就能在每个账号被使用的那段时间里把数据记录下来。查询失败绝不影响
+    /// 轮换主流程 —— 额度信息是优化项，不是安全门。
+    private func captureQuotaSnapshot(profileDirectory: String, source: String) async {
+        guard let quotaSnapshots else { return }
+        do {
+            let usage = try await quotaProbe.probe()
+            try quotaSnapshots.record(
+                usage.snapshot(profileDirectory: profileDirectory, source: source)
+            )
+            try? quotaSnapshots.prune()
+
+            var detail = "5 小时窗口已用 "
+                + (usage.primaryUsedPercent.map { String(format: "%.0f%%", $0) } ?? "未知")
+            if let resetAt = usage.primaryResetAt {
+                detail += "，恢复于 \(MCPRequestRouter.localText(resetAt))"
+            }
+            logger.info(
+                .quotaSnapshotCaptured,
+                "已采集账号额度快照 [\(source)] \(profileDirectory)：\(detail)",
+                metadata: .object([
+                    "profile": .string(profileDirectory),
+                    "source": .string(source),
+                    "limitReached": .bool(usage.limitReached ?? false),
+                ])
+            )
+        } catch {
+            logger.warning(
+                .quotaSnapshotFailed,
+                "账号额度快照采集失败 [\(source)] \(profileDirectory)："
+                + AppError.normalize(error).userMessage,
+                metadata: .object([
+                    "profile": .string(profileDirectory),
+                    "source": .string(source),
+                ])
+            )
+        }
+    }
+
+    /// 所有账号最近的额度档位；读取失败时返回空表（等价于「情况未知」）。
+    private func quotaStandings() -> [String: CodexQuotaStanding] {
+        guard let quotaSnapshots else { return [:] }
+        return (try? quotaSnapshots.quotaStanding()) ?? [:]
+    }
+
     /// 选择下一个独立 Chrome Profile，再用 Codex 官方浏览器 OAuth 重新认证。
     /// 只有 OAuth 命令退出 0 且登录状态确认成功后才推进轮换指针。
     private func rotateCodexViaBrowserOAuth(
@@ -756,15 +868,30 @@ public actor AccountRotationManager {
         // 不在退出前额外打开普通 ChatGPT 标签页。那会制造一个无法确认归属的
         // Chrome 窗口，并可能让系统把 OAuth 链接送到错误的 Profile。真正的目标
         // 窗口由 CodexNativeLoginStarter 在“继续登录”之前创建、标记并聚焦。
+        // 离开当前账号前先把它此刻的额度记下来：额度接口只能查询当前登录账号，
+        // 这是最后一次能读到它的机会。
+        if let current {
+            await captureQuotaSnapshot(profileDirectory: current, source: "rotation-before")
+        }
+
         var lastProfileError: CodexBrowserOAuthError?
-        let candidates = Self.oauthCandidates(startingWith: next, in: pool)
-            .filter { candidate in
-                guard let current else { return true }
-                return candidate.directoryName != current
-            }
+        let candidates = Self.quotaAwareCandidates(
+            startingWith: next,
+            in: pool,
+            standings: quotaStandings(),
+            activeAccountKeys: (try? repository.activeQuotaAccountKeys(at: now())) ?? [],
+            at: now()
+        )
+        .filter { candidate in
+            guard let current else { return true }
+            return candidate.directoryName != current
+        }
         for candidate in candidates {
             do {
                 try await codexBrowserOAuth.reauthenticate(using: candidate)
+                await captureQuotaSnapshot(
+                    profileDirectory: candidate.directoryName, source: "rotation-after"
+                )
 
                 try repository.update(taskID: taskID, currentProfile: candidate.directoryName)
                 try repository.recordChatGPTAccount(

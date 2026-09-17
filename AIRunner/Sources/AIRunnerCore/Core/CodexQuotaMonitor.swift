@@ -425,6 +425,97 @@ public actor CodexQuotaMonitor {
         )
     }
 
+    /// Codex 通过 MCP 主动上报额度耗尽后触发的轮换。
+    ///
+    /// 与 GUI 屏幕识别共用**完全相同**的安全门控：辅助功能权限 → Codex 可用性 →
+    /// 是否仍在生成 → 保存检查点并置为等待账号 → 切号 → 启动恢复监视器。
+    /// 区别只在于信号来源：这条由模型自己读到的限额提示触发，比文本识别更准确，
+    /// 也不会因为页面重绘而抖动。
+    ///
+    /// 推理中途退出账号会中断本地聊天与计划任务，因此忙碌检查失败时一律拒绝。
+    public func handleReportedQuotaExhaustion(
+        taskID: String,
+        source: String,
+        detail: String?
+    ) async throws -> CodexQuotaMonitorOutcome {
+        guard let task = try tasks.fetch(id: taskID), !task.status.isTerminal else {
+            throw AppError.invalidRequest("任务不存在或已经结束，无法切换账号。")
+        }
+
+        // 上一次轮换可能已经保存检查点、却在退出账号前被中断。此时任务本就
+        // 应该保持 waitingForAccount，应当直接从轮换继续，而不是要求重建任务。
+        if task.status == .waitingForAccount {
+            guard try bindings.fetchByTask(taskID: taskID) != nil else {
+                throw AppError.invalidRequest("请先给该任务绑定一个 Codex 线程")
+            }
+            logger.warning(
+                .accountHandoffRequested,
+                "Codex 通过 MCP(\(source)) 上报额度耗尽；检查点已保存，重新执行账号轮换",
+                taskID: taskID,
+                metadata: .object([
+                    "issue": .string(CodexAccountIssue.quotaExhausted.eventName),
+                    "automatic": .bool(true),
+                    "source": .string(source),
+                ])
+            )
+            return await performRotation(
+                taskID: taskID, issue: .quotaExhausted, simulated: false
+            )
+        }
+
+        guard [.running, .waiting, .waitingForUser, .waitingForBrowser, .queued]
+            .contains(task.status) else {
+            throw AppError.invalidRequest(
+                "任务当前为「\(task.status.displayName)」，不能执行账号切换。"
+            )
+        }
+        guard let binding = try bindings.fetchByTask(taskID: taskID) else {
+            throw AppError.invalidRequest("任务还没有绑定 Codex 线程，无法确定要恢复哪个对话。")
+        }
+        guard (await driver.checkAccessibilityPermission()).isUsable else {
+            throw CodexAutomationError.accessibilityPermissionMissing
+        }
+        let probe = await driver.probeAvailability(
+            bundleIdentifier: binding.applicationBundleIdentifier
+        )
+        guard probe.isUsable else {
+            throw AppError.invalidRequest("Codex 当前不可用：\(probe.summary)")
+        }
+        let app = try await driver.locateApplication(
+            bundleIdentifier: binding.applicationBundleIdentifier
+        )
+        let busy = try await driver.detectBusyState(app)
+        switch busy {
+        case .generating:
+            throw AppError.invalidRequest(
+                "Codex 仍在生成中，已拒绝退出账号；请等本轮生成停止后再切换。"
+            )
+        case .idle:
+            break
+        case .unknown:
+            guard try await driver.detectTaskStopped(app) else {
+                throw AppError.invalidRequest(
+                    "无法确认 Codex 已停止生成，已拒绝退出账号。"
+                )
+            }
+        }
+
+        logger.warning(
+            .accountHandoffDetected,
+            "Codex 通过 MCP(\(source)) 上报额度耗尽，忙碌检查已通过；准备切换账号",
+            taskID: taskID,
+            metadata: .object([
+                "issue": .string(CodexAccountIssue.quotaExhausted.eventName),
+                "automatic": .bool(true),
+                "source": .string(source),
+                "detail": .string(detail ?? ""),
+            ])
+        )
+        return await transitionAndRotate(
+            taskID: taskID, issue: .quotaExhausted, simulated: false
+        )
+    }
+
     private func transitionAndRotate(
         taskID: String,
         issue: CodexAccountIssue,

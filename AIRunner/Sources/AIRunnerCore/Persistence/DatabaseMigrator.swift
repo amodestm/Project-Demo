@@ -10,7 +10,7 @@ public enum DatabaseMigrator {
     ///
     /// ★ 每个 migration 只允许把自己推进到**自己的**版本号 ★
     /// 详见 `migrateToV1` 的注释。
-    public static let currentVersion = 10
+    public static let currentVersion = 11
 
     public static func migrate(_ db: Database) throws {
         let existing = try db.scalarInt("PRAGMA user_version;") ?? 0
@@ -60,6 +60,10 @@ public enum DatabaseMigrator {
 
         if existing < 10 {
             try migrateToV10(db)
+        }
+
+        if existing < 11 {
+            try migrateToV11(db)
         }
     }
 
@@ -556,6 +560,65 @@ public enum DatabaseMigrator {
             try db.execute("PRAGMA user_version = 10;")
         }
     }
+
+    // MARK: - V11: 账号额度快照
+
+    /// 每次账号切换前后采集一次的额度快照。
+    ///
+    /// 背景：额度接口只能查询**当前登录**的账号，因此每个账号的数据只能在它
+    /// 被使用的那段时间里采集。把采集结果按 (profile, 采集时刻) 存下来之后，
+    /// 后续选号就可以按「额度是否耗尽 / 恢复时间先后」排序，而不是盲目环形轮换。
+    ///
+    /// 存的全是额度计量值（百分比、时间戳、plan 名称），**不含任何凭据**。
+    private static func migrateToV11(_ db: Database) throws {
+        try db.transaction {
+            for statement in v11Statements {
+                try db.execute(statement)
+            }
+            try db.execute("PRAGMA user_version = 11;")
+        }
+    }
+
+    private static let v11Statements: [String] = [
+        """
+        CREATE TABLE IF NOT EXISTS codex_account_quota_snapshots (
+            profile_directory        TEXT NOT NULL,
+            captured_at              TEXT NOT NULL,
+            source                   TEXT NOT NULL,
+
+            email                    TEXT,
+            account_id               TEXT,
+            plan_type                TEXT,
+            allowed                  INTEGER,
+            limit_reached            INTEGER,
+            rate_limit_reached_type  TEXT,
+
+            primary_used_percent     REAL,
+            primary_window_seconds   INTEGER,
+            primary_reset_at         INTEGER,
+
+            secondary_used_percent   REAL,
+            secondary_window_seconds INTEGER,
+            secondary_reset_at       INTEGER,
+
+            model_available_at       INTEGER,
+            credits_balance          TEXT,
+            reset_credits_available  INTEGER,
+
+            raw_json                 TEXT,
+
+            PRIMARY KEY (profile_directory, captured_at)
+        );
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_quota_snapshot_profile
+            ON codex_account_quota_snapshots(profile_directory, captured_at DESC);
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_quota_snapshot_reset
+            ON codex_account_quota_snapshots(primary_reset_at);
+        """,
+    ]
 
     /// 判断某列是否已存在 (用于让 ADD COLUMN 可重入)。
     static func columnExists(_ db: Database, table: String, column: String) throws -> Bool {

@@ -117,6 +117,15 @@ public enum EventType: String, Codable, Sendable, CaseIterable {
     case accountRotationFailed            = "ACCOUNT_ROTATION_FAILED"
     case accountRotationWindowFocusFailed = "ACCOUNT_ROTATION_WINDOW_FOCUS_FAILED"
 
+    // 额度快照（实时查询官方用量接口）
+    case quotaSnapshotCaptured   = "QUOTA_SNAPSHOT_CAPTURED"
+    case quotaSnapshotFailed     = "QUOTA_SNAPSHOT_FAILED"
+
+    // Codex 经 MCP 主动上报 / 请求
+    case mcpRequestReceived      = "MCP_REQUEST_RECEIVED"
+    case mcpRequestCompleted     = "MCP_REQUEST_COMPLETED"
+    case mcpRequestFailed        = "MCP_REQUEST_FAILED"
+
     // 配置与安全
     case configChanged    = "CONFIG_CHANGED"
     case keychainUpdated  = "KEYCHAIN_UPDATED"

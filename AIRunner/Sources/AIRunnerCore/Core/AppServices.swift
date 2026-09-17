@@ -62,6 +62,14 @@ public final class AppServices: @unchecked Sendable {
     public let codexLogin: CodexLoginAutomating
     public let codexBrowserOAuth: CodexBrowserOAuthAuthenticating
 
+    // 账号额度快照与 Codex 主动请求通道
+    /// 实时额度探测（官方用量接口, 只能查询当前登录账号）。
+    public let quotaProbe: any CodexQuotaProbing
+    /// 每次切换前后采集到的额度快照。
+    public let quotaSnapshots: CodexQuotaSnapshotRepository
+    /// Codex 通过 MCP 请求驱动的控制通道（查额度 / 续跑 / 切号）。
+    public let mcpRouter: MCPRequestRouter
+
     // 设置
     private let settingsStore: SettingsStore
     /// 线程安全的当前设置快照。WebExecutionCoordinator 通过它读取最新的 ChatGPT 地址。
@@ -175,6 +183,8 @@ public final class AppServices: @unchecked Sendable {
             )
         let resolvedCodexBrowserOAuth = codexBrowserOAuth
             ?? CodexBrowserOAuthAuthenticator(profiles: chromeProfiles)
+        let quotaSnapshotRepo = CodexQuotaSnapshotRepository(db: database)
+        let resolvedQuotaProbe = CodexQuotaProbe()
         let accountRotation = AccountRotationManager(
             profiles: chromeProfiles,
             windows: BrowserWindowLocator(),
@@ -185,6 +195,8 @@ public final class AppServices: @unchecked Sendable {
             codexLogin: resolvedCodexLogin,
             codexAccountVault: resolvedCodexVault,
             codexBrowserOAuth: resolvedCodexBrowserOAuth,
+            quotaProbe: resolvedQuotaProbe,
+            quotaSnapshots: quotaSnapshotRepo,
             settleDelay: .seconds(2)
         )
 
@@ -214,6 +226,19 @@ public final class AppServices: @unchecked Sendable {
         let codexOAuthSafetyTester = CodexOAuthSafetyTester(
             driver: driver,
             accountTesting: accountRotation
+        )
+
+        // Codex 经 MCP 发起的请求: 读取 inbox 目录, 并复用额度监视器那条
+        // 已经过验证的安全链路 (忙碌检查 → 检查点 → 切号 → 自动恢复)。
+        let mcpRequestRouter = MCPRequestRouter(
+            tasks: tasks,
+            bindings: codexBindingRepo,
+            rotationRepo: accountRotationRepo,
+            quotaSnapshots: quotaSnapshotRepo,
+            probe: resolvedQuotaProbe,
+            resumeController: codexController,
+            quotaMonitor: codexQuotaMonitor,
+            logger: logger
         )
 
         let runner = JobRunner(
@@ -272,6 +297,9 @@ public final class AppServices: @unchecked Sendable {
         self.codexAccountVault = resolvedCodexVault
         self.codexLogin = resolvedCodexLogin
         self.codexBrowserOAuth = resolvedCodexBrowserOAuth
+        self.quotaProbe = resolvedQuotaProbe
+        self.quotaSnapshots = quotaSnapshotRepo
+        self.mcpRouter = mcpRequestRouter
         self.discussionRepo = DiscussionRepository(db: database)
         self.discussionSessions = ChromeDiscussionSessionProvider(
             configuration: {
