@@ -128,8 +128,8 @@ public protocol ChatGPTAccountSwitching: Sendable {
 ///
 /// ## ★ 不接触任何凭据 ★
 ///
-/// 账号登录态在浏览器 session 里。这里只"点击菜单条目" ——
-/// 与你用鼠标点完全等价。不读 Cookie、不读密码、不发网络请求。
+/// 账号登录态在浏览器 Profile 里。这里只"点击菜单条目" ——
+/// 与你用鼠标点完全等价。
 public struct ChatGPTAccountSwitcher: ChatGPTAccountSwitching {
 
     private let configuration: ChatGPTAccountSwitcherConfiguration

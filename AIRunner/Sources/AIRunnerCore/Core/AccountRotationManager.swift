@@ -31,6 +31,14 @@ public struct AccountRotationOutcome: Sendable, Equatable {
 /// Codex 额度/登录异常监视器需要的最小轮换接口，便于无 UI 单测注入替身。
 public protocol CodexAccountRotating: Sendable {
     func rotateChatGPTAccount(taskID: String) async throws -> ChatGPTAccountSwitchOutcome
+    /// 记录当前账号额度耗尽后，跳过冷却中的账号并切换到下一个可用账号。
+    func rotateChatGPTAccountAfterQuotaExhaustion(taskID: String) async throws -> ChatGPTAccountSwitchOutcome
+}
+
+public extension CodexAccountRotating {
+    func rotateChatGPTAccountAfterQuotaExhaustion(taskID: String) async throws -> ChatGPTAccountSwitchOutcome {
+        try await rotateChatGPTAccount(taskID: taskID)
+    }
 }
 
 /// 设置页的一键 OAuth 测试只验证账号退出和重新登录，不依赖 AIRunner 任务。
@@ -72,6 +80,9 @@ public actor AccountRotationManager {
     /// 测试指针需要跨 AIRunner 重启保存，否则每次都会重新选中 Default。
     private let loadSettingsTestProfileDirectory: @Sendable () -> String?
     private let saveSettingsTestProfileDirectory: @Sendable (String) -> Void
+    private let now: @Sendable () -> Date
+    private let quotaWindow: TimeInterval
+    private let quotaRecoveryBuffer: TimeInterval
 
     public init(
         profiles: ChromeProfileScanner = ChromeProfileScanner(),
@@ -93,7 +104,10 @@ public actor AccountRotationManager {
             UserDefaults.standard.set(
                 directory, forKey: "AIRunnerOAuthSettingsTestLastProfileDirectory"
             )
-        }
+        },
+        now: @escaping @Sendable () -> Date = { Date() },
+        quotaWindow: TimeInterval = 5 * 60 * 60,
+        quotaRecoveryBuffer: TimeInterval = 2 * 60
     ) {
         self.profiles = profiles
         self.windows = windows
@@ -107,6 +121,9 @@ public actor AccountRotationManager {
         self.settleDelay = settleDelay
         self.loadSettingsTestProfileDirectory = loadSettingsTestProfileDirectory
         self.saveSettingsTestProfileDirectory = saveSettingsTestProfileDirectory
+        self.now = now
+        self.quotaWindow = quotaWindow
+        self.quotaRecoveryBuffer = quotaRecoveryBuffer
     }
 
     // MARK: - 查询
@@ -284,6 +301,20 @@ public actor AccountRotationManager {
         }
     }
 
+    /// 从轮换顺序中选出第一个没有处于额度冷却的 Profile。
+    ///
+    /// `activeAccountKeys` 使用 repository 的稳定键 (`profile:<目录名>`)，
+    /// 这样“额度耗尽的账号暂不轮换”规则可以脱离浏览器和时间进行单测。
+    public static func nextQuotaEligibleProfile(
+        startingWith first: ChromeProfile?,
+        in pool: [ChromeProfile],
+        activeAccountKeys: Set<String>
+    ) -> ChromeProfile? {
+        oauthCandidates(startingWith: first, in: pool).first {
+            !activeAccountKeys.contains("profile:\($0.directoryName)")
+        }
+    }
+
     /// 列出所有浏览器里的 profile (设置页展示用)。
     public func availableProfiles() -> [(browser: ChromeProfileScanner.ChromeKind, profiles: [ChromeProfile])] {
         profiles.availableProfilesAcrossBrowsers()
@@ -452,6 +483,87 @@ public actor AccountRotationManager {
 
         // ★ 头像菜单兜底 (旧): 未配置凭据 → 用网页右上角头像菜单切换 ★
         return try await rotateViaAvatarMenu(taskID: taskID)
+    }
+
+    /// 额度专用轮换：当前账号记入五小时冷却（额外两分钟网络缓冲），
+    /// 后续只选择冷却已结束的账号；全部冷却时抛出可持久化的等待时间。
+    public func rotateChatGPTAccountAfterQuotaExhaustion(taskID: String) async throws -> ChatGPTAccountSwitchOutcome {
+        let currentKey = quotaAccountKey(taskID: taskID)
+        if let currentKey {
+            let at = now()
+            if (try? repository.activeQuotaCooldown(accountKey: currentKey, at: at)) == nil {
+                let availableAt = at.addingTimeInterval(quotaWindow + quotaRecoveryBuffer)
+                try repository.recordQuotaExhaustion(
+                    accountKey: currentKey,
+                    exhaustedAt: at,
+                    availableAt: availableAt
+                )
+                logger.info(
+                    .accountHandoffDetected,
+                    "记录账号额度耗尽时间 (DateCoding.string(from: at))；预计恢复 (DateCoding.string(from: availableAt))（含两分钟网络缓冲）",
+                    taskID: taskID,
+                    metadata: .object([
+                        "kind": .string("quota_cooldown_recorded"),
+                        "accountKey": .string(currentKey),
+                        "exhaustedAt": .string(DateCoding.string(from: at)),
+                        "availableAt": .string(DateCoding.string(from: availableAt)),
+                    ])
+                )
+            }
+        }
+
+        let at = now()
+        if let next = try nextQuotaEligibleProfile(taskID: taskID, at: at) {
+            return try await switchCodexAccount(taskID: taskID, to: next.directoryName)
+        }
+        let configuredPool = oauthRotationPool()
+        let activeRecoveryTimes = try configuredPool.compactMap { profile in
+            try repository.activeQuotaCooldown(
+                accountKey: "profile:\(profile.directoryName)",
+                at: at
+            )
+        }
+        if let earliest = activeRecoveryTimes.min() {
+            throw CodexQuotaRotationError.allAccountsCoolingDown(until: earliest)
+        }
+        throw AppError.invalidRequest("没有可用的账号轮换目标")
+    }
+
+    private func quotaAccountKey(taskID: String) -> String? {
+        if settingsBox().useCodexBrowserOAuthRotation {
+            if let profile = currentProfile(taskID: taskID)?.directoryName {
+                return "profile:\(profile)"
+            }
+            let pointer = (try? repository.currentChatGPTAccount(taskID: taskID)) ?? nil
+            if let pointer, pointer.hasPrefix("profile:") { return pointer }
+            return nil
+        }
+        let pointer = (try? repository.currentChatGPTAccount(taskID: taskID)) ?? nil
+        if !settingsBox().codexAccountRotationIDs.isEmpty, let pointer {
+            return "credential:\(pointer)"
+        }
+        if let pointer {
+            return "web:\(pointer)"
+        }
+        return nil
+    }
+
+    private func nextQuotaEligibleProfile(taskID: String, at: Date) throws -> ChromeProfile? {
+        let pool = oauthRotationPool()
+        guard pool.count >= 2 else { return nil }
+        let pointer = (try? repository.currentChatGPTAccount(taskID: taskID)) ?? nil
+        let pointerDirectory = pointer.flatMap(Self.profileDirectory(fromAccountPointer:))
+        let current = currentProfile(taskID: taskID)
+            ?? pointerDirectory.flatMap { directory in
+                pool.first { $0.directoryName == directory }
+            }
+        let first = Self.nextProfile(after: current?.directoryName, in: pool)
+        let active = try repository.activeQuotaAccountKeys(at: at)
+        return Self.nextQuotaEligibleProfile(
+            startingWith: first,
+            in: pool,
+            activeAccountKeys: active
+        )
     }
 
     /// 设置页的一键安全测试：退出当前 Codex 账号并通过下一个 Profile 重新登录。

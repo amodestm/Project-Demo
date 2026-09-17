@@ -121,6 +121,15 @@ public enum EventType: String, Codable, Sendable, CaseIterable {
     case configChanged    = "CONFIG_CHANGED"
     case keychainUpdated  = "KEYCHAIN_UPDATED"
 
+    // 多账号 AI 讨论组
+    case discussionStarted        = "DISCUSSION_STARTED"
+    case discussionRoundStarted   = "DISCUSSION_ROUND_STARTED"
+    case discussionUtteranceSent  = "DISCUSSION_UTTERANCE_SENT"
+    case discussionIdentityFailed = "DISCUSSION_IDENTITY_FAILED"
+    case discussionConverged      = "DISCUSSION_CONVERGED"
+    case discussionFailed         = "DISCUSSION_FAILED"
+    case discussionCancelled      = "DISCUSSION_CANCELLED"
+
     case unknown          = "UNKNOWN"
 
     public var displayName: String { rawValue }

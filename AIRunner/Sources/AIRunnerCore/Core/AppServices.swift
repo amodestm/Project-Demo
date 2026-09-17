@@ -53,6 +53,10 @@ public final class AppServices: @unchecked Sendable {
     public let accountRotation: AccountRotationManager
     public let browserWindows: BrowserWindowLocating
 
+    // 多账号 AI 讨论组 (多个 ChatGPT 账号扮演不同角色, 轮流发言后收敛决策)
+    public let discussionRepo: DiscussionRepository
+    public let discussionSessions: ChromeDiscussionSessionProvider
+
     // Codex 凭据自动登录 (登出当前账号 → 账号密码重新登录)
     public let codexAccountVault: CodexAccountVaulting
     public let codexLogin: CodexLoginAutomating
@@ -157,16 +161,6 @@ public final class AppServices: @unchecked Sendable {
             configuration: codexConfig
         )
 
-        let codexMonitor = AccountHandoffResumeMonitor(
-            driver: driver,
-            resumeController: codexController,
-            bindings: codexBindingRepo,
-            tasks: tasks,
-            logger: logger,
-            cooldown: loaded.codexResumeCooldown,
-            pollInterval: .seconds(max(2, loaded.codexMonitorPollInterval))
-        )
-
         let chromeProfiles = ChromeProfileScanner()
 
         // ★ Chrome Profile 自动账号轮换 ★
@@ -192,6 +186,17 @@ public final class AppServices: @unchecked Sendable {
             codexAccountVault: resolvedCodexVault,
             codexBrowserOAuth: resolvedCodexBrowserOAuth,
             settleDelay: .seconds(2)
+        )
+
+        let codexMonitor = AccountHandoffResumeMonitor(
+            driver: driver,
+            resumeController: codexController,
+            bindings: codexBindingRepo,
+            tasks: tasks,
+            accountRotation: accountRotation,
+            logger: logger,
+            cooldown: loaded.codexResumeCooldown,
+            pollInterval: .seconds(max(2, loaded.codexMonitorPollInterval))
         )
 
         let codexQuotaMonitor = CodexQuotaMonitor(
@@ -267,6 +272,15 @@ public final class AppServices: @unchecked Sendable {
         self.codexAccountVault = resolvedCodexVault
         self.codexLogin = resolvedCodexLogin
         self.codexBrowserOAuth = resolvedCodexBrowserOAuth
+        self.discussionRepo = DiscussionRepository(db: database)
+        self.discussionSessions = ChromeDiscussionSessionProvider(
+            configuration: {
+                var configuration = ChromeDiscussionSessionConfiguration()
+                configuration.chatGPTURL = URL(string: loaded.chatGPTURL)
+                    ?? ChromeDiscussionSessionConfiguration.default.chatGPTURL
+                return configuration
+            }()
+        )
     }
 
     /// 一行启动。生产代码用默认路径, 测试用 `inMemory: true`。

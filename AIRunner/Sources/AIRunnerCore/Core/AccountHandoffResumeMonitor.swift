@@ -64,7 +64,6 @@ public enum HandoffTickOutcome: Sendable, Equatable {
 /// * 不执行账号切换
 /// * 不填写登录表单
 /// * 不触碰浏览器密码管理器
-/// * 不读取 cookie / session token
 ///
 /// 也就是说: **认证这件事完全在 AIRunner 之外发生**, 它只负责"认证完了之后接着干活"。
 ///
@@ -79,6 +78,7 @@ public actor AccountHandoffResumeMonitor {
     private let resumeController: CodexResumeController
     private let bindings: CodexTaskBindingRepository
     private let tasks: TaskRepository
+    private let accountRotation: (any CodexAccountRotating)?
     private let logger: LoggerService
     private let cooldown: TimeInterval
     private let pollInterval: Duration
@@ -100,6 +100,7 @@ public actor AccountHandoffResumeMonitor {
         resumeController: CodexResumeController,
         bindings: CodexTaskBindingRepository,
         tasks: TaskRepository,
+        accountRotation: (any CodexAccountRotating)? = nil,
         logger: LoggerService,
         cooldown: TimeInterval = 60,
         pollInterval: Duration = .seconds(15),
@@ -109,6 +110,7 @@ public actor AccountHandoffResumeMonitor {
         self.resumeController = resumeController
         self.bindings = bindings
         self.tasks = tasks
+        self.accountRotation = accountRotation
         self.logger = logger
         self.cooldown = cooldown
         self.pollInterval = pollInterval
@@ -228,6 +230,11 @@ public actor AccountHandoffResumeMonitor {
             return .idle
         }
 
+        if let waitingUntil = task.waitingUntil, waitingUntil > now() {
+            state = .waitingForUserAuthentication
+            return .stillWaiting(reason: "所有账号额度仍在冷却，最早恢复时间：\(DateCoding.string(from: waitingUntil))")
+        }
+
         state = .checkingSession
 
         // --- 必须有绑定 ---
@@ -275,15 +282,21 @@ public actor AccountHandoffResumeMonitor {
                 bindingID: binding.id
             )
 
-            lastSendAt[taskID] = result.sentAt
-
             if result.isConfirmed {
+                lastSendAt[taskID] = result.sentAt
                 logger.info(
                     .accountHandoffAutoResumed,
                     "已自动发送「\(result.sentMessage)」到绑定线程并观察到确认。",
                     taskID: taskID
                 )
             } else {
+                if let outcome = await rotateIfQuotaStillExhausted(
+                    after: .sendUnconfirmed,
+                    taskID: taskID,
+                    binding: binding
+                ) {
+                    return outcome
+                }
                 // 不谎报成功 —— 但仍然停止监视, 因为已经发过一次了。
                 logger.warning(
                     .codexResumeUnconfirmed,
@@ -301,11 +314,99 @@ public actor AccountHandoffResumeMonitor {
             return .resumed(bindingID: binding.id)
 
         } catch let error as CodexAutomationError {
+            if let outcome = await rotateIfQuotaStillExhausted(
+                after: error,
+                taskID: taskID,
+                binding: binding
+            ) {
+                return outcome
+            }
             return await handleResumeFailure(error, taskID: taskID, bindingID: binding.id)
         } catch {
             state = .failed
             await stop(taskID: taskID, reason: "自动恢复失败")
             return .failed(reason: "\(error)")
+        }
+    }
+
+    /// 新账号本身也可能已经没有额度，此时 Composer 会禁用，导致“继续”无法发送。
+    /// 只有发送阶段错误且再次读取到明确额度横幅时才继续切号；定位、标题和模型
+    /// 校验错误仍走原来的 fail-closed 分支。
+    private func rotateIfQuotaStillExhausted(
+        after error: CodexAutomationError,
+        taskID: String,
+        binding: CodexTaskBinding
+    ) async -> HandoffTickOutcome? {
+        guard error.canBeCausedByQuotaBlockingSend,
+              let accountRotation else { return nil }
+
+        let app: CodexAppHandle
+        do {
+            app = try await driver.locateApplication(
+                bundleIdentifier: binding.applicationBundleIdentifier
+            )
+            guard try await driver.detectAccountIssue(app) == .quotaExhausted else {
+                return nil
+            }
+        } catch {
+            return nil
+        }
+
+        logger.warning(
+            .accountHandoffDetected,
+            "新账号已登录，但页面明确显示额度耗尽；发送「\(binding.resumeMessage)」不可用，继续轮换下一个账号",
+            taskID: taskID,
+            metadata: .object([
+                "issue": .string(CodexAccountIssue.quotaExhausted.eventName),
+                "resumeError": .string(error.eventName),
+                "automatic": .bool(true),
+            ])
+        )
+
+        do {
+            _ = try await accountRotation.rotateChatGPTAccountAfterQuotaExhaustion(taskID: taskID)
+            _ = try? tasks.updateStatus(
+                id: taskID,
+                to: .waitingForAccount,
+                errorMessage: "当前账号额度已耗尽，已切换下一个账号，等待登录完成",
+                errorClass: CodexAccountIssue.quotaExhausted.eventName,
+                waitingUntil: nil
+            )
+            state = .waitingForUserAuthentication
+            logger.info(
+                .accountHandoffCompleted,
+                "额度耗尽账号已跳过，等待下一个账号恢复 Codex 后重新锁定并发送",
+                taskID: taskID
+            )
+            return .stillWaiting(reason: "当前账号额度已耗尽，已切换下一个账号")
+        } catch let error as CodexQuotaRotationError {
+            if case .allAccountsCoolingDown(let until) = error {
+                _ = try? tasks.updateStatus(
+                    id: taskID,
+                    to: .waitingForAccount,
+                    errorMessage: "所有账号额度均在冷却中，等待最早账号恢复后自动切换",
+                    errorClass: CodexAccountIssue.quotaExhausted.eventName,
+                    waitingUntil: until
+                )
+                state = .waitingForUserAuthentication
+                logger.info(
+                    .accountHandoffDetected,
+                    "所有账号都在额度冷却中，等待至 \(DateCoding.string(from: until))（含网络缓冲）",
+                    taskID: taskID
+                )
+                return .stillWaiting(reason: "所有账号额度均在冷却中，等待至 \(DateCoding.string(from: until))")
+            }
+            return .failed(reason: error.localizedDescription)
+        } catch {
+            let message = AppError.normalize(error).userMessage
+            state = .failed
+            logger.error(
+                .accountRotationFailed,
+                "继续轮换下一个账号失败: \(message)",
+                taskID: taskID
+            )
+            await stop(taskID: taskID, reason: "账号轮换失败")
+            return .failed(reason: message)
         }
     }
 

@@ -358,7 +358,10 @@ public actor CodexResumeController {
         // 第一次 AX 读取到的空数组当成“目标不存在”；在同一窗口内只读轮询，
         // 等待列表出现后再进入唯一性匹配。
         var candidates: [CodexThreadCandidate] = []
-        let candidateDeadline = Date().addingTimeInterval(10)
+        // OAuth 回调后 Codex 可能先只显示登录页或窗口外壳，侧边栏列表和
+        // 线程标题会在稍后异步挂载。给它完整 30 秒，只读轮询；没有唯一
+        // 匹配仍然停止，不会因为延长等待而降低安全门槛。
+        let candidateDeadline = Date().addingTimeInterval(30)
         repeat {
             if (try? await driver.dismissBlockingWelcomeOverlay(app)) == true {
                 logger.info(
@@ -427,14 +430,22 @@ public actor CodexResumeController {
 
         // 7) ★二次验证★ —— 回到主会话区重新确认。
         // Electron 点击侧边栏后会先保留旧会话标题，再异步切换到目标会话。
-        // 不能把“读到一个非空标题”当成切换完成；必须等标题与绑定一致，
-        // 最多轮询 10 秒，避免在旧标题窗口内提前报错。
+        // 登录后也可能先出现模型介绍弹窗。不能把“读到一个非空标题”当成
+        // 切换完成；必须等标题与绑定一致，最多轮询 30 秒，避免在旧标题或
+        // 登录页窗口内提前报错。
         var context = try await driver.readOpenThreadContext(app)
         var verified = matcher.verifyOpenedThread(
             context: context, against: binding.fingerprint
         )
-        let contextDeadline = Date().addingTimeInterval(10)
+        let contextDeadline = Date().addingTimeInterval(30)
         while !verified.passed && Date() < contextDeadline {
+            if (try? await driver.dismissBlockingWelcomeOverlay(app)) == true {
+                logger.info(
+                    .codexTargetOpened,
+                    "等待目标线程加载期间已关闭登录后模型介绍弹窗",
+                    metadata: .object(["bindingID": .string(binding.id)])
+                )
+            }
             try? await Task.sleep(for: .milliseconds(250))
             context = try await driver.readOpenThreadContext(app)
             verified = matcher.verifyOpenedThread(

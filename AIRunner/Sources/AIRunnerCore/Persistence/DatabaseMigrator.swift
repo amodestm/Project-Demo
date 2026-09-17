@@ -10,7 +10,7 @@ public enum DatabaseMigrator {
     ///
     /// ★ 每个 migration 只允许把自己推进到**自己的**版本号 ★
     /// 详见 `migrateToV1` 的注释。
-    public static let currentVersion = 7
+    public static let currentVersion = 10
 
     public static func migrate(_ db: Database) throws {
         let existing = try db.scalarInt("PRAGMA user_version;") ?? 0
@@ -48,6 +48,18 @@ public enum DatabaseMigrator {
 
         if existing < 7 {
             try migrateToV7(db)
+        }
+
+        if existing < 8 {
+            try migrateToV8(db)
+        }
+
+        if existing < 9 {
+            try migrateToV9(db)
+        }
+
+        if existing < 10 {
+            try migrateToV10(db)
         }
     }
 
@@ -265,7 +277,6 @@ public enum DatabaseMigrator {
     ///
     /// 同样是**非破坏性**迁移 —— 只新建表, 不触碰任何既有表。
     ///
-    /// 这里**不存**任何认证信息: 没有 email / password / cookie / session token /
     /// authentication storage。存的全部是"如何在自己的 UI 里重新找到那个线程"
     /// 的可重建定位信息。
     private static func migrateToV3(_ db: Database) throws {
@@ -421,6 +432,128 @@ public enum DatabaseMigrator {
                 """
             )
             try db.execute("PRAGMA user_version = 7;")
+        }
+    }
+
+    // MARK: - V8: 多账号 AI 讨论组
+
+    /// V8: 讨论组 —— 配置(组 / 成员 / 轮次) + 运行时(运行 / 发言)。
+    ///
+    /// 设计取舍:
+    /// - **成员与轮次以 JSON 存进组表** —— 配置是整体读写, 不需要按成员单独查询,
+    ///   规范化成多表只会带来无谓的 JOIN 和迁移负担。
+    /// - **运行与发言规范化成独立表** —— 它们需要频繁增量更新(`received` 即落盘)
+    ///   和断点续跑, JSON 整体覆盖会丢并发写入。
+    private static func migrateToV8(_ db: Database) throws {
+        try db.transaction {
+            for statement in v8Statements {
+                try db.execute(statement)
+            }
+            try db.execute("PRAGMA user_version = 8;")
+        }
+    }
+
+    private static let v8Statements: [String] = [
+        """
+        CREATE TABLE IF NOT EXISTS discussion_groups (
+            id                      TEXT PRIMARY KEY,
+            name                    TEXT NOT NULL,
+            topic                   TEXT NOT NULL DEFAULT '',
+            consensus               TEXT NOT NULL DEFAULT 'moderatorSummary',
+            moderator_participant_id TEXT,
+            participants_json       TEXT NOT NULL DEFAULT '[]',
+            rounds_json             TEXT NOT NULL DEFAULT '[]',
+            created_at              TEXT NOT NULL,
+            updated_at              TEXT NOT NULL
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS discussion_runs (
+            id                     TEXT PRIMARY KEY,
+            group_id               TEXT NOT NULL,
+            state                  TEXT NOT NULL DEFAULT 'idle',
+            current_round          INTEGER NOT NULL DEFAULT 0,
+            current_participant_id TEXT,
+            final_decision         TEXT,
+            error_message          TEXT,
+            started_at             TEXT,
+            finished_at            TEXT
+        );
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_discussion_runs_group ON discussion_runs(group_id);",
+        """
+        CREATE TABLE IF NOT EXISTS discussion_utterances (
+            id                 TEXT PRIMARY KEY,
+            run_id             TEXT NOT NULL,
+            round_index        INTEGER NOT NULL DEFAULT 0,
+            participant_id     TEXT NOT NULL,
+            prompt_sent        TEXT NOT NULL,
+            response_text      TEXT,
+            account_email_used TEXT,
+            status             TEXT NOT NULL DEFAULT 'pending',
+            created_at         TEXT NOT NULL,
+            completed_at       TEXT
+        );
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_discussion_utterances_run
+            ON discussion_utterances(run_id, round_index);
+        """,
+    ]
+
+    // MARK: - V9: 讨论运行幂等与引用保护
+
+    private static func migrateToV9(_ db: Database) throws {
+        try db.transaction {
+            // 同一场运行里，同一成员在同一轮只能有一条发言。
+            try db.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_discussion_utterance_identity
+                    ON discussion_utterances(run_id, round_index, participant_id);
+                """
+            )
+            // V8 为兼容旧库没有重建表；用触发器补上等价的引用检查。
+            try db.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS discussion_runs_group_exists
+                BEFORE INSERT ON discussion_runs
+                WHEN NOT EXISTS (SELECT 1 FROM discussion_groups WHERE id = NEW.group_id)
+                BEGIN
+                    SELECT RAISE(ABORT, 'discussion group does not exist');
+                END;
+                """
+            )
+            try db.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS discussion_utterances_run_exists
+                BEFORE INSERT ON discussion_utterances
+                WHEN NOT EXISTS (SELECT 1 FROM discussion_runs WHERE id = NEW.run_id)
+                BEGIN
+                    SELECT RAISE(ABORT, 'discussion run does not exist');
+                END;
+                """
+            )
+            try db.execute("PRAGMA user_version = 9;")
+        }
+    }
+
+    // MARK: - V10: Codex 账号额度冷却
+
+    private static func migrateToV10(_ db: Database) throws {
+        try db.transaction {
+            try db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS codex_account_quota_cooldowns (
+                    account_key  TEXT PRIMARY KEY NOT NULL,
+                    exhausted_at TEXT NOT NULL,
+                    available_at TEXT NOT NULL
+                );
+                """
+            )
+            try db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_codex_quota_available ON codex_account_quota_cooldowns(available_at);"
+            )
+            try db.execute("PRAGMA user_version = 10;")
         }
     }
 

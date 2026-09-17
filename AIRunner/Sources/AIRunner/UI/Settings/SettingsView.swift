@@ -481,7 +481,7 @@ struct CodexSettingsView: View {
                     Text("""
                     当任务需要换账号时，AIRunner 会先保存检查点，再选择下一个独立 Chrome Profile，通过 Codex 官方浏览器授权切换账号，最后继续任务。
 
-                    每个 Chrome Profile 只需预先登录一个 ChatGPT 账号。AIRunner 不读取 Cookie 或 session token；网页会话过期、验证码或安全挑战出现时会停下来等你处理。
+                    每个 Chrome Profile 只需预先登录一个 ChatGPT 账号；网页会话过期、验证码或安全挑战出现时会停下来等你处理。
                     """)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -668,7 +668,6 @@ struct CodexSettingsView: View {
                     Text("""
                     自动登录与恢复只做这些:
                      · 在独立 Chrome Profile 中打开 Codex 官方短时授权地址
-                     · 不读取、不复制、不注入网页 Cookie 或 session token
                      · 检测到验证码、两步验证或安全挑战时立即停止
                      · 通过 macOS Accessibility API 定位已绑定的线程
                      · 二次验证 (标题 + 至少一个辅助信号) 后才发送

@@ -41,7 +41,7 @@ struct TaskDetailView: View {
     private var accountRotationCaption: String {
         usesBrowserOAuth
             ? "Codex 退出 → 指定 Chrome Profile 授权 → 回到 Codex"
-            : "从 macOS 钥匙串自动登录下一个账号 · 不读取 Cookie"
+            : "从 macOS 钥匙串自动登录下一个账号"
     }
     private var accountRotationHelp: String {
         usesBrowserOAuth
@@ -736,11 +736,20 @@ struct TaskDetailView: View {
                 Button {
                     manager.simulateCodexQuotaHandoff(task)
                 } label: {
-                    Label("安全模拟额度耗尽", systemImage: "testtube.2")
+                    Label(
+                        task.status == .waitingForAccount
+                            ? "继续安全模拟"
+                            : "安全模拟额度耗尽",
+                        systemImage: "testtube.2"
+                    )
                 }
                 .controlSize(.small)
                 .disabled(task.status.isTerminal || manager.isRotatingAccount)
-                .help("先确认绑定线程没有生成内容，再走真实的 Codex 退出、Profile 轮换、OAuth 登录和自动恢复流程")
+                .help(
+                    task.status == .waitingForAccount
+                        ? "检查点已经保存；继续未完成的 Profile 轮换、OAuth 登录和目标线程恢复"
+                        : "先确认绑定线程没有生成内容，再走真实的 Codex 退出、Profile 轮换、OAuth 登录和自动恢复流程"
+                )
             }
             Text("开启后，AIRunner 会持续检测额度耗尽或登录失效。只有任务已停止生成、页面处于空闲且异常连续确认后，才会自动退出当前 Codex 账号并切换下一个；切换完成后会重新锁定目标对话与模型，再发送一次「\(binding.resumeMessage)」。")
                 .font(.caption2)

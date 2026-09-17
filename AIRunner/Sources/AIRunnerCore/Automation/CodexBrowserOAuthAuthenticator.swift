@@ -81,7 +81,6 @@ public enum CodexBrowserOAuthError: Error, LocalizedError, Sendable, Equatable {
 ///
 /// AIRunner 通过 Codex 左下角个人资料菜单发起退出并处理确认框。退出完成后从 Codex 窗口
 /// 按下“使用 ChatGPT 账号登录”，让官方流程在目标 Chrome Profile 中继续。
-/// AIRunner 不读取、不复制 ChatGPT Cookie，也不注入 session token。
 public actor CodexBrowserOAuthAuthenticator: CodexBrowserOAuthAuthenticating {
     private let executableURL: URL
     private let timeout: TimeInterval

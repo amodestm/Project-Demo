@@ -1,5 +1,18 @@
 import Foundation
 
+public enum CodexQuotaRotationError: Error, Sendable, Equatable {
+    case allAccountsCoolingDown(until: Date)
+}
+
+extension CodexQuotaRotationError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .allAccountsCoolingDown(let until):
+            return "所有账号仍在额度冷却中，最早恢复时间为 \(DateCoding.string(from: until))"
+        }
+    }
+}
+
 // MARK: - 错误
 
 /// Codex 自动化相关错误。
@@ -118,6 +131,19 @@ public enum CodexAutomationError: Error, Sendable, Equatable {
         case .staleResumeLease:                return "STALE_RESUME_LEASE"
         case .bindingNotFound:                 return "BINDING_NOT_FOUND"
         case .timeout:                         return "CODEX_TIMEOUT"
+        }
+    }
+
+    /// 这些错误可能是额度耗尽页面禁用了 Composer / 发送按钮造成的。
+    /// 只有上层重新读取页面并再次确认额度横幅后，才允许据此继续轮换账号。
+    public var canBeCausedByQuotaBlockingSend: Bool {
+        switch self {
+        case .composerNotFound, .composerNotEditable, .composerFocusFailed,
+             .messageInsertionFailed, .sendControlNotFound, .sendFailed,
+             .sendUnconfirmed:
+            return true
+        default:
+            return false
         }
     }
 }

@@ -9,6 +9,51 @@ public struct AccountRotationRepository: Sendable {
         self.db = db
     }
 
+    public func recordQuotaExhaustion(
+        accountKey: String,
+        exhaustedAt: Date,
+        availableAt: Date
+    ) throws {
+        try db.execute(
+            """
+            INSERT INTO codex_account_quota_cooldowns
+                (account_key, exhausted_at, available_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(account_key) DO UPDATE SET
+                exhausted_at = excluded.exhausted_at,
+                available_at = excluded.available_at
+            WHERE codex_account_quota_cooldowns.available_at <= ?
+            """,
+            [
+                .text(accountKey),
+                .text(DateCoding.string(from: exhaustedAt)),
+                .text(DateCoding.string(from: availableAt)),
+                .text(DateCoding.string(from: exhaustedAt)),
+            ]
+        )
+    }
+
+    public func activeQuotaCooldown(accountKey: String, at date: Date) throws -> Date? {
+        try db.queryOne(
+            "SELECT available_at FROM codex_account_quota_cooldowns WHERE account_key = ? AND available_at > ?",
+            [.text(accountKey), .text(DateCoding.string(from: date))]
+        )?.date("available_at")
+    }
+
+    public func activeQuotaAccountKeys(at date: Date) throws -> Set<String> {
+        Set(try db.query(
+            "SELECT account_key FROM codex_account_quota_cooldowns WHERE available_at > ?",
+            [.text(DateCoding.string(from: date))]
+        ).compactMap { $0.string("account_key") })
+    }
+
+    public func earliestQuotaAvailability(at date: Date) throws -> Date? {
+        try db.queryOne(
+            "SELECT MIN(available_at) AS available_at FROM codex_account_quota_cooldowns WHERE available_at > ?",
+            [.text(DateCoding.string(from: date))]
+        )?.date("available_at")
+    }
+
     /// 读取某任务当前的 profile 目录名。
     public func currentProfile(taskID: String) throws -> String? {
         try db.queryOne(

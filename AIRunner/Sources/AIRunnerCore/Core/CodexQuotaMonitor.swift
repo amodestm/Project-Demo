@@ -16,7 +16,7 @@ public enum CodexQuotaMonitorOutcome: Sendable, Equatable {
 /// 只在 Codex 已停止生成且连续观察到明确额度/认证信号时轮换账号。
 ///
 /// 额度耗尽会先在原线程补发一次「继续」；等待后仍连续看到额度耗尽才轮换。
-/// 监视器不读取 Cookie/token，也不把“任务已停止”单独解释为额度耗尽。
+/// 监视器不把“任务已停止”单独解释为额度耗尽。
 /// 轮换前先将任务安全置为 `waitingForAccount`，因此检查点和未提交步骤都能保留。
 public actor CodexQuotaMonitor {
 
@@ -45,8 +45,6 @@ public actor CodexQuotaMonitor {
     /// 补发后异常文本可能在页面重绘时短暂消失；连续两次无异常才清除补发状态。
     private var issueClearObservations: [String: Int] = [:]
     private var lastObserved: [String: CodexAccountIssue] = [:]
-    /// 一次轮换完成后，必须先看到异常从最新输出中消失，才能再次对同一任务切号。
-    private var rotationLatched: Set<String> = []
 
     public init(
         driver: any CodexUIAutomationDriving,
@@ -94,7 +92,6 @@ public actor CodexQuotaMonitor {
         candidates.removeValue(forKey: taskID)
         issueClearObservations.removeValue(forKey: taskID)
         lastObserved.removeValue(forKey: taskID)
-        rotationLatched.remove(taskID)
         logger.info(.accountHandoffMonitoring, "已停止 Codex 额度监视: \(reason)", taskID: taskID)
     }
 
@@ -171,18 +168,9 @@ public actor CodexQuotaMonitor {
             candidates.removeValue(forKey: taskID)
             issueClearObservations.removeValue(forKey: taskID)
             lastObserved.removeValue(forKey: taskID)
-            rotationLatched.remove(taskID)
             return .waitingForCodex
         }
         issueClearObservations.removeValue(forKey: taskID)
-
-
-        // 新账号恢复后，原线程历史里可能暂时仍显示上一账号留下的错误。
-        // 在错误离开“最新输出”以前保持锁定，避免每两个轮询周期再次切号。
-        if rotationLatched.contains(taskID) {
-            candidates.removeValue(forKey: taskID)
-            return .observed(issue)
-        }
 
         if lastObserved[taskID] != issue {
             lastObserved[taskID] = issue
@@ -281,6 +269,23 @@ public actor CodexQuotaMonitor {
                     bindingID: binding.id,
                     message: binding.resumeMessage
                 )
+                if !result.isConfirmed,
+                   (try? await driver.detectAccountIssue(app)) == .quotaExhausted {
+                    candidates.removeValue(forKey: taskID)
+                    logger.warning(
+                        .accountHandoffDetected,
+                        "额度耗尽补发未获确认，页面仍明确显示额度耗尽；直接轮换下一个账号",
+                        taskID: taskID,
+                        metadata: .object([
+                            "issue": .string(issue.eventName),
+                            "quotaRetry": .bool(true),
+                            "sendConfirmed": .bool(false),
+                        ])
+                    )
+                    return await transitionAndRotate(
+                        taskID: taskID, issue: issue, simulated: false
+                    )
+                }
                 candidate.retrySentAt = result.sentAt
                 candidate.postRetryObservations = 0
                 candidates[taskID] = candidate
@@ -295,6 +300,35 @@ public actor CodexQuotaMonitor {
                     ])
                 )
                 return .retrySent
+            } catch let error as CodexAutomationError {
+                candidates.removeValue(forKey: taskID)
+                if error.canBeCausedByQuotaBlockingSend,
+                   (try? await driver.detectAccountIssue(app)) == .quotaExhausted {
+                    logger.warning(
+                        .accountHandoffDetected,
+                        "额度耗尽导致补发不可用，页面二次确认仍为额度耗尽；直接轮换下一个账号",
+                        taskID: taskID,
+                        metadata: .object([
+                            "issue": .string(issue.eventName),
+                            "quotaRetry": .bool(true),
+                            "resumeError": .string(error.eventName),
+                        ])
+                    )
+                    return await transitionAndRotate(
+                        taskID: taskID, issue: issue, simulated: false
+                    )
+                }
+                let message = error.userMessage
+                logger.error(
+                    .codexResumeAborted,
+                    "额度耗尽后的单次补发失败，未切换账号: \(message)",
+                    taskID: taskID,
+                    metadata: .object([
+                        "issue": .string(issue.eventName),
+                        "quotaRetry": .bool(true),
+                    ])
+                )
+                return .retryFailed(message)
             } catch {
                 candidates.removeValue(forKey: taskID)
                 let message = AppError.normalize(error).userMessage
@@ -321,6 +355,30 @@ public actor CodexQuotaMonitor {
     public func simulateQuotaExhaustion(taskID: String) async throws -> CodexQuotaMonitorOutcome {
         guard let task = try tasks.fetch(id: taskID), !task.status.isTerminal else {
             throw AppError.invalidRequest("测试任务不存在或已经结束，请新建一个测试任务")
+        }
+        // 上一次模拟可能已经安全保存检查点，却在退出、OAuth 或回到 Codex
+        // 之前中断。此时任务本来就应保持 waitingForAccount；再次点击测试应
+        // 从账号轮换继续，而不是要求用户手动篡改任务状态或重新建任务。
+        if task.status == .waitingForAccount {
+            guard try bindings.fetchByTask(taskID: taskID) != nil else {
+                throw AppError.invalidRequest("请先给测试任务绑定一个 Codex 线程")
+            }
+            logger.warning(
+                .accountHandoffRequested,
+                "用户继续上次未完成的安全模拟：检查点已保存，重新执行账号轮换",
+                taskID: taskID,
+                metadata: .object([
+                    "issue": .string(CodexAccountIssue.quotaExhausted.eventName),
+                    "automatic": .bool(true),
+                    "simulated": .bool(true),
+                    "resumedPendingRotation": .bool(true),
+                ])
+            )
+            return await performRotation(
+                taskID: taskID,
+                issue: .quotaExhausted,
+                simulated: true
+            )
         }
         guard [.running, .waiting, .waitingForUser, .waitingForBrowser, .queued]
             .contains(task.status) else {
@@ -395,9 +453,34 @@ public actor CodexQuotaMonitor {
             return .rotationFailed(message)
         }
 
+        return await performRotation(taskID: taskID, issue: issue, simulated: simulated)
+    }
+
+    /// 任务进入 waitingForAccount 后唯一的账号轮换入口。首次轮换与用户重试
+    /// 共用这一段，确保两条路径都在授权成功后启动同一个恢复监视器。
+    private func performRotation(
+        taskID: String,
+        issue: CodexAccountIssue,
+        simulated: Bool
+    ) async -> CodexQuotaMonitorOutcome {
         do {
-            _ = try await accountRotation.rotateChatGPTAccount(taskID: taskID)
-            rotationLatched.insert(taskID)
+            _ = try await (issue == .quotaExhausted
+                ? accountRotation.rotateChatGPTAccountAfterQuotaExhaustion(taskID: taskID)
+                : accountRotation.rotateChatGPTAccount(taskID: taskID))
+            // OAuth 已经确认进入新的 Profile。下一账号若仍然显示额度耗尽，
+            // 必须允许它重新走“补发一次 → 二次确认 → 再轮换”；否则只要
+            // 连续两个账号都没额度，旧的永久锁存就会把流程卡死。稳定观察、
+            // 单次补发和任务状态门控已经足以过滤登录后的短暂旧页面。
+            candidates.removeValue(forKey: taskID)
+            issueClearObservations.removeValue(forKey: taskID)
+            lastObserved.removeValue(forKey: taskID)
+            _ = try? tasks.updateStatus(
+                id: taskID,
+                to: .waitingForAccount,
+                errorMessage: "已切换账号，等待新账号登录完成",
+                errorClass: issue.eventName,
+                waitingUntil: nil
+            )
             logger.info(
                 .accountHandoffCompleted,
                 "已自动退出当前 Codex 账号并完成下一个账号授权，等待恢复绑定线程",
@@ -408,6 +491,25 @@ public actor CodexQuotaMonitor {
             )
             await onRotationComplete(taskID)
             return .rotationCompleted
+        } catch let error as CodexQuotaRotationError {
+            if case .allAccountsCoolingDown(let until) = error {
+                _ = try? tasks.updateStatus(
+                    id: taskID,
+                    to: .waitingForAccount,
+                    errorMessage: "所有账号额度均在冷却中，等待最早账号恢复后自动切换",
+                    errorClass: issue.eventName,
+                    waitingUntil: until
+                )
+                candidates.removeValue(forKey: taskID)
+                logger.info(
+                    .accountHandoffDetected,
+                    "所有账号都在额度冷却中，等待至 \(DateCoding.string(from: until))（含网络缓冲）",
+                    taskID: taskID
+                )
+                await onRotationComplete(taskID)
+                return .rotationCompleted
+            }
+            return .rotationFailed(error.localizedDescription)
         } catch {
             let message = AppError.normalize(error).userMessage
             logger.error(

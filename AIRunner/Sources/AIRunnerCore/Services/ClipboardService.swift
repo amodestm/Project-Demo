@@ -44,8 +44,6 @@ public final class InMemoryClipboard: ClipboardServicing, @unchecked Sendable {
 /// 本协议**只**允许做一件事: 打开一个 URL, 让用户自己在已登录的浏览器里操作。
 ///
 /// 明确禁止在本项目任何位置实现:
-/// - 读取浏览器 Cookie 数据库 / 导出 Cookie
-/// - 读取或注入 session token / authentication storage
 /// - 自动填写账号密码
 /// - 自动执行账号轮换
 /// - 用自动化工具操作网页来绕过平台使用限制

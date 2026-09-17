@@ -55,6 +55,27 @@ final class CodexExecutionPreferenceTests: XCTestCase {
         XCTAssertNil(CodexReasoningEffort.fromUILabel("选择强度"))
     }
 
+    func testReasoningPopoverReadsSelectedLevelAndIgnoresEntranceLabel() {
+        XCTAssertEqual(
+            CodexReasoningEffort.uniqueFromUILabels([
+                "选择强度", "高", "GPT-5.6 Sol",
+            ]),
+            .high
+        )
+        XCTAssertEqual(
+            CodexReasoningEffort.uniqueFromUILabels([
+                "选择强度", "极高", "GPT-6 Astra",
+            ]),
+            .xhigh
+        )
+        XCTAssertNil(
+            CodexReasoningEffort.uniqueFromUILabels([
+                "选择强度", "极高", "最高",
+            ])
+        )
+        XCTAssertNil(CodexReasoningEffort.uniqueFromUILabels(["选择强度"]))
+    }
+
     func testSelectionAcceptsSeparatorsAndKeepsUltraDistinct() {
         let high = CodexExecutionPreference(modelID: "gpt-5.6-sol", reasoningEffort: .high)
         XCTAssertTrue(CodexExecutionSelection(visibleTitle: "GPT-5.6 Sol · 高").matches(high))

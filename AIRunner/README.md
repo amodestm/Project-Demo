@@ -82,7 +82,6 @@ Repositories → Database(系统 SQLite3, 原子提交) → KeychainManager · L
 
 ## 隐私与安全
 
-- 不读取、导出或注入浏览器 Cookie / session token；切换的是你合法持有的账号，复用 Profile 中已有的网页登录。
 - 凭据只写入 macOS Keychain；任务 / 设置 / 数据库 / 日志只保存非敏感记录 ID，日志经 `SecretRedactor` 强制脱敏。
 - 遇到验证码 / 人机验证 / 2FA 会停止并提示你处理，不尝试绕过。
-- 网络层使用临时会话配置，不落盘缓存、不写 cookie。
+- 网络层使用临时会话配置，不落盘缓存。

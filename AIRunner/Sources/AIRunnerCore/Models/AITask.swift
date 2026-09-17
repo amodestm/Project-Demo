@@ -14,7 +14,7 @@ public enum TaskStatus: String, Codable, Sendable, CaseIterable {
 
     /// ★ ChatGPT Web 兼容流程: 当前 session 无法继续, 需要切换到另一个
     /// **自己已授权**的 ChatGPT session。任务详情可从 macOS Keychain 读取用户
-    /// 保存的凭据并自动登录下一个账号；程序不读 Cookie 或 session token。
+    /// 保存的凭据并自动登录下一个账号。
     case waitingForAccount
     /// 需要用户把浏览器/页面准备好 (例如 ChatGPT 页面被关闭, 或需要新开一个对话)。
     case waitingForBrowser

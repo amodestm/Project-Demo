@@ -29,7 +29,7 @@ public struct OpenAICompatibleProvider: AIProvider {
     }
 
     static func makeSession() -> URLSession {
-        let cfg = URLSessionConfiguration.ephemeral   // 不落盘缓存, 不写 cookie jar
+        let cfg = URLSessionConfiguration.ephemeral   // 不落盘缓存
         cfg.timeoutIntervalForRequest = 300
         cfg.timeoutIntervalForResource = 1800
         cfg.waitsForConnectivity = false

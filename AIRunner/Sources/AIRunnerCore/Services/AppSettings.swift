@@ -73,8 +73,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
 
     /// Chrome Profile 对应的账号显示邮箱。
     ///
-    /// 这是用户确认后的显示别名，只存目录名 → 邮箱映射；不从 Chrome
-    /// Cookie、Google 账号信息或 ChatGPT session 中读取。
+    /// 这是用户确认后的显示别名，只存目录名 → 邮箱映射。
     public var accountRotationProfileAliases: [String: String]
 
     public init(

@@ -85,7 +85,7 @@ public struct ProviderConfig: Codable, Sendable, Identifiable, Equatable, Hashab
     // MARK: - 出厂默认
 
     /// 出厂 Provider 列表。全部是"用户自己合法配置的官方 API 端点"。
-    /// 不含任何 Cookie / 网页自动化 / 账号轮换相关的配置项。
+    /// 不含网页自动化 / 账号轮换相关的配置项。
     public static let defaults: [ProviderConfig] = [
         ProviderConfig(
             id: "openai",

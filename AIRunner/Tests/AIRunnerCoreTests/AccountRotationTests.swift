@@ -30,6 +30,19 @@ final class AccountRotationTests: XCTestCase {
         ChromeProfile(directoryName: name, displayName: display)
     }
 
+    func testPreferredAccountIdentityUsesAliasThenProfileNameThenDirectory() {
+        let named = profile("Profile 3", display: "person@example.com")
+        XCTAssertEqual(
+            named.preferredAccountIdentity(alias: " confirmed@example.com "),
+            "confirmed@example.com"
+        )
+        XCTAssertEqual(named.preferredAccountIdentity(), "person@example.com")
+        XCTAssertEqual(
+            profile("Profile 4").preferredAccountIdentity(),
+            "Profile 4"
+        )
+    }
+
     func testNextProfileWrapsAround() {
         let pool = [profile("Default"), profile("Profile 1"), profile("Profile 2")]
 
@@ -68,6 +81,23 @@ final class AccountRotationTests: XCTestCase {
             startingWith: profile("Profile 1"), in: pool
         )
         XCTAssertEqual(candidates.map(\.directoryName), ["Profile 1", "Profile 2", "Default"])
+    }
+
+    func testQuotaSelectionSkipsCoolingProfilesAndWraps() {
+        let pool = [profile("Default"), profile("Profile 1"), profile("Profile 2")]
+        let selected = AccountRotationManager.nextQuotaEligibleProfile(
+            startingWith: profile("Default"),
+            in: pool,
+            activeAccountKeys: ["profile:Default", "profile:Profile 1"]
+        )
+        XCTAssertEqual(selected?.directoryName, "Profile 2")
+
+        let allCooling = AccountRotationManager.nextQuotaEligibleProfile(
+            startingWith: profile("Default"),
+            in: pool,
+            activeAccountKeys: ["profile:Default", "profile:Profile 1", "profile:Profile 2"]
+        )
+        XCTAssertNil(allCooling)
     }
 
     private static func next(_ current: String?, _ pool: [ChromeProfile]) -> String? {
@@ -134,6 +164,71 @@ final class AccountRotationTests: XCTestCase {
         )
         let read = try reopened.accountRotationRepo.currentProfile(taskID: task.id)
         XCTAssertEqual(read, "Profile 5")
+    }
+
+    func testQuotaCooldownRecordsFiveHourWindowAndEarliestRecovery() throws {
+        let services = try TestSupport.makeServices()
+        let repo = services.accountRotationRepo
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let firstAvailable = base.addingTimeInterval(5 * 60 * 60 + 2 * 60)
+        let secondAvailable = base.addingTimeInterval(6 * 60 * 60)
+
+        try repo.recordQuotaExhaustion(
+            accountKey: "profile:Default",
+            exhaustedAt: base,
+            availableAt: firstAvailable
+        )
+        try repo.recordQuotaExhaustion(
+            accountKey: "profile:Profile 1",
+            exhaustedAt: base,
+            availableAt: secondAvailable
+        )
+
+        XCTAssertEqual(
+            try repo.activeQuotaCooldown(accountKey: "profile:Default", at: base),
+            firstAvailable
+        )
+        XCTAssertEqual(
+            try repo.activeQuotaAccountKeys(at: base),
+            ["profile:Default", "profile:Profile 1"]
+        )
+        XCTAssertEqual(try repo.earliestQuotaAvailability(at: base), firstAvailable)
+    }
+
+    func testActiveQuotaCooldownIsNotExtendedUntilItExpires() throws {
+        let services = try TestSupport.makeServices()
+        let repo = services.accountRotationRepo
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let original = base.addingTimeInterval(5 * 60 * 60 + 2 * 60)
+        let attemptedExtension = base.addingTimeInterval(12 * 60 * 60)
+
+        try repo.recordQuotaExhaustion(
+            accountKey: "profile:Default",
+            exhaustedAt: base,
+            availableAt: original
+        )
+        try repo.recordQuotaExhaustion(
+            accountKey: "profile:Default",
+            exhaustedAt: base.addingTimeInterval(60),
+            availableAt: attemptedExtension
+        )
+
+        XCTAssertEqual(
+            try repo.activeQuotaCooldown(accountKey: "profile:Default", at: base),
+            original
+        )
+
+        // 过期后再次记录才允许建立新的五小时窗口。
+        let afterExpiry = original.addingTimeInterval(1)
+        try repo.recordQuotaExhaustion(
+            accountKey: "profile:Default",
+            exhaustedAt: afterExpiry,
+            availableAt: attemptedExtension
+        )
+        XCTAssertEqual(
+            try repo.activeQuotaCooldown(accountKey: "profile:Default", at: afterExpiry),
+            attemptedExtension
+        )
     }
 
     // MARK: - 数据库迁移

@@ -6,6 +6,15 @@ import XCTest
 /// 全部用 `FakeCodexUIAutomationDriver` + `tick()` 手动驱动, 不依赖真实计时器。
 final class AccountHandoffMonitorTests: XCTestCase {
 
+    actor FakeAccountRotation: CodexAccountRotating {
+        private(set) var callCount = 0
+
+        func rotateChatGPTAccount(taskID: String) async throws -> ChatGPTAccountSwitchOutcome {
+            callCount += 1
+            return ChatGPTAccountSwitchOutcome(accountLabel: "下一个账号", pageReloaded: true)
+        }
+    }
+
     // MARK: - 装置
 
     struct Fixture {
@@ -13,6 +22,7 @@ final class AccountHandoffMonitorTests: XCTestCase {
         let driver: FakeCodexUIAutomationDriver
         let controller: CodexResumeController
         let monitor: AccountHandoffResumeMonitor
+        let rotation: FakeAccountRotation
         let bindings: CodexTaskBindingRepository
         let leases: CodexResumeLeaseRepository
         let taskID: String
@@ -44,12 +54,14 @@ final class AccountHandoffMonitorTests: XCTestCase {
             ownerID: "test-owner",
             now: { Date() }
         )
+        let rotation = FakeAccountRotation()
 
         let monitor = AccountHandoffResumeMonitor(
             driver: driver,
             resumeController: controller,
             bindings: bindings,
             tasks: services.tasks,
+            accountRotation: rotation,
             logger: logger,
             cooldown: cooldown,
             pollInterval: .milliseconds(10),
@@ -83,6 +95,7 @@ final class AccountHandoffMonitorTests: XCTestCase {
             driver: driver,
             controller: controller,
             monitor: monitor,
+            rotation: rotation,
             bindings: bindings,
             leases: leases,
             taskID: task.id,
@@ -479,6 +492,64 @@ final class AccountHandoffMonitorTests: XCTestCase {
             events.contains { $0.eventType == .codexResumeUnconfirmed },
             "无法确认时必须留下 CODEX_RESUME_UNCONFIRMED 事件, 不能谎报成功"
         )
+    }
+
+    func testQuotaBlockedSendAfterHandoffRotatesToNextAccount() async throws {
+        let fixture = try await makeFixture { driver in
+            driver.accountIssue = .quotaExhausted
+            driver.sendControlAvailable = false
+        }
+        try await armHandoff(fixture)
+
+        let outcome = await fixture.monitor.tick(taskID: fixture.taskID)
+
+        guard case .stillWaiting = outcome else {
+            return XCTFail("明确额度耗尽且无法发送时应继续轮换, 实际: \(outcome)")
+        }
+        let rotationCalls = await fixture.rotation.callCount
+        let stillMonitoring = await fixture.monitor.isMonitoring(taskID: fixture.taskID)
+        XCTAssertEqual(rotationCalls, 1)
+        XCTAssertEqual(fixture.driver.sendCount, 0)
+        XCTAssertTrue(stillMonitoring)
+        XCTAssertEqual(
+            try fixture.services.tasks.fetch(id: fixture.taskID)?.status,
+            .waitingForAccount
+        )
+    }
+
+    func testUnconfirmedSendWithPersistentQuotaRotatesToNextAccount() async throws {
+        let fixture = try await makeFixture { driver in
+            driver.accountIssue = .quotaExhausted
+            driver.confirmation = .unconfirmed
+        }
+        try await armHandoff(fixture)
+
+        let outcome = await fixture.monitor.tick(taskID: fixture.taskID)
+
+        guard case .stillWaiting = outcome else {
+            return XCTFail("发送未确认且额度横幅仍在时应继续轮换, 实际: \(outcome)")
+        }
+        XCTAssertEqual(fixture.driver.sendCount, 1)
+        let rotationCalls = await fixture.rotation.callCount
+        let stillMonitoring = await fixture.monitor.isMonitoring(taskID: fixture.taskID)
+        XCTAssertEqual(rotationCalls, 1)
+        XCTAssertTrue(stillMonitoring)
+    }
+
+    func testSendFailureWithoutQuotaStillFailsClosed() async throws {
+        let fixture = try await makeFixture { driver in
+            driver.sendControlAvailable = false
+            driver.accountIssue = nil
+        }
+        try await armHandoff(fixture)
+
+        let outcome = await fixture.monitor.tick(taskID: fixture.taskID)
+
+        guard case .failed = outcome else {
+            return XCTFail("没有额度横幅时不得把发送错误解释为切号, 实际: \(outcome)")
+        }
+        let rotationCalls = await fixture.rotation.callCount
+        XCTAssertEqual(rotationCalls, 0)
     }
 
     // MARK: - 边界: 任务状态变化后自动停止监视

@@ -130,6 +130,15 @@ public enum CodexReasoningEffort: String, Codable, Sendable, Equatable, Hashable
         }
         return nil
     }
+
+    /// 从同一个思考程度弹层的可见文本中回读唯一档位。
+    /// “选择强度”等入口文案不会映射成档位；若同时出现两个不同档位，
+    /// 返回 nil，让调用方保持 fail-closed。
+    static func uniqueFromUILabels(_ labels: [String]) -> Self? {
+        let efforts = Set(labels.compactMap(fromUILabel))
+        guard efforts.count == 1 else { return nil }
+        return efforts.first
+    }
 }
 
 /// 从 Codex 模型按钮回读的可见状态。
@@ -172,7 +181,6 @@ public struct CodexExecutionSelection: Sendable, Equatable {
 ///
 /// ## ★ 这个模型里不存在任何认证信息 ★
 ///
-/// 没有 email、没有 password、没有 cookie、没有 session token、
 /// 没有 authentication storage。存的全是"如何在自己的 UI 里重新找到那个线程"
 /// 的可重建定位信息。
 ///
@@ -201,7 +209,7 @@ public struct CodexTaskBinding: Codable, Sendable, Identifiable, Equatable, Hash
     ///
     /// 每个 Chrome Profile 是**独立的登录环境**。用户在每个 profile 里手动登录一次后,
     /// session 长期有效。切换账号 = 用另一个 profile 打开 ChatGPT ——
-    /// **不读密码、不读 Cookie、不碰 token**, 只调用 Chrome 自己的 `--profile-directory`。
+    /// 只调用 Chrome 自己的 `--profile-directory`，凭据仍由对应 Profile 管理。
     public var chromeProfileDirectory: String?
 
     /// 重新识别同一线程所需的信号集合。

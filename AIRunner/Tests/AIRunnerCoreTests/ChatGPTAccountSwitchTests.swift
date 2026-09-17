@@ -258,6 +258,26 @@ final class ChatGPTAccountSwitchTests: XCTestCase {
         )
     }
 
+    func testOAuthBrowserAutomatorChoosesEmailCardOnCodexAccountChooser() throws {
+        let url = try XCTUnwrap(URL(string: "https://auth.openai.com/codex/choose-account"))
+        let controls = [
+            CodexOAuthBrowserAutomator.Control(
+                text: "Zpsksk rotated@example.com"
+            ),
+            CodexOAuthBrowserAutomator.Control(text: "登录至另一个账户"),
+            CodexOAuthBrowserAutomator.Control(text: "创建账户"),
+        ]
+
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.intendedAction(
+                url: url,
+                controls: controls,
+                pageText: "欢迎回来 选择一个账户以继续前往 Codex"
+            ),
+            .chooseAccount(0)
+        )
+    }
+
     func testOAuthBrowserAutomatorRefusesAmbiguousAccounts() throws {
         let url = try XCTUnwrap(URL(string: "https://auth.openai.com/choose-an-account"))
         let controls = [
@@ -283,6 +303,58 @@ final class ChatGPTAccountSwitchTests: XCTestCase {
         )
     }
 
+    func testOAuthBrowserAutomatorAllowsTheFirstPress() {
+        XCTAssertTrue(CodexOAuthBrowserAutomator.shouldPressAgain(attempt: nil))
+    }
+
+    func testOAuthBrowserAutomatorPrefersRealClickForWebCardsAndContinue() {
+        // Chromium 对 AXPress 可能返回 success 却不触发页面事件；
+        // 账号卡片与“继续”都必须真实点击优先、AXPress 兜底。
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.activationMethods(for: .chooseAccount(0)),
+            [.centerClick, .press]
+        )
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.activationMethods(for: .chooseWorkspaceAccount(3)),
+            [.centerClick, .press]
+        )
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.activationMethods(for: .continueWorkspace(1)),
+            [.centerClick, .press]
+        )
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.activationMethods(for: .continueConsent(2)),
+            [.centerClick, .press]
+        )
+        // 非点击类判定不得产生任何激活动作。
+        XCTAssertEqual(CodexOAuthBrowserAutomator.activationMethods(for: .wait), [])
+        XCTAssertEqual(CodexOAuthBrowserAutomator.activationMethods(for: .ambiguousAccounts), [])
+        XCTAssertEqual(CodexOAuthBrowserAutomator.activationMethods(for: .profileNotLoggedIn), [])
+    }
+
+    func testOAuthBrowserAutomatorBlocksImmediateRepress() {
+        let attempt = CodexOAuthBrowserAutomator.ActionAttempt(count: 1, lastAt: Date())
+        XCTAssertFalse(CodexOAuthBrowserAutomator.shouldPressAgain(attempt: attempt))
+    }
+
+    func testOAuthBrowserAutomatorAllowsOneCorrectionRetryAfterDelay() {
+        let attempt = CodexOAuthBrowserAutomator.ActionAttempt(
+            count: 1,
+            lastAt: Date().addingTimeInterval(
+                -CodexOAuthBrowserAutomator.actionRetryDelay - 1
+            )
+        )
+        XCTAssertTrue(CodexOAuthBrowserAutomator.shouldPressAgain(attempt: attempt))
+    }
+
+    func testOAuthBrowserAutomatorStopsAfterMaxAttempts() {
+        let attempt = CodexOAuthBrowserAutomator.ActionAttempt(
+            count: CodexOAuthBrowserAutomator.maxActionAttempts,
+            lastAt: Date().addingTimeInterval(-3_600)
+        )
+        XCTAssertFalse(CodexOAuthBrowserAutomator.shouldPressAgain(attempt: attempt))
+    }
+
     func testOAuthBrowserAutomatorContinuesCodexConsent() throws {
         let url = try XCTUnwrap(
             URL(string: "https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
@@ -297,6 +369,54 @@ final class ChatGPTAccountSwitchTests: XCTestCase {
                 url: url, controls: controls, pageText: "使用 ChatGPT 登录到 Codex"
             ),
             .continueConsent(1)
+        )
+    }
+
+    func testOAuthBrowserAutomatorChoosesWorkspaceAccountThenContinues() throws {
+        let url = try XCTUnwrap(URL(string: "https://chatgpt.com/workspace-selection"))
+        let accountControls = [
+            CodexOAuthBrowserAutomator.Control(text: "个人账户"),
+            CodexOAuthBrowserAutomator.Control(text: "继续"),
+        ]
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.intendedAction(
+                url: url, controls: accountControls,
+                pageText: "选择一个工作空间"
+            ),
+            .chooseWorkspaceAccount(0)
+        )
+
+        let selectedControls = [
+            CodexOAuthBrowserAutomator.Control(text: "个人账户", selected: true),
+            CodexOAuthBrowserAutomator.Control(text: "继续"),
+        ]
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.intendedAction(
+                url: url, controls: selectedControls,
+                pageText: "选择一个工作空间"
+            ),
+            .continueWorkspace(1)
+        )
+
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.intendedAction(
+                url: url,
+                controls: [.init(text: "继续")],
+                pageText: "选择一个工作空间 个人账户"
+            ),
+            .continueWorkspace(0)
+        )
+    }
+
+    func testOAuthBrowserAutomatorRecognizesChatGPTWorkspaceHost() throws {
+        let url = try XCTUnwrap(URL(string: "https://chatgpt.com/workspace-selection"))
+        XCTAssertEqual(
+            CodexOAuthBrowserAutomator.intendedAction(
+                url: url,
+                controls: [.init(text: "继续")],
+                pageText: "选择一个工作空间"
+            ),
+            .continueWorkspace(0)
         )
     }
 

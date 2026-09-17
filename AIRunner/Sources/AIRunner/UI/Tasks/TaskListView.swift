@@ -11,6 +11,7 @@ struct MainSplitView: View {
 
     @State private var selection: String?
     @State private var showingCreate = false
+    @State private var showingDiscussion = false
 
     var body: some View {
         NavigationSplitView {
@@ -32,8 +33,21 @@ struct MainSplitView: View {
                 )
             }
         }
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    showingDiscussion = true
+                } label: {
+                    Label("讨论组", systemImage: "bubble.left.and.bubble.right.fill")
+                }
+                .help("多账号 AI 讨论组: 多个 ChatGPT 账号扮演不同角色, 轮流发言后收敛决策")
+            }
+        }
         .sheet(isPresented: $showingCreate) {
             CreateTaskView(manager: manager, isPresented: $showingCreate)
+        }
+        .sheet(isPresented: $showingDiscussion) {
+            DiscussionHubView(services: services)
         }
         .onReceive(NotificationCenter.default.publisher(for: .airunnerCreateTask)) { _ in
             showingCreate = true

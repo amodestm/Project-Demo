@@ -10,8 +10,8 @@ import Foundation
 /// 分别登录了两个 ChatGPT 账号, 那么"切换账号"就等价于"用另一个 profile 打开网址" ——
 /// 不需要重新输入密码, 因为那个 profile 里的 session 早就是活的。
 ///
-/// 这一步**不读取任何凭据**: 不读密码、不读 Cookie、不读 token、不读账号邮箱。
-/// 它只是把浏览器自己的一个已有能力 (多 profile) 暴露给自动化流程。
+/// 这一步不读取密码；它只是把浏览器自己的一个已有能力 (多 profile)
+/// 暴露给自动化流程。
 public struct ChromeProfile: Sendable, Equatable, Identifiable {
     /// Chrome 内部目录名, 例如 `Default` / `Profile 1`。
     public let directoryName: String
@@ -24,6 +24,21 @@ public struct ChromeProfile: Sendable, Equatable, Identifiable {
         displayName.isEmpty ? directoryName : "\(displayName) (\(directoryName))"
     }
 
+    /// 讨论组默认用用户看到的 Profile 名称校验账号身份。
+    ///
+    /// 设置页已经确认过的邮箱别名最可靠；没有别名时使用 Chrome 里的
+    /// Profile 显示名称，最后才回退到内部目录名。只有实际邮箱与这个默认值
+    /// 不一致时，配置界面才需要用户另行输入。
+    public func preferredAccountIdentity(alias: String? = nil) -> String {
+        let trimmedAlias = alias?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedAlias.isEmpty { return trimmedAlias }
+
+        let trimmedDisplayName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedDisplayName.isEmpty { return trimmedDisplayName }
+
+        return directoryName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     public init(directoryName: String, displayName: String) {
         self.directoryName = directoryName
         self.displayName = displayName
@@ -33,8 +48,7 @@ public struct ChromeProfile: Sendable, Equatable, Identifiable {
 /// 扫描与启动 Chrome profile。
 ///
 /// 只读 Chrome 的 `Local State` 里**用户自己给 profile 起的名字**。
-/// 刻意**不读** `gaia_name` (Google 账号邮箱) —— 那属于账号身份信息,
-/// 本项目没有理由接触它。
+/// 账号邮箱由用户在 AIRunner 中确认后作为显示别名保存。
 public struct ChromeProfileScanner: Sendable {
 
     public enum ChromeKind: String, Sendable, CaseIterable {

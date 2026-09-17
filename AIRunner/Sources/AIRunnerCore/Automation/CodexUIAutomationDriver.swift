@@ -60,6 +60,7 @@ public struct CodexDriverConfiguration: Sendable, Equatable {
     public var quotaIssueHints: [String] = [
         "usage limit", "usage limits", "rate limit", "quota exceeded",
         "out of credits", "credits exhausted", "limit reached", "you've hit your limit",
+        "out of codex and work usage", "add credits or upgrade your plan",
         "monthly limit", "daily limit", "too many requests",
         "额度不足", "额度已用尽", "额度耗尽", "达到使用上限", "用量上限",
         "超出限额", "请求过多",
@@ -112,9 +113,10 @@ public struct CodexDriverConfiguration: Sendable, Equatable {
     /// 发送后观察 Composer 清空或消息提交的最长时间。
     public var sendConfirmationTimeout: TimeInterval = 5
 
-    /// 打开对话后 Electron 可能先保留旧页面树，再异步刷新主会话标题。
-    /// 标题读取在这段时间内只读重试，不输入、不点击、不发送。
-    public var threadContextTimeout: TimeInterval = 10
+    /// 打开对话或完成 OAuth 后 Electron 可能先保留登录页/旧页面树，
+    /// 再异步刷新主会话标题。标题读取在这段时间内只读重试，不输入、不发送。
+    /// 30 秒覆盖慢速登录回调和 Codex 冷启动；超时仍然 fail closed。
+    public var threadContextTimeout: TimeInterval = 30
 
     /// 登录后偶发出现的模型介绍弹窗。必须同时命中介绍语义和操作语义，
     /// 才允许在同一容器内寻找右上角关闭按钮。
@@ -882,6 +884,7 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
         // 避免把旧对话里孤立的一句“使用上限”重新当成当前信号。
         let currentQuotaBanner = meaningful.filter { text in
             let normalized = normalizeIssueText(text)
+            let explicitOutOfUsage = normalized.contains("out of codex and work usage")
             let upgrade = normalized.contains("升级套餐或充值额度以继续")
                 || normalized.contains("upgrade your plan to continue")
                 || normalized.contains("upgrade your plan")
@@ -889,7 +892,8 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
                 || normalized.contains("稍后再试")
                 || normalized.contains("try again")
                 || normalized.contains("retry")
-            return upgrade && retry
+                || normalized.contains("usage to reset")
+            return explicitOutOfUsage || (upgrade && retry)
         }
         for banner in currentQuotaBanner where !latest.contains(banner) {
             latest.append(banner)
@@ -1005,16 +1009,38 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
                 // 先走六点滑杆路径，避免把模型按钮再次点击成关闭动作。
                 try await setReasoningSlider(preference.reasoningEffort, in: app)
             } catch {
-                // 旧版仍可能把思考程度暴露为语义菜单；滑杆路径失败后才
-                // 回退到旧菜单，并在两条路径都要求最终回读确认。
-                Self.postEscape(to: app.processIdentifier)
-                try await openModelPicker(in: app)
-                try await openReasoningSubmenu(in: app, expected: preference.reasoningEffort)
-                try await pressUniqueMenuOption(
-                    labels: preference.reasoningEffort.uiLabels,
-                    missing: .reasoningOptionNotFound(preference.reasoningEffort.displayName),
-                    in: app
-                )
+                // Chromium 可能已经接收六点轨道点击，但 AX 树比画面晚刷新。
+                // 在进入旧菜单前再读取一次；画面已精确显示目标档位时直接
+                // 接受，避免随后错误地报告“列表中找不到高”。
+                let recovered = try? await readExecutionSelection(app)
+                if let recovered, recovered.matches(preference) {
+                    current = recovered
+                } else if modernReasoningInteractionIsVisible(in: app) {
+                    let actual = recovered.map { selection in
+                        guard let effort = selection.reasoningEffort else {
+                            return selection.visibleTitle
+                        }
+                        return "\(selection.visibleTitle) · \(effort.displayName)"
+                    }
+                    throw CodexAutomationError.modelSelectionFailed(
+                        expected: preference.displayName, actual: actual
+                    )
+                } else {
+                    // 旧版仍可能把思考程度暴露为语义菜单；只有现代滑杆未能
+                    // 精确回读时才回退，并继续要求最终回读确认。
+                    Self.postEscape(to: app.processIdentifier)
+                    try await openModelPicker(in: app)
+                    try await openReasoningSubmenu(
+                        in: app, expected: preference.reasoningEffort
+                    )
+                    try await pressUniqueMenuOption(
+                        labels: preference.reasoningEffort.uiLabels,
+                        missing: .reasoningOptionNotFound(
+                            preference.reasoningEffort.displayName
+                        ),
+                        in: app
+                    )
+                }
             }
             guard let selected = try await waitForSelection(
                 in: app, matching: { $0.matches(preference) }
@@ -1258,33 +1284,9 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
         picker: AXUIElement? = nil,
         control: AXUIElement? = nil
     ) -> AXUIElement? {
-        let anchor = picker ?? control
-        guard let anchorFrame = anchor.flatMap(CodexLoginAutomator.frame(of:)) else {
-            return nil
-        }
-        var budget = configuration.traversalNodeBudget
-        let groups = collectElements(
-            in: surface,
-            matching: ["AXGroup"],
-            maxDepth: configuration.traversalMaxDepth,
-            budget: &budget,
-            containerRole: nil
-        )
-        let popovers = groups.compactMap { group -> (AXUIElement, CGRect)? in
-            guard let frame = CodexLoginAutomator.frame(of: group),
-                  frame.width >= max(120, anchorFrame.width * 1.5),
-                  frame.height >= 60, frame.height <= 360,
-                  frame.maxY >= anchorFrame.minY - 8,
-                  frame.minY <= anchorFrame.minY + 8,
-                  frame.midX >= anchorFrame.minX - frame.width * 0.25,
-                  frame.midX <= anchorFrame.maxX + frame.width * 0.25,
-                  supportsAction(group, action: "AXCancel")
-            else { return nil }
-            return (group, frame)
-        }
-        guard let popover = popovers.min(by: { $0.1.height < $1.1.height }) else {
-            return nil
-        }
+        guard let popover = reasoningPopover(
+            in: surface, picker: picker, control: control
+        ) else { return nil }
 
         var innerBudget = configuration.traversalNodeBudget
         let tracks = collectElements(
@@ -1309,6 +1311,41 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
         }.first?.0
     }
 
+    /// 返回模型控件附近、带 AXCancel 动作的唯一强度弹层。
+    /// 这个范围同时用于轨道定位和已选档位回读，避免把弹层外的正文文字
+    /// 或底部“选择强度”入口当成当前档位。
+    private func reasoningPopover(
+        in surface: AXUIElement,
+        picker: AXUIElement? = nil,
+        control: AXUIElement? = nil
+    ) -> (AXUIElement, CGRect)? {
+        let anchor = picker ?? control
+        guard let anchorFrame = anchor.flatMap(CodexLoginAutomator.frame(of:)) else {
+            return nil
+        }
+        var budget = configuration.traversalNodeBudget
+        let groups = collectElements(
+            in: surface,
+            matching: ["AXGroup"],
+            maxDepth: configuration.traversalMaxDepth,
+            budget: &budget,
+            containerRole: nil
+        )
+        let popovers = groups.compactMap { group -> (AXUIElement, CGRect)? in
+            guard let frame = CodexLoginAutomator.frame(of: group),
+                  frame.width >= max(120, anchorFrame.width * 1.5),
+                  frame.height >= 60, frame.height <= 360,
+                  frame.maxY >= anchorFrame.minY - 8,
+                  frame.minY <= anchorFrame.minY + 8,
+                  frame.midX >= anchorFrame.minX - frame.width * 0.25,
+                  frame.midX <= anchorFrame.maxX + frame.width * 0.25,
+                  supportsAction(group, action: "AXCancel")
+            else { return nil }
+            return (group, frame)
+        }
+        return popovers.min(by: { $0.1.height < $1.1.height })
+    }
+
     private func reasoningTracks(
         in app: CodexAppHandle,
         picker: AXUIElement? = nil,
@@ -1318,6 +1355,22 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
         return deduplicateByFrame(contentSurfaces(of: root).compactMap {
             reasoningTrack(in: $0, picker: picker, control: control)
         })
+    }
+
+    /// 判断当前是否已经展开现代六点滑杆弹层。只要这个表面存在，失败就应
+    /// 保留为精确回读失败，不能再误走旧版语义菜单并报告“列表中找不到”。
+    private func modernReasoningInteractionIsVisible(in app: CodexAppHandle) -> Bool {
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        let surfaces = contentSurfaces(of: root)
+        let picker = surfaces.flatMap { modelPickers(in: $0) }.first
+        guard let picker else { return false }
+        if !reasoningSliders(in: app, picker: picker).isEmpty
+            || !reasoningTracks(in: app, picker: picker).isEmpty {
+            return true
+        }
+        return surfaces.contains {
+            reasoningPopover(in: $0, picker: picker) != nil
+        }
     }
 
     private func rawNumber(_ element: AXUIElement, _ attribute: String) -> Double? {
@@ -1409,18 +1462,30 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
     private func visibleReasoningEffort(
         in surfaces: [AXUIElement], picker: AXUIElement
     ) -> CodexReasoningEffort? {
+        // 新版六点弹层的底部入口仍显示“选择强度”，真正选中的档位只在
+        // 弹层顶部显示（例如“极高”）。弹层打开时必须优先读取顶部档位，
+        // 否则下面的入口/选项节点可能让已经选中的“高”继续落入旧菜单分支。
+        // 只读取已经由几何与 AXCancel 动作锁定的弹层；档位不唯一时返回 nil。
         for surface in surfaces {
-            for control in reasoningControls(in: surface, picker: picker) {
-                let values = [
+            guard let popover = reasoningPopover(in: surface, picker: picker) else {
+                continue
+            }
+            let texts = allTexts(of: popover.0, maxDepth: 8)
+            if let effort = CodexReasoningEffort.uniqueFromUILabels(texts) {
+                return effort
+            }
+        }
+
+        for surface in surfaces {
+            let labels = reasoningControls(in: surface, picker: picker).flatMap { control in
+                [
                     string(control, kAXTitleAttribute),
                     string(control, kAXDescriptionAttribute),
                     string(control, kAXValueAttribute),
                 ].compactMap { $0 }
-                for value in values {
-                    if let effort = CodexReasoningEffort.fromUILabel(value) {
-                        return effort
-                    }
-                }
+            }
+            if let effort = CodexReasoningEffort.uniqueFromUILabels(labels) {
+                return effort
             }
         }
         return nil
@@ -1615,6 +1680,14 @@ public struct CodexUIAutomationDriver: CodexUIAutomationDriving {
         if reasoningSliders(in: app, picker: picker, control: control).isEmpty
             && reasoningTracks(in: app, picker: picker, control: control).isEmpty {
             try await openReasoningPicker(in: app)
+        }
+
+        // 打开弹层后先回读顶部档位。目标本来就是“高”时无需再次点击，
+        // 也不能因为六点轨道没有语义菜单项而回退去搜索一个不存在的列表。
+        if let selection = try? await readExecutionSelection(app),
+           selection.reasoningEffort == effort
+            || selectionTitleMatchesEffort(selection.visibleTitle, effort) {
+            return
         }
 
         let sliderDeadline = Date().addingTimeInterval(configuration.reasoningSelectionTimeout)

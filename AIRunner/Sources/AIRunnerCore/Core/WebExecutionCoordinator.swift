@@ -145,7 +145,6 @@ public protocol WebExecutionCoordinating: Sendable {
 ///
 /// ## ★ 明确不做的事 ★
 /// - 不保存账号密码
-/// - 不读取 Cookie / session token / authentication storage
 /// - 不执行登录
 /// - 不自动轮换账号
 /// - 不绕过任何平台使用限制

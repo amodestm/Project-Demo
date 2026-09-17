@@ -31,7 +31,7 @@ public struct BrowserWindowInfo: Sendable, Equatable {
 /// ## ★ 只用 AX 属性, 不碰网页内容 ★
 ///
 /// 读窗口标题 (`kAXTitleAttribute`) 与 `AXRaise` 都是系统无障碍 API 的
-/// 正常窗口管理操作。不读取页面 DOM、不读 Cookie、不注入脚本。
+/// 正常窗口管理操作。
 public struct BrowserWindowLocator: Sendable {
 
     public init() {}

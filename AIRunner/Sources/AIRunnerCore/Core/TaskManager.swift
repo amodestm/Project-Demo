@@ -848,7 +848,9 @@ public final class TaskManager: ObservableObject {
         guard !isRotatingAccount else { return }
         isRotatingAccount = true
         lastErrorMessage = nil
-        lastInfoMessage = "正在确认 Codex 已停止生成…"
+        lastInfoMessage = task.status == .waitingForAccount
+            ? "正在继续上次未完成的账号切换…"
+            : "正在确认 Codex 已停止生成…"
 
         Task { [weak self] in
             guard let self else { return }
@@ -980,7 +982,7 @@ public final class TaskManager: ObservableObject {
     /// ★ 一键自动切换账号 (Chrome Profile 模式, 备用) ★
     ///
     /// 流程: 选下一个 profile → 用它打开 ChatGPT → AX 把窗口调到前台。
-    /// 全程不碰密码 / Cookie —— 用户事先在每个 profile 里登录好账号即可。
+    /// 用户事先在每个 Profile 里登录好账号即可。
     ///
     /// 切换成功后:
     /// - 若任务在 `waitingForAccount`: 自动从检查点恢复执行

@@ -29,7 +29,7 @@ public enum ExecutionMode: String, Codable, Sendable, CaseIterable, Identifiable
     /// 暂停与恢复、崩溃恢复。自动化无法确认时可以降级为手工回填。
     /// 账号受限时可使用 macOS Keychain 中由用户保存的凭据登录下一个账号。
     ///
-    /// 程序**不做**: 读 Cookie / 读 session token / 绕过验证码、两步验证或安全挑战。
+    /// 程序不绕过验证码、两步验证或安全挑战。
     case chatGPTWeb = "chatgpt_web"
 
     /// 可选后端: 官方 API 直连。
