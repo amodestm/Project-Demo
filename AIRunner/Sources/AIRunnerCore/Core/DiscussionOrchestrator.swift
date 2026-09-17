@@ -27,10 +27,15 @@ public final class DiscussionOrchestrator: ObservableObject {
 
     // MARK: - 依赖
 
-    public let group: DiscussionGroup
+    @Published public private(set) var group: DiscussionGroup
     private let sessions: DiscussionSessionProviding
     private let repository: DiscussionRepository?
     private let logger: LoggerService
+
+    public func updateGroup(_ newGroup: DiscussionGroup) {
+        guard !isRunning else { return }
+        self.group = newGroup
+    }
 
     private var cancelled = false
 
@@ -171,11 +176,11 @@ public final class DiscussionOrchestrator: ObservableObject {
         )
         if finishedKeys.contains("\(roundIndex)-\(speaker.id)") { return }
         if utterances.contains(where: {
-            $0.roundIndex == roundIndex && $0.participantID == speaker.id
+            $0.roundIndex == roundIndex && $0.participantID == speaker.id && $0.status != .failed
         }) {
             throw AppError.invalidRequest(
-                "成员「\(speaker.displayName)」本轮已有未完成的发送记录。"
-                + "为避免崩溃恢复后重复发送，请开始一场新讨论。"
+                "成员「\(speaker.displayName)」本轮已有进行中的发送记录。"
+                + "为避免并发冲突，请等待完成后再试。"
             )
         }
 
@@ -196,14 +201,26 @@ public final class DiscussionOrchestrator: ObservableObject {
 
         let prompt = buildPrompt(round: round, speaker: speaker)
 
-        var utterance = DiscussionUtterance(
-            runID: run.id,
-            roundIndex: roundIndex,
-            participantID: speaker.id,
-            promptSent: prompt,
-            status: .pending
-        )
-        try repository?.insert(utterance)
+        var utterance: DiscussionUtterance
+        if let existing = utterances.first(where: {
+            $0.roundIndex == roundIndex && $0.participantID == speaker.id
+        }) {
+            utterance = existing
+            utterance.promptSent = prompt
+            utterance.status = .pending
+            utterance.completedAt = nil
+            utterance.responseText = nil
+            try repository?.update(utterance)
+        } else {
+            utterance = DiscussionUtterance(
+                runID: run.id,
+                roundIndex: roundIndex,
+                participantID: speaker.id,
+                promptSent: prompt,
+                status: .pending
+            )
+            try repository?.insert(utterance)
+        }
         refresh(utterance)
 
         // UI: 这个成员开始"思考"
@@ -341,7 +358,7 @@ public final class DiscussionOrchestrator: ObservableObject {
         }
 
         parts.append(
-            "【要求】直接给出你的判断与理由, 不要复述他人观点, 300 字以内。"
+            "【要求】开启深度思考/高推理模式（High Reasoning Effort），充分推演反方抗辩与极端边界场景；直接给出你的判断与核心论据，不要复述他人观点，逻辑严密，直击要害。"
         )
         return parts.joined(separator: "\n\n")
     }

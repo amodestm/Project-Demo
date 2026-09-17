@@ -324,8 +324,8 @@ public actor CodexOAuthBrowserAutomator: CodexOAuthBrowserAutomating {
         // ★ 只在网页内容子树里找控件。★
         //
         // Chrome 窗口的 AX 树同时包含浏览器自己的工具栏，而 Chrome 的个人资料
-        // 按钮文案就是 profile 名 —— 本项目里 profile 名就是账号邮箱
-        // （例如 critic@example.com）。若从窗口根节点开始扫描，这个浏览器
+        // 按钮文案就是 profile 名 —— 很多用户的 profile 名直接就是账号邮箱
+        // （例如 user@example.com）。若从窗口根节点开始扫描，这个浏览器
         // 按钮会被当成「账号候选」按下，弹出 Chrome 个人资料菜单，整轮授权就此
         // 卡死，且永远不会推进。把扫描根限定为 AXWebArea 后，浏览器工具栏不再
         // 进入候选集，账号卡片仍可被正常识别。

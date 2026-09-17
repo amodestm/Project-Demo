@@ -9,6 +9,7 @@ macOS 上的 **AI 长任务自动执行器**。把一个跑几小时甚至几天
 - **零点击账号切换**：某账号额度耗尽 / 限流 / 卡死时，自动切到下一个可用账号并继续，全程无需人工点击。
 - **ChatGPT 网页端自动执行**：通过 macOS 辅助功能（AX）API 驱动网页端——生成自包含续跑 Prompt → 自动提交 → 自动读回 → 校验 → 原子推进检查点（无 AX 权限时可降级为剪贴板手工模式）。
 - **多账号轮换**：在设置的多个 Chrome Profile 间循环，官方 OAuth 授权成功后才推进账号指针；失败不会提前推进检查点。
+- **多账号 AI 讨论组**：把多个已登录账号组成讨论组，各自扮演**立场互斥**的角色，按可配置议程「独立论述 → 交叉质询 → 收敛决策」产出最终决策。身份校验 fail-closed，每条发言收到即落盘。详见 [docs/AI_DISCUSSION.md](./docs/AI_DISCUSSION.md)。
 - **崩溃恢复 & 幂等**：同一任务同时只一个执行器；已完成的步骤在 SQL 层就查不到，重复启动不会重复跑；fallback 不会 A→B→A 循环。
 - **原生驱动，不用网页自动化框架**：采用原生 macOS AX API 操作 UI（而非 Selenium / Playwright）。
 - **零外部依赖**：纯 SwiftPM 工程，Xcode 直接打开即可构建，无需 resolve 任何 package。
@@ -32,6 +33,19 @@ macOS 上的 **AI 长任务自动执行器**。把一个跑几小时甚至几天
 | 通过 AX 自动提交、自动读回、自动切号 | |
 | 检测到额度/登录异常且任务已停止时自动切换账号 | |
 | 崩溃恢复 / 不重复已完成的工作 | |
+
+## 多账号 AI 讨论组
+
+讨论组是 AIRunner 的第二条执行线：不追求「一个任务跑到底」，而是让多个账号**互相质询后给出决策**。
+
+- **角色互斥**：每个成员绑定一个已登录的 Chrome Profile，并持有一段只允许站在单一立场的角色设定。内置批判者 / 成本专家 / 乐观派 / 用户代言人 / 风险官 / 执行者六套模板——所有账号背后都是同一个 ChatGPT，角色不互斥就会退化成互相附和。
+- **议程可配**：独立论述 → 交叉质询 → 收敛决策。每轮可单独设置**发言人顺序**与**可见性**（不看他人 / 看他人 / 看全部）；独立论述轮故意不喂他人观点，避免被带节奏。
+- **收敛方式可配**：主席汇总 / 多数投票 / 一致同意 / 主席独裁。投票规则下强制成员在最后一行输出 `VOTE: YES` / `VOTE: NO`，并保证同轮后投票者看不到前人的票。
+- **两条铁律**：**身份校验 fail closed**（窗口账号与成员不匹配立即停止整场讨论，绝不发错人）；**发言收到即落盘**（崩溃、强杀后从最后一条完成的发言续跑，不重复、不重跑已推进的轮次）。
+- **两种执行模式**：真实 Chrome 会话 / 脚本演示（离线跑通流程）。模式不会被静默切换——成员未绑定账号时直接报错，不会偷偷降级冒充真实讨论。
+- **一键分配账号**：从本地检测到的 Chrome Profile 中自动为各成员分配不同账号，可随机换一批避开失效账号。
+
+完整说明（配置模型、轮次与可见性、收敛规则、审计与持久化）：**[docs/AI_DISCUSSION.md](./docs/AI_DISCUSSION.md)**
 
 ## 快速开始
 
@@ -57,6 +71,7 @@ open dist/AIRunner.app
 2. 在 Chrome 中建立至少两个 Profile，并在每个 Profile 分别登录一个 ChatGPT 账号。
 3. 在「Codex 自动恢复」中重新检测并勾选这些 Profile；授予 AIRunner「辅助功能」权限。
 4. 回主界面 `⌘N` 新建任务；创建后保持「排队中」，在任务详情点击「开始执行」才会登录并执行。
+5. 想用讨论组：主界面打开「讨论组」→ 新建 → 在「配置」里填写议题并点「一键分配」绑定 Chrome 账号 → 选好会话模式后点「开始讨论」。
 
 ### 数据位置
 
@@ -75,6 +90,11 @@ UI (SwiftUI) → TaskManager → JobRunner(actor)
                               ├─ RecoveryManager      崩溃恢复
                               ├─ ResponseValidator    结果校验
                               └─ Web / API 执行通道（共用持久化与编排）
+
+UI (SwiftUI) → DiscussionHubView → DiscussionOrchestrator
+                              ├─ RoutingDiscussionSessionProvider  真实 Chrome / 脚本演示路由
+                              └─ ChromeDiscussionSession           锁窗 · 身份校验 · 提交 · 读回
+
 Repositories → Database(系统 SQLite3, 原子提交) → KeychainManager · LoggerService(脱敏)
 ```
 
@@ -82,6 +102,7 @@ Repositories → Database(系统 SQLite3, 原子提交) → KeychainManager · L
 
 ## 隐私与安全
 
+- 不读取、导出或注入浏览器 Cookie / session token；切换的是你合法持有的账号，复用 Profile 中已有的网页登录。
 - 凭据只写入 macOS Keychain；任务 / 设置 / 数据库 / 日志只保存非敏感记录 ID，日志经 `SecretRedactor` 强制脱敏。
 - 遇到验证码 / 人机验证 / 2FA 会停止并提示你处理，不尝试绕过。
-- 网络层使用临时会话配置，不落盘缓存。
+- 网络层使用临时会话配置，不落盘缓存、不写 cookie。

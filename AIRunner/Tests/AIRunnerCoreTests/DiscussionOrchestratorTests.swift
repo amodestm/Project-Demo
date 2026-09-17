@@ -306,6 +306,203 @@ final class DiscussionOrchestratorTests: XCTestCase {
             promptSent: "duplicate"
         )))
     }
+
+    func testRoutingProviderRejectsUnboundParticipantInRealChromeMode() async {
+        let participant = DiscussionParticipant(
+            displayName: "未绑定成员",
+            rolePrompt: "角色",
+            profileDirectory: "",
+            emailHint: ""
+        )
+        let router = RoutingDiscussionSessionProvider(
+            mode: .realChrome,
+            realProvider: WrongIdentityProvider(),
+            scriptedProvider: ScriptedSessionProvider(sessions: [:])
+        )
+
+        do {
+            _ = try await router.session(for: participant)
+            XCTFail("真实模式下未绑定 Profile 的成员必须抛出错误，不能静默放行或冒充")
+        } catch let error as AppError {
+            XCTAssertTrue(error.userMessage.contains("未绑定 Chrome Profile"))
+        } catch {
+            XCTFail("预期抛出 AppError，实际抛出: \(error)")
+        }
+    }
+
+    func testRoutingProviderAllowsParticipantInDemoMode() async throws {
+        let participant = DiscussionParticipant(
+            displayName: "演示成员",
+            rolePrompt: "角色",
+            profileDirectory: "",
+            emailHint: ""
+        )
+        let group = DiscussionGroup(
+            name: "演示组",
+            topic: "议题",
+            participants: [participant]
+        )
+        let router = RoutingDiscussionSessionProvider(
+            mode: .demo,
+            realProvider: WrongIdentityProvider(),
+            scriptedProvider: ScriptedSessionProvider(group: group)
+        )
+
+        let session = try await router.session(for: participant)
+        let response = try await session.send(prompt: "测试")
+        XCTAssertTrue(response.contains("脚本回复") || response.contains("观点"))
+    }
+
+    func testOrchestratorUpdateGroupUpdatesConfiguration() throws {
+        let group = makeGroup()
+        let orch = try makeOrchestrator(
+            group: group,
+            sessions: ScriptedSessionProvider(group: group)
+        )
+        var updated = group
+        updated.topic = "新更新的议题"
+
+        orch.updateGroup(updated)
+        XCTAssertEqual(orch.group.topic, "新更新的议题")
+    }
+
+    func testPasteboardGuardRestoresOriginalContent() {
+        let pb = NSPasteboard.general
+        let original = "original_clipboard_text_\(UUID().uuidString)"
+        pb.clearContents()
+        pb.setString(original, forType: .string)
+
+        func doAutomatedTask() {
+            let guardPB = PasteboardGuard()
+            defer { guardPB.restore() }
+            pb.clearContents()
+            pb.setString("temporary_automation_prompt", forType: .string)
+            XCTAssertEqual(pb.string(forType: .string), "temporary_automation_prompt")
+        }
+
+        doAutomatedTask()
+        XCTAssertEqual(pb.string(forType: .string), original, "离开作用域后剪贴板必须恢复原样")
+    }
+
+    func testCopyButtonMatchingIncludesChineseReplyAndExcludesMessage() {
+        func matchesAssistantReply(_ text: String) -> Bool {
+            let normalized = text.lowercased().split(whereSeparator: \Character.isWhitespace).joined(separator: " ")
+            if normalized.contains("消息") || normalized.contains("message") || normalized.contains("提示")
+                || normalized.contains("prompt") || normalized.contains("代码") || normalized.contains("code") {
+                return false
+            }
+            return normalized.contains("复制回复")
+                || normalized.contains("复制回答")
+                || normalized.contains("copy response")
+                || normalized.contains("copy reply")
+                || normalized == "复制"
+                || normalized == "copy"
+        }
+
+        XCTAssertTrue(matchesAssistantReply("复制回复"), "必须匹配中文网页的复制回复")
+        XCTAssertTrue(matchesAssistantReply("复制回答"), "必须匹配中文网页的复制回答")
+        XCTAssertTrue(matchesAssistantReply("Copy response"), "必须匹配英文网页的 Copy response")
+        XCTAssertTrue(matchesAssistantReply("Copy reply"), "必须匹配英文网页的 Copy reply")
+        XCTAssertTrue(matchesAssistantReply("复制"), "必须匹配简短的复制")
+
+        XCTAssertFalse(matchesAssistantReply("复制消息"), "必须排除用户提问的复制消息")
+        XCTAssertFalse(matchesAssistantReply("Copy message"), "必须排除用户提问的 Copy message")
+        XCTAssertFalse(matchesAssistantReply("复制代码"), "必须排除代码块复制按钮")
+        XCTAssertFalse(matchesAssistantReply("Copy code"), "必须排除代码块复制按钮")
+    }
+
+    func testComposerEmptyOrPlaceholderDetection() {
+        func isComposerEmptyOrPlaceholder(_ text: String) -> Bool {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { return true }
+            let lower = trimmed.lowercased()
+            let placeholders = [
+                "问问 chatgpt", "message chatgpt", "ask chatgpt",
+                "给 chatgpt 发送消息", "向 chatgpt 发送消息", "与 chatgpt 聊天",
+                "问问"
+            ]
+            return placeholders.contains { lower == $0 || lower.contains($0) }
+        }
+
+        XCTAssertTrue(isComposerEmptyOrPlaceholder(""), "空字符串应判定为空")
+        XCTAssertTrue(isComposerEmptyOrPlaceholder("   "), "空白字符应判定为空")
+        XCTAssertTrue(isComposerEmptyOrPlaceholder("问问 ChatGPT"), "中文占位符应判定为空")
+        XCTAssertTrue(isComposerEmptyOrPlaceholder("Message ChatGPT"), "英文占位符应判定为空")
+        XCTAssertTrue(isComposerEmptyOrPlaceholder("Ask ChatGPT"), "英文 Ask 占位符应判定为空")
+
+        XCTAssertFalse(isComposerEmptyOrPlaceholder("真正的内容草稿"), "实际用户输入的草稿不应被当作占位符")
+        XCTAssertFalse(isComposerEmptyOrPlaceholder("这是我的论点：..."), "实际用户输入的草稿不应被当作占位符")
+    }
+
+    func testFailedUtteranceCanBeRetriedWithoutError() async throws {
+        let services = try TestSupport.makeServices()
+        let repo = services.discussionRepo
+        let group = makeGroup()
+        try repo.save(group)
+
+        let run = DiscussionRun(groupID: group.id)
+        try repo.save(run)
+
+        let first = group.enabledParticipants[0]
+        // 模拟前一次发送因网络或窗口问题标记为 failed
+        let failedUtterance = DiscussionUtterance(
+            runID: run.id,
+            roundIndex: 0,
+            participantID: first.id,
+            promptSent: "failed prompt",
+            status: .failed
+        )
+        try repo.insert(failedUtterance)
+
+        let provider = ScriptedSessionProvider(group: group, replyDelay: .zero)
+        let orch = DiscussionOrchestrator(
+            group: group,
+            sessions: provider,
+            repository: repo,
+            logger: services.logger,
+            run: run
+        )
+        orch.loadHistory()
+
+        // 重试应该成功，不应报“本轮已有未完成的发送记录”
+        await orch.start()
+
+        XCTAssertEqual(orch.run.state, .converged)
+        let firstUtterances = orch.utterances.filter { $0.roundIndex == 0 && $0.participantID == first.id }
+        XCTAssertEqual(firstUtterances.count, 1, "重试后同一轮同一人应该只有一条记录")
+        XCTAssertEqual(firstUtterances.first?.status, .received, "状态应更新为 received")
+    }
+
+    func testCombineContentPartsSmartFormatting() {
+        let parts = [
+            "如果只算",
+            "Bilibili 这个岗位",
+            "，最后一版就是：",
+            "《项目内容强化版》",
+            "建议采取如下方案：",
+            "1. 强化分析指标",
+            "2. 压缩项目篇幅"
+        ]
+        let combined = AX.combineContentParts(parts)
+        XCTAssertTrue(combined.contains("如果只算Bilibili 这个岗位，最后一版就是："))
+        XCTAssertTrue(combined.contains("1. 强化分析指标\n2. 压缩项目篇幅"))
+        XCTAssertFalse(combined.contains("\n，"), "中文标点前不应产生孤立换行")
+    }
+
+    func testThinkingPlaceholdersRejectedAsValidResponse() {
+        let prompt = "【议题】测试议题"
+        // 必须拒绝思考中间态
+        XCTAssertFalse(AX.isValidAssistantResponse("正在思考", prompt: prompt))
+        XCTAssertFalse(AX.isValidAssistantResponse("Thinking...", prompt: prompt))
+        XCTAssertFalse(AX.isValidAssistantResponse("已思考 3 秒", prompt: prompt))
+        XCTAssertFalse(AX.isValidAssistantResponse("●", prompt: prompt))
+        XCTAssertFalse(AX.isValidAssistantResponse("Something went wrong while generating the response.", prompt: prompt))
+        XCTAssertFalse(AX.isValidAssistantResponse(prompt, prompt: prompt))
+
+        // 真实正文必须通过
+        let realResponse = "我的判断是：AIDD短期最可能提升的是靶点筛选与分子生成。"
+        XCTAssertTrue(AX.isValidAssistantResponse(realResponse, prompt: prompt))
+    }
 }
 
 // MARK: - 测试替身

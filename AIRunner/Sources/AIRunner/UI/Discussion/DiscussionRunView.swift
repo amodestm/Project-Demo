@@ -12,8 +12,9 @@ struct DiscussionRunView: View {
 
     let services: AppServices
     let onGroupUpdated: ((DiscussionGroup) -> Void)?
-    private let usingRealChrome: Bool
+    private let sessionRouter: RoutingDiscussionSessionProvider
     @State private var group: DiscussionGroup
+    @State private var executionMode: RoutingDiscussionSessionProvider.Mode
 
     @StateObject private var orchestrator: DiscussionOrchestrator
 
@@ -29,19 +30,18 @@ struct DiscussionRunView: View {
         self.services = services
         self.onGroupUpdated = onGroupUpdated
         self._group = State(initialValue: group)
-        let realChrome = group.enabledParticipants.count >= 2
-            && group.enabledParticipants.allSatisfy {
-                !$0.profileDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    && !$0.emailHint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
-        self.usingRealChrome = realChrome
+        self._executionMode = State(initialValue: .realChrome)
+        let router = RoutingDiscussionSessionProvider(
+            mode: .realChrome,
+            realProvider: services.discussionSessions,
+            scriptedProvider: ScriptedSessionProvider(group: group)
+        )
+        self.sessionRouter = router
         let resumedRun = (try? services.discussionRepo.latestRun(groupID: group.id))
             .flatMap { $0.state.isTerminal ? nil : $0 }
         self._orchestrator = StateObject(wrappedValue: DiscussionOrchestrator(
             group: group,
-            sessions: realChrome
-                ? services.discussionSessions
-                : ScriptedSessionProvider(group: group),
+            sessions: router,
             repository: services.discussionRepo,
             logger: services.logger,
             run: resumedRun
@@ -62,6 +62,8 @@ struct DiscussionRunView: View {
         .sheet(isPresented: $showingConfig) {
             DiscussionConfigView(services: services, group: $group) { updated in
                 group = updated
+                orchestrator.updateGroup(updated)
+                sessionRouter.updateScriptedGroup(updated)
                 onGroupUpdated?(updated)
             }
         }
@@ -72,6 +74,11 @@ struct DiscussionRunView: View {
             Button("好") { errorMessage = nil }
         } message: {
             Text(errorMessage ?? "")
+        }
+        .onChange(of: orchestrator.run.errorMessage) { _, newMsg in
+            if let newMsg, !newMsg.isEmpty {
+                errorMessage = newMsg
+            }
         }
     }
 
@@ -92,6 +99,17 @@ struct DiscussionRunView: View {
             }
 
             Spacer()
+
+            Picker("会话模式", selection: $executionMode) {
+                Text("真实 Chrome").tag(RoutingDiscussionSessionProvider.Mode.realChrome)
+                Text("脚本演示").tag(RoutingDiscussionSessionProvider.Mode.demo)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 170)
+            .controlSize(.small)
+            .onChange(of: executionMode) { _, newMode in
+                sessionRouter.mode = newMode
+            }
 
             statusPill
 
@@ -173,13 +191,13 @@ struct DiscussionRunView: View {
                 }
                 .padding(16)
             }
-            .onChange(of: orchestrator.utterances.count) { _ in
+            .onChange(of: orchestrator.utterances.count) { _, _ in
                 scrollToLatest(proxy)
             }
-            .onChange(of: orchestrator.thinkingParticipantID ?? "") { _ in
+            .onChange(of: orchestrator.thinkingParticipantID ?? "") { _, _ in
                 scrollToLatest(proxy)
             }
-            .onChange(of: orchestrator.run.finalDecision ?? "") { _ in
+            .onChange(of: orchestrator.run.finalDecision ?? "") { _, _ in
                 withAnimation { proxy.scrollTo("decision", anchor: .bottom) }
             }
         }
@@ -241,10 +259,28 @@ struct DiscussionRunView: View {
                     discussionTask?.cancel()
                     orchestrator.cancel()
                 }
-                    .buttonStyle(.bordered)
+                .buttonStyle(.bordered)
+            } else if orchestrator.run.state == .failed {
+                Button {
+                    orchestrator.resetForNewRun()
+                    discussionTask = Task { await orchestrator.start() }
+                } label: {
+                    Label("重新开始", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .disabled(startButtonDisabled)
+
+                Button {
+                    discussionTask = Task { await orchestrator.start() }
+                } label: {
+                    Label("重试本次讨论", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(startButtonDisabled)
+                .help(topicPlaceholder)
             } else {
                 Button {
-                    if orchestrator.run.state == .converged {
+                    if orchestrator.run.state == .converged || orchestrator.run.state == .cancelled {
                         orchestrator.resetForNewRun()
                     }
                     discussionTask = Task { await orchestrator.start() }
@@ -255,7 +291,7 @@ struct DiscussionRunView: View {
                     )
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(group.enabledParticipants.isEmpty || group.topic.isEmpty)
+                .disabled(startButtonDisabled)
                 .help(topicPlaceholder)
             }
         }
@@ -263,41 +299,68 @@ struct DiscussionRunView: View {
         .padding(.vertical, 12)
     }
 
-    private var topicPlaceholder: String {
-        if group.topic.isEmpty { return "请先在「配置」里填写议题" }
-        if group.enabledParticipants.isEmpty { return "请先在「配置」里添加至少一个启用成员" }
-        return "按议程开始讨论"
+    private var unconfiguredParticipants: [DiscussionParticipant] {
+        group.enabledParticipants.filter {
+            $0.profileDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || $0.emailHint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
     }
 
-    /// 明确标注当前用的是脚本化会话, 避免误以为真的在调用 ChatGPT。
-    private var demoBadge: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "theatermasks.fill")
-            Text("演示会话（脚本回复）")
+    private var isRealChromeReady: Bool {
+        group.enabledParticipants.count >= 2 && unconfiguredParticipants.isEmpty
+    }
+
+    private var startButtonDisabled: Bool {
+        if group.enabledParticipants.isEmpty || group.topic.isEmpty { return true }
+        if executionMode == .realChrome && !isRealChromeReady { return true }
+        return false
+    }
+
+    private var topicPlaceholder: String {
+        if group.topic.isEmpty { return "请先在「配置」里填写议题" }
+        if group.enabledParticipants.count < 2 { return "请先在「配置」里添加至少两位启用成员" }
+        if executionMode == .realChrome && !isRealChromeReady {
+            let names = unconfiguredParticipants.map(\.displayName).joined(separator: "、")
+            return "成员「\(names)」尚未绑定 Chrome Profile，请点击「配置」一键分配账号"
         }
-        .font(.caption2)
-        .foregroundStyle(.orange)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Color.orange.opacity(0.12), in: Capsule())
-        .help("当前回复由脚本生成, 用于验证讨论流程与界面。接入真实 Chrome 窗口驱动后这里会自动切换。")
+        return "按议程开始讨论"
     }
 
     private var executionBadge: some View {
         Group {
-            if usingRealChrome {
-                Label("真实 Chrome 会话", systemImage: "globe")
-                    .foregroundStyle(.green)
-                    .help("按成员绑定的 Chrome Profile 定位窗口，并在发送前校验账号名称")
+            if executionMode == .realChrome {
+                if isRealChromeReady {
+                    Label("真实 Chrome 会话就绪", systemImage: "globe")
+                        .foregroundStyle(.green)
+                        .help("使用各成员绑定的已登录 Chrome Profile 发起真实讨论，全程保护剪贴板")
+                } else {
+                    Button {
+                        showingConfig = true
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                            Text("未配置账号 (\(unconfiguredParticipants.count) 位待绑定)")
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.orange)
+                    .help("点击打开配置并使用「一键分配 Chrome 账号」")
+                }
             } else {
-                demoBadge
+                HStack(spacing: 4) {
+                    Image(systemName: "theatermasks.fill")
+                    Text("演示模式（脚本假回复）")
+                }
+                .foregroundStyle(.purple)
+                .help("当前使用预设脚本回复跑通流程，不调用真实网页。切换到「真实 Chrome」可调用真实账号。")
             }
         }
         .font(.caption2)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
         .background(
-            (usingRealChrome ? Color.green : Color.orange).opacity(0.12),
+            (executionMode == .realChrome ? (isRealChromeReady ? Color.green : Color.orange) : Color.purple)
+                .opacity(0.12),
             in: Capsule()
         )
     }

@@ -35,7 +35,13 @@ public actor ChromeDiscussionSessionProvider: DiscussionSessionProviding {
         let profile = participant.profileDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
         let email = participant.emailHint.trimmingCharacters(in: .whitespacesAndNewlines)
         let sessionKey = "\(participant.id)|\(profile)|\(email.lowercased())"
-        if let existing = sessions[sessionKey] { return existing }
+        if let existing = sessions[sessionKey] {
+            if existing.isValid {
+                return existing
+            } else {
+                sessions.removeValue(forKey: sessionKey)
+            }
+        }
         guard !profile.isEmpty else {
             throw AppError.invalidRequest("成员「\(participant.displayName)」没有绑定 Chrome Profile。")
         }
@@ -58,6 +64,10 @@ public actor ChromeDiscussionSessionProvider: DiscussionSessionProviding {
         sessions[sessionKey] = created
         return created
     }
+
+    public func reset() {
+        sessions.removeAll()
+    }
 }
 
 /// 一扇已经锁定的 Chrome 窗口。
@@ -70,6 +80,19 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
     private let expectedAccount: String
     private let configuration: ChromeDiscussionSessionConfiguration
     private var verifiedAccount: String?
+
+    public var isValid: Bool {
+        guard !application.isTerminated else { return false }
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(window, &pid) == .success, pid == application.processIdentifier else {
+            return false
+        }
+        var raw: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &raw) == .success else {
+            return false
+        }
+        return true
+    }
 
     private init(
         application: NSRunningApplication,
@@ -96,6 +119,16 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
         guard let markedURL = markedURL(configuration.chatGPTURL, marker: marker) else {
             throw AppError.invalidRequest("ChatGPT 地址无效：\(configuration.chatGPTURL.absoluteString)")
         }
+
+        let existingHashes: Set<CFHashCode>
+        if let app = NSRunningApplication.runningApplications(
+            withBundleIdentifier: configuration.browserKind.rawValue
+        ).first(where: { !$0.isTerminated }) {
+            existingHashes = Set(AX.windows(in: app).map { CFHash($0 as CFTypeRef) })
+        } else {
+            existingHashes = []
+        }
+
         guard ChromeProfileScanner().open(
             url: markedURL,
             profile: profile,
@@ -110,16 +143,42 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
             try Task.checkCancellation()
             if let app = NSRunningApplication.runningApplications(
                 withBundleIdentifier: configuration.browserKind.rawValue
-            ).first(where: { !$0.isTerminated }),
-               let target = AX.findWindow(in: app, documentContaining: marker) {
-                let session = ChromeDiscussionSession(
-                    application: app,
-                    window: target,
-                    expectedAccount: expectedAccount,
-                    configuration: configuration
-                )
-                try await session.waitUntilPageReady()
-                return session
+            ).first(where: { !$0.isTerminated }) {
+                if let target = AX.findWindow(in: app, documentContaining: marker) {
+                    let session = ChromeDiscussionSession(
+                        application: app,
+                        window: target,
+                        expectedAccount: expectedAccount,
+                        configuration: configuration
+                    )
+                    try await session.waitUntilPageReady()
+                    Task { @MainActor in
+                        NSApplication.shared.activate(ignoringOtherApps: true)
+                    }
+                    return session
+                }
+                for window in AX.windows(in: app) {
+                    let hash = CFHash(window as CFTypeRef)
+                    if !existingHashes.contains(hash) {
+                        let title = AX.string(window, kAXTitleAttribute) ?? ""
+                        let doc = AX.string(window, kAXDocumentAttribute) ?? ""
+                        if doc.localizedCaseInsensitiveContains("chatgpt")
+                            || doc.localizedCaseInsensitiveContains("openai")
+                            || title.localizedCaseInsensitiveContains("chatgpt") {
+                            let session = ChromeDiscussionSession(
+                                application: app,
+                                window: window,
+                                expectedAccount: expectedAccount,
+                                configuration: configuration
+                            )
+                            try await session.waitUntilPageReady()
+                            Task { @MainActor in
+                                NSApplication.shared.activate(ignoringOtherApps: true)
+                            }
+                            return session
+                        }
+                    }
+                }
             }
             try await Task.sleep(for: configuration.pollInterval)
         }
@@ -134,6 +193,7 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
         let expected = emailHint.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !expected.isEmpty else { return false }
         try raise()
+        try checkSessionHealth()
 
         if AX.allTexts(in: window, configuration: configuration)
             .contains(where: { AX.identityMatches($0, expected: expected) }) {
@@ -169,35 +229,78 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AppError.invalidRequest("讨论提示词为空，已停止发送。")
         }
+        try raise()
+        try checkSessionHealth()
+
+        // 1. 发送前先守卫：确保前一轮思考或回答已彻底完成，解除生成锁定
+        try await waitUntilReadyForSend()
+
         guard try await verifyIdentity(emailHint: expectedAccount) else {
             throw AppError.invalidRequest(
                 "目标 Chrome 窗口无法确认账号 \(expectedAccount)，已停止发送。"
             )
         }
 
-        try raise()
+        // 2. 自动检测并切换网页端思考强度为“高”（深度思考模式）
+        AX.ensureHighReasoningEffort(
+            in: window, configuration: configuration, pid: application.processIdentifier
+        )
+
         let composer = try await waitForComposer()
         if let existing = AX.textValue(composer, kAXValueAttribute),
-           !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw AppError.invalidRequest("目标 ChatGPT 输入框中已有草稿，已停止以免覆盖。")
+           !AX.isComposerEmptyOrPlaceholder(existing) {
+            await CodexLoginAutomator.clearField(composer, pid: application.processIdentifier)
+            try await Task.sleep(for: .milliseconds(150))
         }
 
         let baselineCopyCount = AX.copyButtons(
             in: window, configuration: configuration
         ).count
         try await insert(prompt, into: composer)
-        try await pressSend(near: composer)
-        try await waitForComposerToClear(composer)
+        try await executeSend(composer: composer)
         return try await waitForResponse(
             baselineCopyCount: baselineCopyCount,
             prompt: prompt
         )
     }
 
+    private func waitUntilReadyForSend() async throws {
+        let deadline = Date().addingTimeInterval(45)
+        while Date() < deadline {
+            try Task.checkCancellation()
+            if !AX.hasGeneratingControl(in: window, configuration: configuration) {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(800))
+        }
+    }
+
     // MARK: - 页面操作
 
+    private func checkSessionHealth() throws {
+        if let doc = AX.string(window, kAXDocumentAttribute) {
+            let lower = doc.lowercased()
+            if lower.contains("/auth/") || lower.contains("/uc/") || lower.contains("/login")
+                || lower.contains("/mfa") || lower.contains("/challenge") {
+                throw AppError.invalidRequest(
+                    "目标 Profile (\(expectedAccount)) 的 ChatGPT 处于未登录或验证状态（当前页面：\(doc)）。请先在 Chrome 中完成登录。"
+                )
+            }
+        }
+        if let webArea = AX.findWebArea(in: window) {
+            let buttons = AX.allButtonsText(in: webArea)
+            if buttons.contains(where: { $0 == "登录" || $0 == "log in" || $0 == "sign in" }) {
+                throw AppError.invalidRequest(
+                    "目标 Profile (\(expectedAccount)) 的 ChatGPT 处于未登录状态（页面显示登录按钮）。请先在 Chrome 中登录该账号。"
+                )
+            }
+        }
+    }
+
     private func waitUntilPageReady() async throws {
+        try checkSessionHealth()
         _ = try await waitForComposer(timeout: configuration.pageReadyTimeout)
+        try checkSessionHealth()
     }
 
     private func waitForComposer(timeout: TimeInterval? = nil) async throws -> AXUIElement {
@@ -219,65 +322,104 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
             composer, kAXFocusedAttribute as CFString, true as CFTypeRef
         )
         _ = AX.pressOrClick(composer)
+        try await Task.sleep(for: .milliseconds(150))
 
-        let pasteboard = NSPasteboard.general
-        let previous = pasteboard.string(forType: .string)
-        pasteboard.clearContents()
-        guard pasteboard.setString(text, forType: .string) else {
-            if let previous { pasteboard.setString(previous, forType: .string) }
-            throw AppError.invalidRequest("无法准备讨论提示词。")
-        }
-        defer {
-            pasteboard.clearContents()
-            if let previous { pasteboard.setString(previous, forType: .string) }
-        }
-
-        AX.postPaste(to: application.processIdentifier)
-        let deadline = Date().addingTimeInterval(8)
-        while Date() < deadline {
-            try Task.checkCancellation()
-            if let actual = AX.textValue(composer, kAXValueAttribute),
-               AX.normalized(actual).contains(AX.normalized(text)) {
-                return
-            }
-            try await Task.sleep(for: .milliseconds(250))
-        }
-
+        // 1. 优先尝试直接通过 AX 属性写入（完全不碰系统剪贴板）
         let status = AXUIElementSetAttributeValue(
             composer, kAXValueAttribute as CFString, text as CFTypeRef
         )
         if status == .success {
-            try await Task.sleep(for: .milliseconds(300))
-            if let actual = AX.textValue(composer, kAXValueAttribute),
-               AX.normalized(actual).contains(AX.normalized(text)) {
-                return
+            try await Task.sleep(for: .milliseconds(250))
+            let actual = AX.composerText(in: composer)
+            if AX.normalized(actual).contains(AX.normalized(text)) {
+                // 只有当网页端 React 确实感知到输入并将发送按钮激活时，才直接完成；
+                // 否则说明 React 缺少 DOM input 事件，必须继续走经由 PasteboardGuard 保护的原生粘贴
+                if AX.findSendButton(in: window, near: composer, configuration: configuration) != nil {
+                    return
+                }
             }
         }
+
+        // 2. 剪贴板粘贴，但使用 PasteboardGuard 完整备份并在离开时立即复原用户剪贴板
+        let pbGuard = PasteboardGuard()
+        defer { pbGuard.restore() }
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard pasteboard.setString(text, forType: .string) else {
+            throw AppError.invalidRequest("无法准备讨论提示词。")
+        }
+
+        AX.postPaste(to: application.processIdentifier)
+        let pasteDeadline = Date().addingTimeInterval(3.5)
+        while Date() < pasteDeadline {
+            try Task.checkCancellation()
+            let actual = AX.composerText(in: composer)
+            if AX.normalized(actual).contains(AX.normalized(text)) {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(200))
+        }
+
+        // 3. 逐字模拟输入后备路径 (与真人打字等价)
+        await CodexLoginAutomator.typeText(text, to: application.processIdentifier, interval: .milliseconds(15))
+        let typeDeadline = Date().addingTimeInterval(5.0)
+        while Date() < typeDeadline {
+            try Task.checkCancellation()
+            let actual = AX.composerText(in: composer)
+            if AX.normalized(actual).contains(AX.normalized(text)) {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(200))
+        }
+
         throw AppError.invalidRequest("提示词没有完整写入 ChatGPT 输入框，已停止发送。")
     }
 
-    private func pressSend(near composer: AXUIElement) async throws {
-        let deadline = Date().addingTimeInterval(10)
+    private func executeSend(composer: AXUIElement) async throws {
+        let deadline = Date().addingTimeInterval(15)
         while Date() < deadline {
             try Task.checkCancellation()
-            if let button = AX.findSendButton(
-                in: window, near: composer, configuration: configuration
-            ), AX.pressOrClick(button) {
+
+            // 成功标志 1：页面已经开始生成回复（出现了停止生成按钮）
+            if AX.hasGeneratingControl(in: window, configuration: configuration) {
                 return
             }
-            try await Task.sleep(for: .milliseconds(300))
-        }
-        throw AppError.invalidRequest("没有找到 ChatGPT 发送按钮，提示词未发送。")
-    }
 
-    private func waitForComposerToClear(_ composer: AXUIElement) async throws {
-        let deadline = Date().addingTimeInterval(12)
-        while Date() < deadline {
-            try Task.checkCancellation()
-            let value = AX.textValue(composer, kAXValueAttribute) ?? ""
-            if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
-            try await Task.sleep(for: .milliseconds(250))
+            // 成功标志 2：输入框已经清空或还原为占位符
+            let currentVal = AX.textValue(composer, kAXValueAttribute) ?? ""
+            if AX.isComposerEmptyOrPlaceholder(currentVal) {
+                return
+            }
+
+            // 动作 A：优先点击/按压发送按钮
+            if let button = AX.findSendButton(
+                in: window, near: composer, configuration: configuration
+            ) {
+                _ = AX.pressOrClick(button)
+            }
+
+            try await Task.sleep(for: .milliseconds(600))
+            if AX.hasGeneratingControl(in: window, configuration: configuration) {
+                return
+            }
+            let checkVal = AX.textValue(composer, kAXValueAttribute) ?? ""
+            if AX.isComposerEmptyOrPlaceholder(checkVal) {
+                return
+            }
+
+            // 动作 B：键盘 Return (Enter) 键提交回退
+            _ = AXUIElementSetAttributeValue(composer, kAXFocusedAttribute as CFString, true as CFTypeRef)
+            AX.postReturn(to: application.processIdentifier)
+
+            try await Task.sleep(for: .milliseconds(800))
         }
+
+        // 超时最后检查一次生成状态
+        if AX.hasGeneratingControl(in: window, configuration: configuration) {
+            return
+        }
+
         throw AppError.invalidRequest(
             "已点击发送，但输入框没有清空，发送状态无法确认。为避免重复发送，讨论已停止。"
         )
@@ -296,22 +438,46 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
             let generating = AX.hasGeneratingControl(
                 in: window, configuration: configuration
             )
-            let copyButtons = AX.copyButtons(in: window, configuration: configuration)
 
-            if !generating, copyButtons.count > baselineCopyCount,
-               let response = AX.copyResponse(
-                   using: copyButtons.last!, pid: application.processIdentifier
-               ),
-               !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-               AX.normalized(response) != AX.normalized(prompt) {
+            // 若仍在思考或流式生成中，绝对不结算采样，强制重置稳定计数器
+            if generating {
+                stableCandidate = nil
+                stableCount = 0
+                try await Task.sleep(for: configuration.pollInterval)
+                continue
+            }
+
+            var candidate: String?
+            // 1. 优先且首选：直接从 AX 树提取最新 Assistant 回复
+            if let response = AX.extractLatestAssistantText(
+                in: window, configuration: configuration, prompt: prompt
+            ), AX.isValidAssistantResponse(response, prompt: prompt) {
+                candidate = response
+            } else {
+                // 2. 备用兜底：仅在语义树未命中时，尝试一次无障碍 AXPress 复制
+                let copyButtons = AX.copyButtons(in: window, configuration: configuration)
+                if copyButtons.count > baselineCopyCount,
+                   let response = AX.copyResponse(
+                       using: copyButtons.last!, pid: application.processIdentifier
+                   ), AX.isValidAssistantResponse(response, prompt: prompt) {
+                    candidate = response
+                }
+            }
+
+            if let response = candidate {
                 if response == stableCandidate {
                     stableCount += 1
                 } else {
                     stableCandidate = response
                     stableCount = 1
                 }
+                // 连续 2 次采样完全一致且脱离生成/思考态，确认为最终完整正文
                 if stableCount >= 2 { return response }
+            } else {
+                stableCandidate = nil
+                stableCount = 0
             }
+
             try await Task.sleep(for: configuration.pollInterval)
         }
 
@@ -324,10 +490,11 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
         guard !application.isTerminated else {
             throw AppError.invalidRequest("讨论使用的 Chrome 已关闭。")
         }
-        _ = application.activate(options: [.activateAllWindows])
-        guard AXUIElementPerformAction(window, kAXRaiseAction as CFString) == .success else {
-            throw AppError.invalidRequest("无法前置讨论成员对应的 Chrome 窗口。")
+        guard isValid else {
+            throw AppError.invalidRequest("讨论成员对应的 Chrome 窗口已失效或关闭。")
         }
+        // 静默运行：绝不抢占前台输入焦点，绝不调用 yieldActivation 与 activateIgnoringOtherApps 强行弹窗
+        _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, true as CFTypeRef)
     }
 
     private func rememberVerified(_ account: String) {
@@ -343,7 +510,7 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
 
 // MARK: - 局部 AX 工具
 
-private enum AX {
+enum AX {
     static func findWindow(
         in application: NSRunningApplication,
         documentContaining marker: String
@@ -359,13 +526,17 @@ private enum AX {
         in root: AXUIElement,
         configuration: ChromeDiscussionSessionConfiguration
     ) -> AXUIElement? {
-        let candidates = collect(in: root, configuration: configuration) { element in
+        let searchRoot = findWebArea(in: root) ?? root
+        let candidates = collect(in: searchRoot, configuration: configuration) { element in
             let role = string(element, kAXRoleAttribute) ?? ""
             guard role == "AXTextArea" || role == "AXTextField" else { return false }
             let text = searchableText(element)
-            if text.contains("search") || text.contains("搜索") { return false }
+            if text.contains("地址") || text.contains("address") || text.contains("omnibox")
+                || text.contains("search") || text.contains("搜索") {
+                return false
+            }
             let editable = bool(element, kAXEnabledAttribute) != false
-            let semantic = ["prompt-textarea", "message", "消息", "询问", "chatgpt"]
+            let semantic = ["prompt-textarea", "message", "消息", "询问", "chatgpt", "聊天", "与 chatgpt 聊天", "问问 chatgpt"]
                 .contains { text.contains($0) }
             return editable && (semantic || role == "AXTextArea")
         }
@@ -410,14 +581,97 @@ private enum AX {
         in root: AXUIElement,
         configuration: ChromeDiscussionSessionConfiguration
     ) -> Bool {
-        let exact = [
-            "stop generating", "停止生成", "stop streaming", "停止回答", "停止响应"
+        let stopHints = [
+            "stop generating", "停止生成", "stop streaming", "停止回答", "停止响应",
+            "停止思考", "stop reasoning", "停止", "stop"
         ]
-        return collect(in: root, configuration: configuration) { element in
+        let foundStopButton = collect(in: root, configuration: configuration) { element in
             guard (string(element, kAXRoleAttribute) ?? "") == "AXButton" else { return false }
             let text = searchableText(element)
-            return exact.contains { text.contains($0) }
+            return stopHints.contains { text == $0 || text.contains($0) }
         }.isEmpty == false
+
+        if foundStopButton { return true }
+
+        // 检查页面是否存在明显的“正在思考”活跃状态或动画圆点
+        let foundThinking = collect(in: root, configuration: configuration) { element in
+            let r = string(element, kAXRoleAttribute) ?? ""
+            guard r == "AXStaticText" || r == "AXHeading" else { return false }
+            let text = (textValue(element, kAXValueAttribute) ?? string(element, kAXTitleAttribute) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return text == "正在思考" || text == "thinking..." || text.hasPrefix("已思考") || text.hasPrefix("thought for") || text == "●"
+        }.isEmpty == false
+
+        return foundThinking
+    }
+
+    static func isValidAssistantResponse(_ text: String, prompt: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 6 else { return false }
+
+        let lower = trimmed.lowercased()
+        // 排除思考占位符
+        let thinkingPlaceholders = [
+            "正在思考", "thinking", "thinking...", "●", "已思考", "thought for"
+        ]
+        if thinkingPlaceholders.contains(where: { lower == $0 || lower.hasPrefix($0) && trimmed.count < 15 }) {
+            return false
+        }
+
+        // 排除 ChatGPT 常见瞬态错误
+        if lower.contains("something went wrong while generating")
+            || lower.contains("if this issue persists please") {
+            return false
+        }
+
+        // 排除单纯的提示词回显
+        if normalized(trimmed) == normalized(prompt) {
+            return false
+        }
+
+        return true
+    }
+
+    static func ensureHighReasoningEffort(
+        in root: AXUIElement,
+        configuration: ChromeDiscussionSessionConfiguration,
+        pid: pid_t
+    ) {
+        let searchRoot = findWebArea(in: root) ?? root
+
+        // 寻找思考强度触发按钮（例如包含“即时”、“低”、“标准”、“思考强度”、“Reasoning”）
+        let effortButtons = collect(in: searchRoot, configuration: configuration) { element in
+            guard (string(element, kAXRoleAttribute) ?? "") == "AXButton" else { return false }
+            let text = searchableText(element)
+            // 如果已经是“高”或“深入思考”，无需切换
+            if text.contains("深入思考") || text.contains("思考：高") || text.contains("high") {
+                return false
+            }
+            return text.contains("即时")
+                || text.contains("思考强度")
+                || text.contains("reasoning")
+                || text.contains("标准")
+                || text.contains("中等")
+        }
+
+        guard let button = effortButtons.first else { return }
+
+        // 点击展开思考强度菜单
+        if pressOrClick(button) {
+            Thread.sleep(forTimeInterval: 0.3)
+            let appRoot = AXUIElementCreateApplication(pid)
+            // 在应用树中寻找“高”或“深入思考”或“High”选项
+            let highOptions = collect(in: appRoot, configuration: configuration) { element in
+                let r = string(element, kAXRoleAttribute) ?? ""
+                guard r == "AXMenuItem" || r == "AXButton" || r == "AXStaticText" else { return false }
+                let text = searchableText(element)
+                return text == "高" || text.contains("高 (") || text.contains("深入思考") || text == "high" || text.contains("extended")
+            }
+            if let target = highOptions.first {
+                _ = pressOrClick(target)
+            } else {
+                postEscape(to: pid)
+            }
+        }
     }
 
     static func copyButtons(
@@ -427,25 +681,161 @@ private enum AX {
         collect(in: root, configuration: configuration) { element in
             guard (string(element, kAXRoleAttribute) ?? "") == "AXButton" else { return false }
             let text = searchableText(element)
-            return text == "copy" || text == "复制" || text == "复制回答" || text == "copy response"
+            // 排除用户消息复制按钮和代码块复制按钮
+            if text.contains("消息") || text.contains("message") || text.contains("提示")
+                || text.contains("prompt") || text.contains("代码") || text.contains("code") {
+                return false
+            }
+            return text.contains("复制回复")
+                || text.contains("复制回答")
+                || text.contains("copy response")
+                || text.contains("copy reply")
+                || text == "复制"
+                || text == "copy"
         }
     }
 
     static func copyResponse(using button: AXUIElement, pid: pid_t) -> String? {
+        let pbGuard = PasteboardGuard()
+        defer { pbGuard.restore() }
+
         let pasteboard = NSPasteboard.general
-        let previous = pasteboard.string(forType: .string)
         pasteboard.clearContents()
-        defer {
-            pasteboard.clearContents()
-            if let previous { pasteboard.setString(previous, forType: .string) }
-        }
-        guard pressOrClick(button) else { return nil }
-        let deadline = Date().addingTimeInterval(2)
-        while Date() < deadline {
-            if let value = pasteboard.string(forType: .string), !value.isEmpty { return value }
-            Thread.sleep(forTimeInterval: 0.05)
+
+        // 仅使用无障碍 AXPress 动作触发复制，不移动用户鼠标，不抢占物理光标
+        if AXUIElementPerformAction(button, kAXPressAction as CFString) == .success {
+            let deadline = Date().addingTimeInterval(0.4)
+            while Date() < deadline {
+                if let value = pasteboard.string(forType: .string),
+                   !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return value
+                }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
         }
         return nil
+    }
+
+    static func extractLatestAssistantText(
+        in root: AXUIElement,
+        configuration: ChromeDiscussionSessionConfiguration,
+        prompt: String? = nil
+    ) -> String? {
+        let searchRoot = findWebArea(in: root) ?? root
+
+        struct TextElement {
+            let role: String
+            let text: String
+        }
+
+        // 收集 AXWebArea 中所有文本与标题节点
+        let elements = collect(in: searchRoot, configuration: configuration) { el in
+            let r = string(el, kAXRoleAttribute) ?? ""
+            return r == "AXStaticText" || r == "AXHeading"
+        }.compactMap { el -> TextElement? in
+            let r = string(el, kAXRoleAttribute) ?? ""
+            let val = textValue(el, kAXValueAttribute)
+                ?? string(el, kAXTitleAttribute)
+                ?? string(el, kAXDescriptionAttribute)
+            guard let text = val?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+                return nil
+            }
+            return TextElement(role: r, text: text)
+        }
+
+        guard !elements.isEmpty else { return nil }
+
+        // 策略 1：定位最后一个明确的 ChatGPT 消息头
+        var startIdx: Int?
+        for (i, el) in elements.enumerated().reversed() {
+            let lower = el.text.lowercased()
+            let isDisclaimerOrInput = lower.contains("可能会犯错")
+                || lower.contains("核查重要信息")
+                || lower.contains("can make mistakes")
+                || lower.contains("问问")
+                || lower.contains("message")
+            if isDisclaimerOrInput { continue }
+
+            if lower.contains("chatgpt 说") || lower.contains("chatgpt said") {
+                startIdx = i
+                break
+            }
+            if el.role == "AXHeading" && (lower == "chatgpt" || lower.contains("chatgpt")) {
+                startIdx = i
+                break
+            }
+        }
+
+        // 策略 2：若无显式 Header，以 prompt 前缀定位用户提问之后的内容
+        if startIdx == nil, let prompt = prompt {
+            let normPrompt = normalized(prompt)
+            let promptPrefix = String(normPrompt.prefix(20))
+            if !promptPrefix.isEmpty {
+                startIdx = elements.lastIndex { el in
+                    normalized(el.text).contains(promptPrefix)
+                }
+            }
+        }
+
+        guard let validStart = startIdx, validStart + 1 < elements.count else {
+            return nil
+        }
+
+        var parts: [String] = []
+        for el in elements[(validStart + 1)...] {
+            let lower = el.text.lowercased()
+            // 遇到页面底部免责声明或输入框立即截断，防止混入外部提示
+            if lower.contains("可能会犯错")
+                || lower.contains("核查重要信息")
+                || lower.contains("can make mistakes")
+                || lower.contains("问问 chatgpt")
+                || lower.contains("message chatgpt")
+                || lower.contains("给 chatgpt 发送消息") {
+                break
+            }
+            // 排除与 Header 完全重复的文本
+            if el.text == elements[validStart].text { continue }
+            // 排除按钮文本
+            if el.text == "复制" || el.text == "copy" || el.text == "分享" || el.text == "share" {
+                continue
+            }
+            parts.append(el.text)
+        }
+
+        guard !parts.isEmpty else { return nil }
+        return combineContentParts(parts)
+    }
+
+    static func combineContentParts(_ parts: [String]) -> String {
+        var combined = ""
+        for (idx, part) in parts.enumerated() {
+            if idx == 0 {
+                combined = part
+                continue
+            }
+            let trimmedPart = part.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedPart.isEmpty else { continue }
+
+            let firstChar = trimmedPart.first!
+            let isPunctuation = "，。！？、：；”’）】》…,".contains(firstChar)
+            let isListMarker = trimmedPart.starts(with: "- ")
+                || trimmedPart.starts(with: "* ")
+                || (firstChar.isNumber && trimmedPart.contains("."))
+
+            let lastChar = combined.trimmingCharacters(in: .whitespacesAndNewlines).last
+            let lastEndsParagraph = lastChar.map { "。！？；：\n".contains($0) } ?? false
+
+            if isPunctuation {
+                combined += trimmedPart
+            } else if isListMarker || lastEndsParagraph {
+                combined += "\n" + trimmedPart
+            } else if let last = lastChar, (last.isASCII && firstChar.isASCII) {
+                combined += " " + trimmedPart
+            } else {
+                combined += trimmedPart
+            }
+        }
+        return combined
     }
 
     static func allTexts(
@@ -471,12 +861,59 @@ private enum AX {
     }
 
     static func pressOrClick(_ element: AXUIElement) -> Bool {
-        if CodexLoginAutomator.clickCenter(element) { return true }
-        return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
+        if AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
+            return true
+        }
+        return CodexLoginAutomator.clickCenter(element)
+    }
+
+    static func composerText(in composer: AXUIElement) -> String {
+        var texts: [String] = []
+        if let val = textValue(composer, kAXValueAttribute) {
+            texts.append(val)
+        }
+        for child in children(composer, attribute: kAXChildrenAttribute) {
+            if let val = textValue(child, kAXValueAttribute) {
+                texts.append(val)
+            }
+            if let title = string(child, kAXTitleAttribute) {
+                texts.append(title)
+            }
+            if let desc = string(child, kAXDescriptionAttribute) {
+                texts.append(desc)
+            }
+        }
+        return texts.joined(separator: " ")
     }
 
     static func postPaste(to pid: pid_t) {
-        postKey(0x09, flags: .maskCommand, to: pid)
+        guard let source = CGEventSource(stateID: .combinedSessionState) else { return }
+        let cmdDown = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: true)
+        cmdDown?.flags = .maskCommand
+        cmdDown?.postToPid(pid)
+        cmdDown?.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.02)
+
+        let vDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true)
+        vDown?.flags = .maskCommand
+        vDown?.postToPid(pid)
+        vDown?.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.03)
+
+        let vUp = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false)
+        vUp?.flags = .maskCommand
+        vUp?.postToPid(pid)
+        vUp?.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.02)
+
+        let cmdUp = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: false)
+        cmdUp?.flags = []
+        cmdUp?.postToPid(pid)
+        cmdUp?.post(tap: .cghidEventTap)
+    }
+
+    static func postReturn(to pid: pid_t) {
+        postKey(0x24, flags: [], to: pid)
     }
 
     static func postEscape(to pid: pid_t) {
@@ -490,6 +927,7 @@ private enum AX {
         else { return }
         down.flags = flags; up.flags = flags
         down.postToPid(pid); up.postToPid(pid)
+        down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap)
     }
 
     static func textValue(_ element: AXUIElement, _ attribute: String) -> String? {
@@ -501,7 +939,7 @@ private enum AX {
         return nil
     }
 
-    private static func string(_ element: AXUIElement, _ attribute: String) -> String? {
+    static func string(_ element: AXUIElement, _ attribute: String) -> String? {
         var raw: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attribute as CFString, &raw) == .success else {
             return nil
@@ -586,5 +1024,91 @@ private enum AX {
                 budget: &budget, result: &result, matching: predicate
             )
         }
+    }
+
+    static func windows(in application: NSRunningApplication) -> [AXUIElement] {
+        let root = AXUIElementCreateApplication(application.processIdentifier)
+        return children(root, attribute: kAXWindowsAttribute)
+    }
+
+    static func findWebArea(in root: AXUIElement) -> AXUIElement? {
+        var queue = [root]
+        while !queue.isEmpty {
+            let el = queue.removeFirst()
+            var rRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &rRef) == .success,
+               let r = rRef as? String, r == "AXWebArea" {
+                return el
+            }
+            queue.append(contentsOf: children(el, attribute: kAXChildrenAttribute))
+        }
+        return nil
+    }
+
+    static func allButtonsText(in root: AXUIElement) -> [String] {
+        var result: [String] = []
+        var queue = [root]
+        while !queue.isEmpty {
+            let el = queue.removeFirst()
+            var rRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &rRef) == .success,
+               let r = rRef as? String, r == "AXButton" {
+                result.append(searchableText(el))
+            }
+            queue.append(contentsOf: children(el, attribute: kAXChildrenAttribute))
+        }
+        return result
+    }
+
+    static func isComposerEmptyOrPlaceholder(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return true }
+        let lower = trimmed.lowercased()
+        let placeholders = [
+            "问问 chatgpt", "message chatgpt", "ask chatgpt",
+            "给 chatgpt 发送消息", "向 chatgpt 发送消息", "与 chatgpt 聊天",
+            "问问"
+        ]
+        return placeholders.contains { lower == $0 || lower.contains($0) }
+    }
+}
+
+// MARK: - 剪贴板保护
+
+/// 剪贴板守卫：在自动化操作需要临时借用剪贴板时，完整保存并无缝还原用户的原有剪贴板内容。
+final class PasteboardGuard: @unchecked Sendable {
+    private struct Item {
+        let types: [(NSPasteboard.PasteboardType, Data)]
+    }
+    private let savedItems: [Item]
+
+    init() {
+        let pb = NSPasteboard.general
+        if let items = pb.pasteboardItems {
+            self.savedItems = items.map { item in
+                let types = item.types.compactMap { type -> (NSPasteboard.PasteboardType, Data)? in
+                    guard let data = item.data(forType: type) else { return nil }
+                    return (type, data)
+                }
+                return Item(types: types)
+            }
+        } else {
+            self.savedItems = []
+        }
+    }
+
+    func restore() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        guard !savedItems.isEmpty else { return }
+        var newItems: [NSPasteboardItem] = []
+        for item in savedItems {
+            let pbItem = NSPasteboardItem()
+            for (type, data) in item.types {
+                pbItem.setData(data, forType: type)
+            }
+            newItems.append(pbItem)
+        }
+        pb.writeObjects(newItems)
     }
 }

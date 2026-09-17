@@ -262,7 +262,7 @@ final class ChatGPTAccountSwitchTests: XCTestCase {
         let url = try XCTUnwrap(URL(string: "https://auth.openai.com/codex/choose-account"))
         let controls = [
             CodexOAuthBrowserAutomator.Control(
-                text: "Zpsksk rotated@example.com"
+                text: "Zpsksk user@example.com"
             ),
             CodexOAuthBrowserAutomator.Control(text: "登录至另一个账户"),
             CodexOAuthBrowserAutomator.Control(text: "创建账户"),

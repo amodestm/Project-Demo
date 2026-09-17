@@ -4,10 +4,12 @@
 
 | 项目 | 定位 | 技术栈 |
 |------|------|--------|
-| [AIRunner](./AIRunner/) | **AI 长任务自动执行器**：拆成有序步骤逐步调 AI，额度/限流时**自动切换账号（零点击）**并自动续跑，每步落盘+检查点 | Swift 6 + SwiftUI + SwiftPM（零外部依赖） |
+| [AIRunner](./AIRunner/) | **AI 长任务自动执行器**：拆成有序步骤逐步调 AI，额度/限流时**自动切换账号（零点击）**并自动续跑，每步落盘+检查点；另含**多账号 AI 讨论组**（多账号扮演互斥角色，论述 → 质询 → 收敛） | Swift 6 + SwiftUI + SwiftPM（零外部依赖） |
 | [BinanceTradingSuite](./BinanceTradingSuite/) | **实时行情自动化交易套件**（含 3 个子系统）：LiqHarvest 完整交易引擎 / LiquidationMonitor 强平监控 / QuickTrade 对冲终端 | Python + asyncio + WebSocket + SQLite |
 
 > `BinanceTradingSuite/` 内含三个可单独运行的子项目：`LiqHarvest`（自包含全量系统）、`LiquidationMonitor`（强平瀑布 + 形态扫描）、`QuickTrade`（一键多空对冲终端）。详见 [BinanceTradingSuite/README.md](./BinanceTradingSuite/README.md)。
+>
+> `AIRunner/` 内含两条执行线：**长任务执行**（步骤化调用 + 零点击切号 + 崩溃续跑）与**多账号 AI 讨论组**（多个已登录账号扮演立场互斥的角色，按可配置议程独立论述 → 交叉质询 → 收敛决策）。讨论组详见 [AIRunner/docs/AI_DISCUSSION.md](./AIRunner/docs/AI_DISCUSSION.md)。
 
 ---
 
@@ -17,11 +19,12 @@
 Project-Demo/
 ├── AIRunner/                    # AI 长任务执行器（Swift 6 / SwiftUI）
 │   ├── Package.swift            # SwiftPM 清单（macOS 14+，零外部依赖）
-│   ├── Sources/AIRunnerCore/    # 零 UI 依赖核心：JobRunner / ModelRouter / RetryManager / Checkpoint / Persistence
-│   ├── Sources/AIRunner/        # SwiftUI 壳
+│   ├── Sources/AIRunnerCore/    # 零 UI 依赖核心：JobRunner / Checkpoint / 账号轮换 / 讨论组编排
+│   ├── Sources/AIRunner/        # SwiftUI 壳（任务 · 设置 · 讨论组）
 │   ├── Tests/AIRunnerCoreTests/ # 测试套件
 │   ├── Scripts/make_app.sh      # 组装可双击 .app
-│   └── README.md                # 设计规则 / 架构 / 安全说明
+│   ├── docs/AI_DISCUSSION.md    # 多账号 AI 讨论组说明
+│   └── README.md                # 功能 / 架构 / 安全说明
 ├── BinanceTradingSuite/         # 实时行情自动化交易套件（Python）
 │   ├── LiqHarvest/              # 完整交易系统（自包含）
 │   │   ├── data_feed.py         # 数据层：3 路 WebSocket

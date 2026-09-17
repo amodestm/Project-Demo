@@ -125,3 +125,65 @@ public struct ScriptedSessionProvider: DiscussionSessionProviding {
         return session
     }
 }
+
+// MARK: - 会话模式路由提供方
+
+/// 统一管理真实 Chrome 会话与演示会话的路由提供方。
+///
+/// 避免系统在未完整配置 Profile 时静默冒充真实讨论，保证用户对“真实 vs 演示”有完全清晰的掌控。
+public final class RoutingDiscussionSessionProvider: DiscussionSessionProviding, @unchecked Sendable {
+
+    public enum Mode: String, Sendable, CaseIterable {
+        case realChrome = "realChrome"
+        case demo = "demo"
+
+        public var displayName: String {
+            switch self {
+            case .realChrome: return "真实 Chrome 会话"
+            case .demo:       return "演示模式（脚本假回复）"
+            }
+        }
+    }
+
+    private let lock = NSLock()
+    private var _mode: Mode
+    private let realProvider: any DiscussionSessionProviding
+    private var scriptedProvider: any DiscussionSessionProviding
+
+    public var mode: Mode {
+        get { lock.lock(); defer { lock.unlock() }; return _mode }
+        set { lock.lock(); defer { lock.unlock() }; _mode = newValue }
+    }
+
+    public init(
+        mode: Mode = .realChrome,
+        realProvider: any DiscussionSessionProviding,
+        scriptedProvider: any DiscussionSessionProviding
+    ) {
+        self._mode = mode
+        self.realProvider = realProvider
+        self.scriptedProvider = scriptedProvider
+    }
+
+    public func updateScriptedGroup(_ group: DiscussionGroup) {
+        lock.lock(); defer { lock.unlock() }
+        self.scriptedProvider = ScriptedSessionProvider(group: group)
+    }
+
+    public func session(for participant: DiscussionParticipant) async throws -> any DiscussionSessionDriving {
+        let currentMode = self.mode
+        switch currentMode {
+        case .realChrome:
+            let profile = participant.profileDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !profile.isEmpty else {
+                throw AppError.invalidRequest(
+                    "成员「\(participant.displayName)」未绑定 Chrome Profile。请先在「配置」中选择已登录的账号。"
+                )
+            }
+            return try await realProvider.session(for: participant)
+        case .demo:
+            return try await scriptedProvider.session(for: participant)
+        }
+    }
+}
+

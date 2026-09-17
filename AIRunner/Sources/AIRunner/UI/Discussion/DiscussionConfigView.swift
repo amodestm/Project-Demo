@@ -121,9 +121,14 @@ struct DiscussionConfigView: View {
                         size: 30
                     )
 
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(participant.displayName)
-                            .font(.callout)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Text(participant.displayName)
+                                .font(.callout.bold())
+
+                            profilePicker(for: participant)
+                        }
+
                         Text(participant.rolePrompt)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
@@ -158,7 +163,7 @@ struct DiscussionConfigView: View {
                     }
                     .buttonStyle(.plain)
                 }
-                .padding(.vertical, 2)
+                .padding(.vertical, 3)
             }
 
             HStack {
@@ -182,6 +187,22 @@ struct DiscussionConfigView: View {
                     Label("空白成员", systemImage: "plus")
                 }
                 .controlSize(.small)
+
+                Button {
+                    autoAssignProfiles(shuffle: false)
+                } label: {
+                    Label("一键分配", systemImage: "person.crop.circle.badge.checkmark")
+                }
+                .controlSize(.small)
+                .help("从本地检测到的 Chrome Profile 中，自动为未绑定账号的成员分配不同的 Profile")
+
+                Button {
+                    autoAssignProfiles(shuffle: true)
+                } label: {
+                    Label("随机换一批", systemImage: "shuffle")
+                }
+                .controlSize(.small)
+                .help("随机打乱可用 Chrome Profile 池并重新分配，避开固定批次或失效账号")
 
                 Spacer()
             }
@@ -339,6 +360,82 @@ struct DiscussionConfigView: View {
             draft.participants[index].emailHint = profile.preferredAccountIdentity(
                 alias: services.settings.accountRotationProfileAliases[directory]
             )
+        }
+    }
+
+    private var availableProfiles: [ChromeProfile] {
+        let all = (try? services.chromeProfiles.availableProfiles()) ?? []
+        let valid = all.filter { $0.directoryName != "Default" && $0.directoryName != "Profile 10" }
+        return valid.isEmpty ? all : valid
+    }
+
+    @ViewBuilder
+    private func profilePicker(for participant: DiscussionParticipant) -> some View {
+        let currentDir = participant.profileDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isUnassigned = currentDir.isEmpty || currentDir == "Default"
+        Menu {
+            ForEach(availableProfiles) { profile in
+                Button {
+                    if let i = draft.participants.firstIndex(where: { $0.id == participant.id }) {
+                        draft.participants[i].profileDirectory = profile.directoryName
+                        draft.participants[i].emailHint = profile.preferredAccountIdentity(
+                            alias: services.settings.accountRotationProfileAliases[profile.directoryName]
+                        )
+                    }
+                } label: {
+                    HStack {
+                        Text("\(profile.directoryName) (\(profile.displayName))")
+                        if currentDir == profile.directoryName {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: isUnassigned ? "exclamationmark.triangle.fill" : "person.crop.circle")
+                Text(isUnassigned ? "选择 Profile" : "\(currentDir) · \(participant.emailHint.isEmpty ? currentDir : participant.emailHint)")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 8))
+            }
+            .font(.caption2)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(isUnassigned ? Color.orange.opacity(0.15) : Color.blue.opacity(0.12))
+            .foregroundStyle(isUnassigned ? Color.orange : Color.blue)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func autoAssignProfiles(shuffle: Bool = false) {
+        let available = availableProfiles
+        guard !available.isEmpty else { return }
+        var pool = available
+        if shuffle {
+            pool.shuffle()
+        }
+
+        var used = Set<String>()
+        if !shuffle {
+            for p in draft.participants where !p.profileDirectory.isEmpty && p.profileDirectory != "Default" && p.profileDirectory != "Profile 10" {
+                used.insert(p.profileDirectory)
+            }
+        }
+
+        for index in draft.participants.indices {
+            let currentDir = draft.participants[index].profileDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+            if shuffle || currentDir.isEmpty || currentDir == "Default" || currentDir == "Profile 10" {
+                if let free = pool.first(where: { !used.contains($0.directoryName) }) {
+                    draft.participants[index].profileDirectory = free.directoryName
+                    draft.participants[index].emailHint = free.preferredAccountIdentity(
+                        alias: services.settings.accountRotationProfileAliases[free.directoryName]
+                    )
+                    used.insert(free.directoryName)
+                }
+            }
         }
     }
 }
