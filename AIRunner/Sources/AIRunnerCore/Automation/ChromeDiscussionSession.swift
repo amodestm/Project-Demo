@@ -226,8 +226,48 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
     }
 
     public func send(prompt: String) async throws -> String {
+        try await send(prompt: prompt, attachments: [])
+    }
+
+    public func send(
+        prompt: String,
+        attachments: [DiscussionAttachment]
+    ) async throws -> String {
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AppError.invalidRequest("讨论提示词为空，已停止发送。")
+        }
+        guard attachments.count <= ChatGPTAttachmentPolicy.maxFilesPerMessage else {
+            throw AppError.invalidRequest(
+                "单条 ChatGPT 网页消息最多添加 \(ChatGPTAttachmentPolicy.maxFilesPerMessage) 个文件。"
+            )
+        }
+        for attachment in attachments {
+            guard FileManager.default.fileExists(atPath: attachment.path) else {
+                throw AppError.invalidRequest("附件已不存在：\(attachment.fileName)")
+            }
+            guard let currentKind = ChatGPTAttachmentPolicy.kind(for: attachment.url),
+                  currentKind == attachment.kind else {
+                throw AppError.invalidRequest("附件格式已改变：\(attachment.fileName)")
+            }
+            let currentSize: Int64
+            do {
+                let values = try attachment.url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+                guard values.isRegularFile == true else {
+                    throw AppError.invalidRequest("附件已不再是普通文件：\(attachment.fileName)")
+                }
+                currentSize = Int64(values.fileSize ?? 0)
+            } catch let error as AppError {
+                throw error
+            } catch {
+                throw AppError.invalidRequest("无法读取附件大小：\(attachment.fileName)")
+            }
+            if let error = ChatGPTAttachmentPolicy.validationError(
+                for: attachment.url,
+                byteSize: currentSize,
+                kind: attachment.kind
+            ) {
+                throw AppError.invalidRequest(error)
+            }
         }
         try raise()
         try checkSessionHealth()
@@ -246,7 +286,7 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
             in: window, configuration: configuration, pid: application.processIdentifier
         )
 
-        let composer = try await waitForComposer()
+        var composer = try await waitForComposer()
         if let existing = AX.textValue(composer, kAXValueAttribute),
            !AX.isComposerEmptyOrPlaceholder(existing) {
             await CodexLoginAutomator.clearField(composer, pid: application.processIdentifier)
@@ -256,6 +296,12 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
         let baselineCopyCount = AX.copyButtons(
             in: window, configuration: configuration
         ).count
+        if !attachments.isEmpty {
+            try await uploadAttachments(attachments)
+            // 每次选择文件后 ChatGPT 可能重建 Composer；使用最新 AX 节点
+            // 输入提示词，避免把文本写入已经脱离页面的旧节点。
+            composer = try await waitForComposer()
+        }
         try await insert(prompt, into: composer)
         try await executeSend(composer: composer)
         return try await waitForResponse(
@@ -273,6 +319,201 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
             }
             try await Task.sleep(for: .milliseconds(800))
         }
+    }
+
+    /// 通过 ChatGPT Composer 的附件按钮逐个打开原生文件选择器。
+    ///
+    /// 网页文件输入不会把本地路径暴露给 AX 树；点击附件按钮后由 Chrome
+    /// 创建原生文件面板，因此这里使用 AX 设置文件名字段并点击“打开”。
+    /// 每个文件都等待面板关闭和文件名出现在页面后才继续，无法确认时 fail closed。
+    private func uploadAttachments(_ attachments: [DiscussionAttachment]) async throws {
+        for attachment in attachments {
+            // ChatGPT 的附件入口是一个两级菜单：先点“添加文件等”，
+            // 再点菜单里的“添加文件”。每次上传后网页都会重建 Composer，
+            // 因此不能复用上一轮缓存的 AX 元素。
+            guard let composer = AX.findComposer(in: window, configuration: configuration) else {
+                throw AppError.invalidRequest("没有找到 ChatGPT 消息输入框，文件未上传。")
+            }
+            try await openAttachmentPicker(near: composer, fileName: attachment.fileName)
+            try await chooseFileInNativePanel(attachment.url)
+            try await waitForUploadedAttachment(named: attachment.fileName, near: composer)
+        }
+    }
+
+    /// 打开 ChatGPT 文件选择器，并处理“添加文件等 → 添加文件”两级入口。
+    ///
+    /// Chromium 的 AXPress 在网页控件上可能返回 success 但没有派发 DOM 事件。
+    /// 先走语义动作；如果菜单/选择器没有出现，再激活对应 Chrome 窗口并对实时
+    /// AXFrame 做一次真实点击。这样不会因为一次假成功就把附件静默丢掉。
+    private func openAttachmentPicker(
+        near composer: AXUIElement,
+        fileName: String
+    ) async throws {
+        guard let button = AX.findAttachmentButton(
+            in: window, near: composer, configuration: configuration
+        ) else {
+            throw AppError.invalidRequest("没有找到 ChatGPT 网页的“添加文件等”按钮，文件未上传：\(fileName)")
+        }
+
+        _ = AX.pressOrClick(button)
+
+        // 先给 AXPress/网页菜单动画一个短窗口；如果入口本身直接打开选择器，
+        // 也在这里直接返回。
+        let firstDeadline = Date().addingTimeInterval(2.0)
+        while Date() < firstDeadline {
+            try Task.checkCancellation()
+            if AX.findFileChooser(for: application) != nil { return }
+            if let menuItem = AX.findAttachmentMenuItem(
+                in: window, near: composer, configuration: configuration
+            ) {
+                _ = AX.pressOrClick(menuItem)
+                if await waitForFileChooser(timeout: 2.0) != nil { return }
+
+                // 菜单项也可能发生 AXPress 假成功；只补点这一枚已定位的菜单项。
+                _ = AX.activateOwnerAndClick(menuItem)
+                if await waitForFileChooser(timeout: 3.0) != nil { return }
+                throw AppError.invalidRequest(
+                    "ChatGPT 的“添加文件”菜单项未能打开文件选择器：\(fileName)"
+                )
+            }
+            try await Task.sleep(for: .milliseconds(200))
+        }
+
+        // 首次 AXPress 没有产生任何页面状态变化时，切到 Chrome 前台，对实时
+        // 边框中心补点一次，再重新扫描两级入口。
+        _ = AX.activateOwnerAndClick(button)
+        let secondDeadline = Date().addingTimeInterval(5.0)
+        while Date() < secondDeadline {
+            try Task.checkCancellation()
+            if AX.findFileChooser(for: application) != nil { return }
+            if let menuItem = AX.findAttachmentMenuItem(
+                in: window, near: composer, configuration: configuration
+            ) {
+                _ = AX.activateOwnerAndClick(menuItem)
+                if await waitForFileChooser(timeout: 3.0) != nil { return }
+                throw AppError.invalidRequest(
+                    "ChatGPT 的“添加文件”菜单项未能打开文件选择器：\(fileName)"
+                )
+            }
+            try await Task.sleep(for: .milliseconds(200))
+        }
+
+        throw AppError.invalidRequest(
+            "点击 ChatGPT 的“添加文件等”后没有出现文件选择器：\(fileName)"
+        )
+    }
+
+    private func waitForFileChooser(timeout: TimeInterval) async -> AXUIElement? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let panel = AX.findFileChooser(for: application) { return panel }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        return nil
+    }
+
+    private func chooseFileInNativePanel(_ url: URL) async throws {
+        let deadline = Date().addingTimeInterval(10)
+        var panel: AXUIElement?
+        while Date() < deadline {
+            try Task.checkCancellation()
+            panel = AX.findFileChooser(for: application)
+            if panel != nil { break }
+            try await Task.sleep(for: .milliseconds(200))
+        }
+        guard let panel else {
+            throw AppError.invalidRequest("文件选择器未出现：\(url.lastPathComponent)")
+        }
+
+        // 某些 macOS 版本的 NSOpenPanel 没有直接的“文件名”输入框，
+        // 先尝试标准字段；找不到时用 Cmd+Shift+G 打开“前往文件夹”面板。
+        if let field = AX.findFileNameField(in: panel) {
+            guard AX.setValue(url.path, for: field) else {
+                throw AppError.invalidRequest("无法填写文件路径：\(url.lastPathComponent)")
+            }
+        } else {
+            AX.postCommandShiftG(to: AX.pid(of: panel))
+            let gotoDeadline = Date().addingTimeInterval(3)
+            var gotoField: AXUIElement?
+            while Date() < gotoDeadline {
+                try Task.checkCancellation()
+                if let candidate = AX.findFileNameField(in: panel, allowFallback: true) {
+                    gotoField = candidate
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(150))
+            }
+            guard let gotoField else {
+                throw AppError.invalidRequest("无法打开文件选择器的路径输入面板：\(url.lastPathComponent)")
+            }
+            guard AX.setValue(url.path, for: gotoField) else {
+                throw AppError.invalidRequest("无法填写文件路径：\(url.lastPathComponent)")
+            }
+            AX.postReturn(to: AX.pid(of: gotoField))
+            try await Task.sleep(for: .milliseconds(350))
+        }
+        guard let openButton = AX.findDialogButton(
+            in: panel,
+            hints: ["open", "choose", "select", "打开", "选择", "插入"]
+        ), AX.pressOrClick(openButton) else {
+            throw AppError.invalidRequest("无法确认文件选择：\(url.lastPathComponent)")
+        }
+
+        let closeDeadline = Date().addingTimeInterval(10)
+        let physicalFallbackDeadline = Date().addingTimeInterval(1.5)
+        var physicalFallbackUsed = false
+        while Date() < closeDeadline {
+            try Task.checkCancellation()
+            if AX.findFileChooser(for: application) == nil { return }
+            if !physicalFallbackUsed, Date() >= physicalFallbackDeadline {
+                // AXPress 可能报告成功但没有关闭原生面板；只补一次由面板拥有者
+                // 激活后的实时坐标点击，避免重复确认/重复上传。
+                physicalFallbackUsed = true
+                _ = AX.activateOwnerAndClick(openButton)
+            }
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        throw AppError.invalidRequest("文件选择器未关闭，未确认上传：\(url.lastPathComponent)")
+    }
+
+    private func waitForUploadedAttachment(
+        named fileName: String,
+        near composer: AXUIElement
+    ) async throws {
+        let deadline = Date().addingTimeInterval(30)
+        let normalizedName = AX.normalized(fileName)
+        var visibleCount = 0
+        while Date() < deadline {
+            try Task.checkCancellation()
+            // 只在当前 Composer 附近确认文件名，避免历史消息中同名文件造成假确认。
+            // ChatGPT may rebuild the Composer after the native panel closes;
+            // reacquire it before each sample so the confirmation follows the
+            // live DOM node instead of a stale AX reference.
+            let currentComposer = AX.findComposer(
+                in: window, configuration: configuration
+            ) ?? composer
+            let texts = AX.attachmentTexts(
+                near: currentComposer, configuration: configuration
+            )
+            let errors = texts.filter { text in
+                let lower = text.lowercased()
+                return lower.contains("upload failed") || lower.contains("上传失败")
+                    || lower.contains("too large") || lower.contains("文件过大")
+            }
+            if !errors.isEmpty {
+                throw AppError.invalidRequest("ChatGPT 未能上传附件：\(fileName)")
+            }
+            if texts.contains(where: { AX.normalized($0).contains(normalizedName) }) {
+                visibleCount += 1
+                // 文件芯片可能先出现、后继续上传；连续两次看到文件名且没有
+                // 错误提示，才允许进入提示词输入和发送。
+                if visibleCount >= 2 { return }
+            } else {
+                visibleCount = 0
+            }
+            try await Task.sleep(for: .milliseconds(400))
+        }
+        throw AppError.invalidRequest("30 秒内没有确认附件已上传：\(fileName)")
     }
 
     // MARK: - 页面操作
@@ -575,6 +816,210 @@ enum AX {
             return composerFrame.insetBy(dx: -500, dy: -220).intersects(buttonFrame)
         }
         return candidates.max { sendScore($0, composer: composerFrame) < sendScore($1, composer: composerFrame) }
+    }
+
+    static func findAttachmentButton(
+        in root: AXUIElement,
+        near composer: AXUIElement,
+        configuration: ChromeDiscussionSessionConfiguration
+    ) -> AXUIElement? {
+        let composerFrame = frame(composer)
+        let candidates = collect(in: root, configuration: configuration) { element in
+            let role = string(element, kAXRoleAttribute) ?? ""
+            guard ["AXButton", "AXPopUpButton", "AXMenuButton"].contains(role),
+                  bool(element, kAXEnabledAttribute) != false else { return false }
+            let text = searchableText(element)
+            let plusButton = text.contains("composer-plus") || text.contains("composer-plus-button")
+                || text.contains("attach-button") || text.contains("composer-attach")
+                || text.contains("add-files")
+            guard plusButton || attachmentButtonTextMatches(text) else {
+                return false
+            }
+            guard let composerFrame, let buttonFrame = frame(element) else { return true }
+            return composerFrame.insetBy(dx: -500, dy: -220).intersects(buttonFrame)
+        }
+        return candidates.max { sendScore($0, composer: composerFrame) < sendScore($1, composer: composerFrame) }
+    }
+
+    /// ChatGPT currently exposes the first attachment control as “添加文件等”.
+    /// The second-level menu item is a separate AX control, so it must be located
+    /// independently after the first click.  Keep the matcher text-only and
+    /// deterministic so it can be covered by unit tests without a live browser.
+    static func attachmentButtonTextMatches(_ text: String) -> Bool {
+        let normalizedText = normalized(text)
+        let hints = [
+            "attach files", "attach a file", "attach file", "add files",
+            "add photos & files", "add photos and files", "photos & files",
+            "upload files", "file upload", "添加文件等", "添加照片和文件",
+            "上传文件", "上传附件", "附件", "附加文件", "照片和文件", "图片和文件"
+        ]
+        return hints.contains { normalizedText.contains(normalized($0)) }
+    }
+
+    static func attachmentMenuItemTextMatches(_ text: String) -> Bool {
+        let normalizedText = normalized(text)
+        let hints = [
+            "attach files", "attach a file", "attach file", "add files",
+            "upload files", "file upload", "添加文件", "上传文件", "上传附件",
+            "附加文件", "选择文件"
+        ]
+        guard hints.contains(where: { normalizedText.contains(normalized($0)) }) else {
+            return false
+        }
+        // Do not mistake the sibling photo action for the document/file action.
+        return !normalizedText.contains("添加照片")
+            && !normalizedText.contains("photo")
+            && !normalizedText.contains("image")
+    }
+
+    static func findAttachmentMenuItem(
+        in root: AXUIElement,
+        near composer: AXUIElement,
+        configuration: ChromeDiscussionSessionConfiguration
+    ) -> AXUIElement? {
+        let composerFrame = frame(composer)
+        let candidates = collect(in: root, configuration: configuration) { element in
+            let role = string(element, kAXRoleAttribute) ?? ""
+            guard ["AXButton", "AXMenuItem", "AXMenuButton"].contains(role),
+                  bool(element, kAXEnabledAttribute) != false else { return false }
+            guard attachmentMenuItemTextMatches(searchableText(element)) else { return false }
+            guard let composerFrame, let itemFrame = frame(element) else { return true }
+            // The menu is rendered next to the composer.  This excludes similarly
+            // named controls in the page header or an old conversation message.
+            return composerFrame.insetBy(dx: -700, dy: -500).intersects(itemFrame)
+        }
+        return candidates.last
+    }
+
+    static func findFileChooser(in application: NSRunningApplication) -> AXUIElement? {
+        let root = AXUIElementCreateApplication(application.processIdentifier)
+        let candidates = collect(in: root, configuration: .default) { element in
+            let role = string(element, kAXRoleAttribute) ?? ""
+            let text = searchableText(element)
+            if role == "AXSheet" || role == "AXDialog" {
+                return text.contains("open") || text.contains("choose") || text.contains("select")
+                    || text.contains("打开") || text.contains("选择")
+                    || findDialogButton(
+                        in: element,
+                        hints: ["open", "choose", "select", "打开", "选择"]
+                    ) != nil
+            }
+            // 新版 macOS 有时把原生面板暴露为标题为“Open/打开”的 AXWindow。
+            guard role == "AXWindow" else { return false }
+            return text == "open" || text == "choose" || text == "select"
+                || text.contains("打开") || text.contains("选择文件")
+        }
+        return candidates.last
+    }
+
+    /// NSOpenPanel may belong to OpenAndSavePanelService rather than Chrome's
+    /// accessibility tree.  Search Chrome first, then the short-lived panel
+    /// helper processes used by AppKit.
+    static func findFileChooser(for browserApplication: NSRunningApplication) -> AXUIElement? {
+        if let panel = findFileChooser(in: browserApplication) { return panel }
+        let helperApplications = NSWorkspace.shared.runningApplications.filter { app in
+            let identifier = (app.bundleIdentifier ?? "").lowercased()
+            return identifier.contains("openandsavepanelservice")
+                || identifier.contains("openandsavepanel")
+        }
+        for helper in helperApplications {
+            if let panel = findFileChooser(in: helper) { return panel }
+        }
+        return nil
+    }
+
+    static func activateOwnerAndClick(_ element: AXUIElement) -> Bool {
+        let ownerPID = pid(of: element)
+        if ownerPID > 0, let owner = NSRunningApplication(processIdentifier: ownerPID) {
+            _ = owner.activate(options: [.activateAllWindows])
+            Thread.sleep(forTimeInterval: 0.08)
+        }
+        return CodexLoginAutomator.clickCenter(element)
+    }
+
+    /// Return text in the current composer subtree only.  A whole-window scan
+    /// can falsely match a same-named file in an older message or the sidebar.
+    static func attachmentTexts(
+        near composer: AXUIElement,
+        configuration: ChromeDiscussionSessionConfiguration
+    ) -> [String] {
+        var scope = composer
+        for _ in 0..<8 {
+            guard let parent = parent(of: scope) else { break }
+            let parentRole = string(parent, kAXRoleAttribute) ?? ""
+            if parentRole == "AXWebArea" || parentRole == "AXWindow" || parentRole == "AXApplication" {
+                break
+            }
+            scope = parent
+        }
+        return allTexts(in: scope, configuration: configuration)
+    }
+
+    static func findFileNameField(
+        in panel: AXUIElement,
+        allowFallback: Bool = false
+    ) -> AXUIElement? {
+        let fields = collect(in: panel, configuration: .default) { element in
+            let role = string(element, kAXRoleAttribute) ?? ""
+            guard role == "AXTextField" || role == "AXTextArea" else { return false }
+            let text = searchableText(element)
+            return text.contains("file") || text.contains("name") || text.contains("文件")
+                || text.contains("名称") || text.contains("名字")
+        }
+        if let field = fields.last { return field }
+        guard allowFallback else { return nil }
+        return collect(in: panel, configuration: .default) { element in
+            let role = string(element, kAXRoleAttribute) ?? ""
+            return role == "AXTextField" || role == "AXTextArea"
+        }.last
+    }
+
+    static func findDialogButton(
+        in panel: AXUIElement,
+        hints: [String]
+    ) -> AXUIElement? {
+        collect(in: panel, configuration: .default) { element in
+            guard (string(element, kAXRoleAttribute) ?? "") == "AXButton",
+                  bool(element, kAXEnabledAttribute) != false else { return false }
+            let text = searchableText(element)
+            return hints.contains { text == $0 || text.contains($0) }
+        }.last
+    }
+
+    static func setValue(_ value: String, for element: AXUIElement) -> Bool {
+        if AXUIElementSetAttributeValue(
+            element, kAXValueAttribute as CFString, value as CFTypeRef
+        ) == .success {
+            let actual = textValue(element, kAXValueAttribute) ?? ""
+            if actual.localizedCaseInsensitiveContains(value)
+                || actual.localizedCaseInsensitiveContains(URL(fileURLWithPath: value).lastPathComponent) {
+                return true
+            }
+        }
+        _ = pressOrClick(element)
+        let guarder = PasteboardGuard()
+        defer { guarder.restore() }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard pasteboard.setString(value, forType: .string) else { return false }
+        postPaste(to: AX.pid(of: element))
+        Thread.sleep(forTimeInterval: 0.2)
+        let actual = textValue(element, kAXValueAttribute) ?? ""
+        return actual.localizedCaseInsensitiveContains(value)
+            || actual.localizedCaseInsensitiveContains(URL(fileURLWithPath: value).lastPathComponent)
+    }
+
+    static func pid(of element: AXUIElement) -> pid_t {
+        var pid: pid_t = 0
+        _ = AXUIElementGetPid(element, &pid)
+        return pid
+    }
+
+    private static func parent(of element: AXUIElement) -> AXUIElement? {
+        var raw: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXParentAttribute as CFString, &raw) == .success,
+              let raw else { return nil }
+        return unsafeDowncast(raw, to: AXUIElement.self)
     }
 
     static func hasGeneratingControl(
@@ -916,6 +1361,10 @@ enum AX {
         postKey(0x24, flags: [], to: pid)
     }
 
+    static func postCommandShiftG(to pid: pid_t) {
+        postKey(0x05, flags: .maskCommand.union(.maskShift), to: pid)
+    }
+
     static func postEscape(to pid: pid_t) {
         postKey(0x35, flags: [], to: pid)
     }
@@ -964,6 +1413,7 @@ enum AX {
             string(element, kAXDescriptionAttribute),
             string(element, kAXIdentifierAttribute),
             string(element, kAXPlaceholderValueAttribute),
+            textValue(element, kAXValueAttribute),
         ].compactMap { $0 }.joined(separator: " "))
     }
 

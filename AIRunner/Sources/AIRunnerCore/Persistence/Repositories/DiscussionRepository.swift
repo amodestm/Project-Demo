@@ -22,13 +22,14 @@ public struct DiscussionRepository: Sendable {
     public func save(_ group: DiscussionGroup) throws {
         let participants = try JSONCoding.encodeToString(group.participants)
         let rounds = try JSONCoding.encodeToString(group.rounds)
+        let attachments = try JSONCoding.encodeToString(group.attachments)
 
         try db.execute(
             """
             INSERT INTO discussion_groups
                 (id, name, topic, consensus, moderator_participant_id,
-                 participants_json, rounds_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 participants_json, rounds_json, attachments_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name                     = excluded.name,
                 topic                    = excluded.topic,
@@ -36,6 +37,7 @@ public struct DiscussionRepository: Sendable {
                 moderator_participant_id = excluded.moderator_participant_id,
                 participants_json        = excluded.participants_json,
                 rounds_json              = excluded.rounds_json,
+                attachments_json         = excluded.attachments_json,
                 updated_at               = excluded.updated_at;
             """,
             [
@@ -46,6 +48,7 @@ public struct DiscussionRepository: Sendable {
                 group.moderatorParticipantID.map(SQLValue.text) ?? .null,
                 .text(participants),
                 .text(rounds),
+                .text(attachments),
                 .text(DateCoding.string(from: group.createdAt)),
                 .text(DateCoding.string(from: group.updatedAt)),
             ]
@@ -224,11 +227,14 @@ public struct DiscussionRepository: Sendable {
     private static func decodeGroup(_ row: SQLRow) -> DiscussionGroup {
         let participantsJSON = row.string("participants_json") ?? "[]"
         let roundsJSON = row.string("rounds_json") ?? "[]"
+        let attachmentsJSON = row.string("attachments_json") ?? "[]"
 
         let participants =
             (try? JSONCoding.decode([DiscussionParticipant].self, from: participantsJSON)) ?? []
         var rounds =
             (try? JSONCoding.decode([DiscussionRoundConfig].self, from: roundsJSON)) ?? []
+        let attachments =
+            (try? JSONCoding.decode([DiscussionAttachment].self, from: attachmentsJSON)) ?? []
 
         // 兼容: 老数据没有轮次配置时回落到默认议程
         if rounds.isEmpty { rounds = DiscussionGroup.defaultRounds }
@@ -237,6 +243,7 @@ public struct DiscussionRepository: Sendable {
             id: row.string("id") ?? "",
             name: row.string("name") ?? "",
             topic: row.string("topic") ?? "",
+            attachments: attachments,
             participants: participants,
             rounds: rounds,
             consensus: ConsensusRule(rawValue: row.string("consensus") ?? "")

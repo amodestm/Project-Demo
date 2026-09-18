@@ -162,6 +162,8 @@ public struct DiscussionGroup: Codable, Sendable, Equatable, Identifiable {
     public var name: String
     /// 议题 / 要决策的问题。
     public var topic: String
+    /// 讨论输入附带的本地文件。文件内容不进配置 JSON，运行时由会话上传。
+    public var attachments: [DiscussionAttachment]
     public var participants: [DiscussionParticipant]
     public var rounds: [DiscussionRoundConfig]
     public var consensus: ConsensusRule
@@ -174,6 +176,7 @@ public struct DiscussionGroup: Codable, Sendable, Equatable, Identifiable {
         id: String = UUID().uuidString,
         name: String,
         topic: String = "",
+        attachments: [DiscussionAttachment] = [],
         participants: [DiscussionParticipant] = [],
         rounds: [DiscussionRoundConfig]? = nil,
         consensus: ConsensusRule = .moderatorSummary,
@@ -184,12 +187,51 @@ public struct DiscussionGroup: Codable, Sendable, Equatable, Identifiable {
         self.id = id
         self.name = name
         self.topic = topic
+        self.attachments = attachments
         self.participants = participants
         self.rounds = rounds ?? Self.defaultRounds
         self.consensus = consensus
         self.moderatorParticipantID = moderatorParticipantID
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, topic, attachments, participants, rounds, consensus
+        case moderatorParticipantID, createdAt, updatedAt
+    }
+
+    /// 附件字段是后加的，旧版讨论组没有该 key 时按空数组兼容读取。
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(String.self, forKey: .id)
+        self.name = try container.decode(String.self, forKey: .name)
+        self.topic = try container.decode(String.self, forKey: .topic)
+        self.attachments = try container.decodeIfPresent(
+            [DiscussionAttachment].self, forKey: .attachments
+        ) ?? []
+        self.participants = try container.decode([DiscussionParticipant].self, forKey: .participants)
+        self.rounds = try container.decode([DiscussionRoundConfig].self, forKey: .rounds)
+        self.consensus = try container.decode(ConsensusRule.self, forKey: .consensus)
+        self.moderatorParticipantID = try container.decodeIfPresent(
+            String.self, forKey: .moderatorParticipantID
+        )
+        self.createdAt = try container.decode(Date.self, forKey: .createdAt)
+        self.updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(topic, forKey: .topic)
+        try container.encode(attachments, forKey: .attachments)
+        try container.encode(participants, forKey: .participants)
+        try container.encode(rounds, forKey: .rounds)
+        try container.encode(consensus, forKey: .consensus)
+        try container.encodeIfPresent(moderatorParticipantID, forKey: .moderatorParticipantID)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(updatedAt, forKey: .updatedAt)
     }
 
     /// 默认议程: 独立论述 → 交叉质询 → 主席收敛。

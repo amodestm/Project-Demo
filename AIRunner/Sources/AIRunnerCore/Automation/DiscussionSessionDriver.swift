@@ -29,8 +29,27 @@ public protocol DiscussionSessionDriving: Sendable {
     /// 发送 prompt 并等待完整回复。
     /// - Returns: 读回的完整回复文本。
     func send(prompt: String) async throws -> String
+
+    /// 发送 prompt，并把附件作为同一条 ChatGPT 网页消息的文件附件上传。
+    /// 默认实现保留旧会话实现的兼容性；真实 Chrome 会话必须覆盖此方法，
+    /// 否则会在有附件时明确失败而不是静默丢弃文件。
+    func send(
+        prompt: String,
+        attachments: [DiscussionAttachment]
+    ) async throws -> String
 }
 
+public extension DiscussionSessionDriving {
+    func send(
+        prompt: String,
+        attachments: [DiscussionAttachment]
+    ) async throws -> String {
+        guard attachments.isEmpty else {
+            throw AppError.invalidRequest("当前 ChatGPT 会话不支持真实文件附件上传。")
+        }
+        return try await send(prompt: prompt)
+    }
+}
 /// 按成员提供会话。
 public protocol DiscussionSessionProviding: Sendable {
     func session(for participant: DiscussionParticipant) async throws -> DiscussionSessionDriving
@@ -79,6 +98,19 @@ public struct ScriptedDiscussionSession: DiscussionSessionDriving {
             try? await Task.sleep(for: replyDelay)
         }
         return reply(prompt)
+    }
+
+    public func send(
+        prompt: String,
+        attachments: [DiscussionAttachment]
+    ) async throws -> String {
+        if replyDelay > .zero {
+            try? await Task.sleep(for: replyDelay)
+        }
+        let suffix = attachments.isEmpty
+            ? ""
+            : "（附带 \(attachments.count) 个文件：\(attachments.map(\.fileName).joined(separator: "、"))）"
+        return reply(prompt + suffix)
     }
 }
 
@@ -186,4 +218,3 @@ public final class RoutingDiscussionSessionProvider: DiscussionSessionProviding,
         }
     }
 }
-

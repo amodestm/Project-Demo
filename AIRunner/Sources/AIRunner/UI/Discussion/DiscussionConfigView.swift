@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import AIRunnerCore
 
 /// 讨论组配置 —— 议题、成员、议程、收敛规则。
@@ -17,6 +18,7 @@ struct DiscussionConfigView: View {
     @State private var editingParticipant: DiscussionParticipant?
     @State private var showingRolePicker = false
     @State private var errorMessage: String?
+    @State private var attachmentNotice: String?
 
     @Environment(\.dismiss) private var dismiss
 
@@ -105,8 +107,134 @@ struct DiscussionConfigView: View {
                 Text("写清楚要决策什么。模糊的议题会得到模糊的讨论。")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+
+                attachmentControls
             }
         }
+    }
+
+    private var attachmentControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Button {
+                    chooseAttachmentFolder()
+                } label: {
+                    Label("添加文件夹", systemImage: "folder.badge.plus")
+                }
+                .controlSize(.small)
+
+                Button {
+                    chooseAttachmentFiles()
+                } label: {
+                    Label("添加文件", systemImage: "paperclip")
+                }
+                .controlSize(.small)
+
+                if !draft.attachments.isEmpty {
+                    Text("已选 \(draft.attachments.count)/\(ChatGPTAttachmentPolicy.maxFilesPerMessage) 个")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if draft.attachments.isEmpty {
+                Text("可递归添加文件夹；支持常见文档、表格、演示文稿、文本/代码和图片。单条消息最多 20 个文件。")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(draft.attachments) { attachment in
+                        HStack(spacing: 6) {
+                            Image(systemName: attachment.kind == .image ? "photo" : "doc")
+                                .foregroundStyle(.secondary)
+                            Text(attachment.fileName)
+                                .lineLimit(1)
+                            Text("· \(attachment.sizeDescription)")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                            Spacer(minLength: 4)
+                            Button {
+                                draft.attachments.removeAll { $0.id == attachment.id }
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("移除 \(attachment.fileName)")
+                        }
+                        .font(.caption)
+                    }
+                }
+                .padding(8)
+                .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 7))
+            }
+
+            if let attachmentNotice {
+                Text(attachmentNotice)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    private func chooseAttachmentFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "选择讨论参考文件夹"
+        panel.message = "AIRunner 会递归读取支持的文件，并在发送前逐个上传到 ChatGPT。"
+        panel.prompt = "添加文件夹"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+
+        let result = DiscussionAttachmentScanner.scan(folder: folder)
+        mergeAttachments(result.attachments)
+        var notices: [String] = []
+        if result.truncated {
+            notices.append("文件超过单条消息的 20 个上限，已截取前 20 个支持的文件。")
+        }
+        if !result.skippedFileNames.isEmpty {
+            notices.append("已跳过 \(result.skippedFileNames.count) 个不支持或超限文件。")
+        }
+        if result.attachments.isEmpty {
+            errorMessage = "该文件夹没有找到符合 ChatGPT 网页格式和大小限制的文件。"
+        } else {
+            attachmentNotice = notices.isEmpty ? "已从 \(folder.lastPathComponent) 添加文件。" : notices.joined(separator: " ")
+        }
+    }
+
+    private func chooseAttachmentFiles() {
+        let panel = NSOpenPanel()
+        panel.title = "选择讨论参考文件"
+        panel.prompt = "添加文件"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        guard panel.runModal() == .OK else { return }
+
+        var accepted: [DiscussionAttachment] = []
+        var skipped: [String] = []
+        for url in panel.urls {
+            do {
+                accepted.append(try ChatGPTAttachmentPolicy.attachment(for: url))
+            } catch {
+                skipped.append(url.lastPathComponent)
+            }
+        }
+        mergeAttachments(accepted)
+        attachmentNotice = skipped.isEmpty
+            ? "已添加 \(accepted.count) 个文件。"
+            : "已跳过 \(skipped.count) 个不支持或超限文件：\(skipped.prefix(3).joined(separator: "、"))"
+    }
+
+    private func mergeAttachments(_ newAttachments: [DiscussionAttachment]) {
+        var merged = draft.attachments
+        for attachment in newAttachments where !merged.contains(where: { $0.id == attachment.id }) {
+            guard merged.count < ChatGPTAttachmentPolicy.maxFilesPerMessage else { break }
+            merged.append(attachment)
+        }
+        draft.attachments = merged
     }
 
     // MARK: - 成员

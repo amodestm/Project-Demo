@@ -10,7 +10,7 @@ public enum DatabaseMigrator {
     ///
     /// ★ 每个 migration 只允许把自己推进到**自己的**版本号 ★
     /// 详见 `migrateToV1` 的注释。
-    public static let currentVersion = 11
+    public static let currentVersion = 12
 
     public static func migrate(_ db: Database) throws {
         let existing = try db.scalarInt("PRAGMA user_version;") ?? 0
@@ -64,6 +64,10 @@ public enum DatabaseMigrator {
 
         if existing < 11 {
             try migrateToV11(db)
+        }
+
+        if existing < 12 {
+            try migrateToV12(db)
         }
     }
 
@@ -619,6 +623,23 @@ public enum DatabaseMigrator {
             ON codex_account_quota_snapshots(primary_reset_at);
         """,
     ]
+
+    // MARK: - V12: 讨论组附件
+
+    /// 保存讨论组输入中用户选择的附件清单。文件本身留在原路径，数据库只保存
+    /// 可重新校验的路径和元数据；旧讨论组自动得到空数组。
+    private static func migrateToV12(_ db: Database) throws {
+        try db.transaction {
+            guard try !columnExists(db, table: "discussion_groups", column: "attachments_json") else {
+                try db.execute("PRAGMA user_version = 12;")
+                return
+            }
+            try db.execute(
+                "ALTER TABLE discussion_groups ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]';"
+            )
+            try db.execute("PRAGMA user_version = 12;")
+        }
+    }
 
     /// 判断某列是否已存在 (用于让 ADD COLUMN 可重入)。
     static func columnExists(_ db: Database, table: String, column: String) throws -> Bool {

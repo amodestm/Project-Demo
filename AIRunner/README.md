@@ -83,6 +83,8 @@ macOS 上的 **AI 长任务自动执行器**。把一个跑几小时甚至几天
 
 ### 配置与详细说明
 
+控制类工具要求 AIRunner **正在运行**（查询类不受此限制，app 没跑也能查）。
+
 ```toml
 [mcp_servers.airunner]
 command = "/usr/bin/python3"
@@ -91,6 +93,14 @@ startup_timeout_sec = 20
 ```
 
 只依赖 Python 标准库，不需要装任何第三方包。加完重启 Codex。
+
+不想手抄路径就交给脚本（默认只打印，确认后再写入）：
+
+```bash
+bash Scripts/mcp/install_mcp_config.sh          # 只打印这段配置
+bash Scripts/mcp/install_mcp_config.sh --apply  # 幂等写入 ~/.codex/config.toml
+bash Scripts/mcp/install_mcp_config.sh --remove # 移除这一段
+```
 
 前置条件、逐条用法、切号安全约束与排障表：**[Scripts/mcp/README.md](./Scripts/mcp/README.md)**
 
@@ -175,5 +185,6 @@ Repositories → Database(系统 SQLite3, 原子提交) → KeychainManager · L
 
 - 不读取、导出或注入浏览器 Cookie / session token；切换的是你合法持有的账号，复用 Profile 中已有的网页登录。
 - 凭据只写入 macOS Keychain；任务 / 设置 / 数据库 / 日志只保存非敏感记录 ID，日志经 `SecretRedactor` 强制脱敏。
+- MCP 查询额度用的是**本机 Codex 自己**的 access token，只进 HTTP 请求头：不落日志、不回传给模型、不写进数据库或任何文件。
 - 遇到验证码 / 人机验证 / 2FA 会停止并提示你处理，不尝试绕过。
 - 网络层使用临时会话配置，不落盘缓存、不写 cookie。

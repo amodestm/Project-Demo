@@ -231,7 +231,10 @@ public final class DiscussionOrchestrator: ObservableObject {
 
         let response: String
         do {
-            response = try await session.send(prompt: prompt)
+            response = try await session.send(
+                prompt: prompt,
+                attachments: group.attachments
+            )
             try Task.checkCancellation()
             if cancelled { throw CancellationError() }
         } catch {
@@ -328,6 +331,15 @@ public final class DiscussionOrchestrator: ObservableObject {
 
         parts.append("【议题】\n\(group.topic)")
         parts.append("【你的角色与立场】\n\(speaker.rolePrompt)")
+
+        if !group.attachments.isEmpty {
+            let manifest = group.attachments.map { attachment in
+                "- \(attachment.fileName)（\(attachment.kind.displayName)，\(attachment.sizeDescription)）"
+            }.joined(separator: "\n")
+            parts.append(
+                "【参考附件】\n已随本条消息上传以下文件，请直接基于文件内容分析：\n\(manifest)"
+            )
+        }
 
         if !round.instruction.isEmpty {
             parts.append("【本轮任务】\n\(round.instruction)")
