@@ -15,6 +15,10 @@ final class CodexNativeLogoutConfirmerTests: XCTestCase {
         XCTAssertFalse(CodexNativeLogoutConfirmer.isProfileMenuControl(
             role: "AXButton", text: "请打开个人资料菜单"
         ))
+        XCTAssertTrue(CodexNativeLogoutConfirmer.isProfileMenuControl(
+            role: "AXPopUpButton",
+            texts: ["打开个人资料菜单", "打开个人资料菜单"]
+        ))
     }
 
     func testRecognizesOnlyExactSidebarLogoutControl() {
@@ -30,6 +34,9 @@ final class CodexNativeLogoutConfirmerTests: XCTestCase {
         XCTAssertFalse(CodexNativeLogoutConfirmer.isSidebarLogoutControl(
             role: "AXGroup", text: "退出登录"
         ))
+        XCTAssertTrue(CodexNativeLogoutConfirmer.isSidebarLogoutControl(
+            role: "AXButton", texts: ["退出登录", "退出登录"]
+        ))
     }
 
     func testRecognizesOnlyExactNativeLogoutMenuCommands() {
@@ -44,6 +51,9 @@ final class CodexNativeLogoutConfirmerTests: XCTestCase {
         ))
         XCTAssertFalse(CodexNativeLogoutConfirmer.isLogoutCommand(
             role: "AXButton", text: "注销"
+        ))
+        XCTAssertTrue(CodexNativeLogoutConfirmer.isLogoutCommand(
+            role: "AXMenuItem", texts: ["Log Out", "Log Out"]
         ))
     }
 
@@ -68,6 +78,9 @@ final class CodexNativeLogoutConfirmerTests: XCTestCase {
         XCTAssertFalse(CodexNativeLogoutConfirmer.isLogoutConfirmationButton(
             role: "AXStaticText", text: "退出登录"
         ))
+        XCTAssertTrue(CodexNativeLogoutConfirmer.isLogoutConfirmationButton(
+            role: "AXButton", texts: ["退出登录", "退出登录"]
+        ))
     }
 
     func testRejectsConversationSentenceContainingConfirmationWords() {
@@ -87,6 +100,14 @@ final class CodexNativeLogoutConfirmerTests: XCTestCase {
         XCTAssertTrue(
             CodexBrowserOAuthError.codexLogoutDidNotComplete
                 .localizedDescription.contains("确认框已经消失")
+        )
+        XCTAssertTrue(
+            CodexBrowserOAuthError.codexProfileMenuNotFound
+                .localizedDescription.contains("个人资料菜单")
+        )
+        XCTAssertTrue(
+            CodexBrowserOAuthError.codexSidebarLogoutNotFound
+                .localizedDescription.contains("退出登录/Log Out")
         )
     }
 }

@@ -25,6 +25,8 @@ public enum CodexBrowserOAuthError: Error, LocalizedError, Sendable, Equatable {
     case codexLogoutConfirmationPressFailed
     case codexLogoutConfirmationDidNotDismiss
     case codexLogoutDidNotComplete
+    case codexProfileMenuNotFound
+    case codexSidebarLogoutNotFound
     case codexLogoutCommandNotFound
     case codexLogoutCommandAmbiguous
     case codexLogoutCommandPressFailed
@@ -67,6 +69,10 @@ public enum CodexBrowserOAuthError: Error, LocalizedError, Sendable, Equatable {
             return "已经找到“要退出登录？”确认框，但点击红色“退出登录”后确认框仍然可见。账号尚未退出，也没有开始切换。"
         case .codexLogoutDidNotComplete:
             return "Codex 的退出确认框已经消失，但没有在规定时间内看到登录界面。账号切换没有开始。"
+        case .codexProfileMenuNotFound:
+            return "Codex 已切到前台并等待 20 秒，但没有找到左下角个人资料菜单。账号未切换。"
+        case .codexSidebarLogoutNotFound:
+            return "AIRunner 已打开 Codex 个人资料菜单，但没有找到唯一的“退出登录/Log Out”。账号未切换。"
         case .codexLogoutCommandNotFound:
             return "没有在 Codex 左下角个人资料菜单或兼容菜单中找到唯一的“退出登录/Log Out”。账号未切换。"
         case .codexLogoutCommandAmbiguous:

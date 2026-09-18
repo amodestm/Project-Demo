@@ -25,6 +25,28 @@ public struct CodexNativeLogoutConfirmer: CodexNativeLogoutConfirming {
             throw CodexBrowserOAuthError.codexLogoutCommandNotFound
         }
 
+        // Electron 在后台时可能只暴露一棵尚未展开的 AX 树。先把 Codex 的
+        // 内容窗口提升到前台，再开始查找个人资料按钮；否则首次切换经常在
+        // 8 秒内找不到入口，而同一操作稍后重试又能成功。
+        let activationDeadline = Date().addingTimeInterval(5)
+        repeat {
+            let activationRoot = AXUIElementCreateApplication(codex.processIdentifier)
+            if let contentWindow = CodexNativeLoginStarter.contentSurfaces(
+                in: activationRoot
+            ).first {
+                _ = CodexNativeLoginStarter.focusWindow(
+                    containing: contentWindow,
+                    application: codex
+                )
+            } else {
+                _ = codex.unhide()
+                _ = codex.activate(options: [.activateAllWindows])
+            }
+            if CodexNativeLoginStarter.isFrontmost(codex) { break }
+            try Task.checkCancellation()
+            try? await Task.sleep(for: .milliseconds(250))
+        } while Date() < activationDeadline
+
         // 登录页已经可见时，退出动作是幂等的；继续后续登录即可。
         var root = AXUIElementCreateApplication(codex.processIdentifier)
         let existingLoginControls = CodexNativeLoginStarter.loginControls(in: root)
@@ -43,7 +65,7 @@ public struct CodexNativeLogoutConfirmer: CodexNativeLogoutConfirming {
 
         // 当前 Codex 的主要退出入口在左下角个人资料菜单。先按真实网页 UI 打开
         // 账号菜单并点击“退出登录”；找不到新版入口时才回退 macOS 应用菜单。
-        let commandDeadline = Date().addingTimeInterval(8)
+        let commandDeadline = Date().addingTimeInterval(20)
         var didPressLogoutCommand = hasPendingConfirmation
         var foundProfileMenu = false
         var usedSidebarLogoutCommand = false
@@ -57,11 +79,20 @@ public struct CodexNativeLogoutConfirmer: CodexNativeLogoutConfirming {
             }
             if let profileMenu = profileMenus.first {
                 foundProfileMenu = true
-                _ = codex.activate(options: [.activateAllWindows])
-                guard CodexLoginAutomator.press(profileMenu)
-                        || CodexLoginAutomator.clickCenter(profileMenu) else {
+                guard CodexNativeLoginStarter.focusWindow(
+                    containing: profileMenu,
+                    application: codex
+                ) else {
                     throw CodexBrowserOAuthError.codexLogoutCommandPressFailed
                 }
+                // Codex/Electron 的 AXPress 可能只聚焦 PopUpButton，却返回 success。
+                // 退出是一次显式的前台操作，因此优先对实时 AXFrame 做完整鼠标
+                // 点击，只有 frame 暂不可用时才回退 AXPress。
+                guard CodexLoginAutomator.clickCenter(profileMenu)
+                        || CodexLoginAutomator.press(profileMenu) else {
+                    throw CodexBrowserOAuthError.codexLogoutCommandPressFailed
+                }
+                try? await Task.sleep(for: .milliseconds(500))
                 break
             }
             try? await Task.sleep(for: .milliseconds(250))
@@ -79,8 +110,11 @@ public struct CodexNativeLogoutConfirmer: CodexNativeLogoutConfirming {
                     throw CodexBrowserOAuthError.codexLogoutCommandAmbiguous
                 }
                 if let command = commands.first {
-                    guard CodexLoginAutomator.press(command)
-                            || CodexLoginAutomator.clickCenter(command) else {
+                    guard CodexNativeLoginStarter.focusWindow(
+                        containing: command,
+                        application: codex
+                    ), CodexLoginAutomator.clickCenter(command)
+                        || CodexLoginAutomator.press(command) else {
                         throw CodexBrowserOAuthError.codexLogoutCommandPressFailed
                     }
                     didPressLogoutCommand = true
@@ -114,7 +148,8 @@ public struct CodexNativeLogoutConfirmer: CodexNativeLogoutConfirming {
                 }
                 if let command = commands.first {
                     _ = codex.activate(options: [.activateAllWindows])
-                    guard CodexLoginAutomator.press(command) else {
+                    guard CodexLoginAutomator.clickCenter(command)
+                            || CodexLoginAutomator.press(command) else {
                         throw CodexBrowserOAuthError.codexLogoutCommandPressFailed
                     }
                     didPressLogoutCommand = true
@@ -124,7 +159,10 @@ public struct CodexNativeLogoutConfirmer: CodexNativeLogoutConfirming {
             }
         }
         guard didPressLogoutCommand else {
-            throw CodexBrowserOAuthError.codexLogoutCommandNotFound
+            if foundProfileMenu {
+                throw CodexBrowserOAuthError.codexSidebarLogoutNotFound
+            }
+            throw CodexBrowserOAuthError.codexProfileMenuNotFound
         }
 
         let confirmationSearchDeadline = Date().addingTimeInterval(timeout)
@@ -150,9 +188,11 @@ public struct CodexNativeLogoutConfirmer: CodexNativeLogoutConfirming {
             }
             if let confirmation = confirmations.first {
                 if !didPressConfirmation {
-                    _ = codex.activate(options: [.activateAllWindows])
-                    guard CodexLoginAutomator.press(confirmation)
-                            || CodexLoginAutomator.clickCenter(confirmation) else {
+                    guard CodexNativeLoginStarter.focusWindow(
+                        containing: confirmation,
+                        application: codex
+                    ), CodexLoginAutomator.clickCenter(confirmation)
+                        || CodexLoginAutomator.press(confirmation) else {
                         throw CodexBrowserOAuthError.codexLogoutConfirmationPressFailed
                     }
                     didPressConfirmation = true
@@ -263,11 +303,11 @@ public struct CodexNativeLogoutConfirmer: CodexNativeLogoutConfirming {
                 maxDepth: 40
             ) { element in
                 let role = CodexLoginAutomator.role(of: element)
-                let text = CodexLoginAutomator.matchingText(of: element)
-                if Self.isLogoutConfirmationTitle(text) {
+                let texts = Self.matchingTexts(of: element)
+                if texts.contains(where: Self.isLogoutConfirmationTitle) {
                     hasConfirmationTitle = true
                 }
-                guard Self.isLogoutConfirmationButton(role: role, text: text),
+                guard Self.isLogoutConfirmationButton(role: role, texts: texts),
                       let frame = CodexLoginAutomator.frame(of: element),
                       frame.width > 1, frame.height > 1 else { return }
                 candidates.append((
@@ -308,8 +348,8 @@ public struct CodexNativeLogoutConfirmer: CodexNativeLogoutConfirming {
                 maxDepth: 40
             ) { element in
                 let role = CodexLoginAutomator.role(of: element)
-                let text = CodexLoginAutomator.matchingText(of: element)
-                if Self.isProfileMenuControl(role: role, text: text) {
+                let texts = Self.matchingTexts(of: element)
+                if Self.isProfileMenuControl(role: role, texts: texts) {
                     matches.append(element)
                 }
             }
@@ -332,8 +372,8 @@ public struct CodexNativeLogoutConfirmer: CodexNativeLogoutConfirming {
                 maxDepth: 40
             ) { element in
                 let role = CodexLoginAutomator.role(of: element)
-                let text = CodexLoginAutomator.matchingText(of: element)
-                guard Self.isSidebarLogoutControl(role: role, text: text),
+                let texts = Self.matchingTexts(of: element)
+                guard Self.isSidebarLogoutControl(role: role, texts: texts),
                       let actionable = actionableControl(for: element) else { return }
                 matches.append(actionable)
             }
@@ -354,8 +394,8 @@ public struct CodexNativeLogoutConfirmer: CodexNativeLogoutConfirming {
             maxDepth: 8
         ) { element in
             let role = CodexLoginAutomator.role(of: element)
-            let text = CodexLoginAutomator.matchingText(of: element)
-            if Self.isLogoutCommand(role: role, text: text) {
+            let texts = Self.matchingTexts(of: element)
+            if Self.isLogoutCommand(role: role, texts: texts) {
                 matches.append(element)
             }
         }
@@ -417,6 +457,39 @@ public struct CodexNativeLogoutConfirmer: CodexNativeLogoutConfirming {
     private static func boolAttribute(_ element: AXUIElement, _ attribute: String) -> Bool? {
         guard let raw = CodexLoginAutomator.rawAttribute(element, attribute) else { return nil }
         return (raw as? NSNumber)?.boolValue
+    }
+
+    /// Chromium 经常同时把同一标签写进 AXTitle 和 AXDescription。不能先把
+    /// 字段拼起来再做精确匹配，否则“退出登录 退出登录”会被误判为不相等。
+    /// 保留每个原始字段并去重，匹配仍然只接受完整官方标签。
+    private static func matchingTexts(of element: AXUIElement) -> [String] {
+        var seen: Set<String> = []
+        return [
+            kAXDescriptionAttribute,
+            kAXTitleAttribute,
+            kAXIdentifierAttribute,
+            kAXPlaceholderValueAttribute,
+            kAXValueAttribute,
+        ]
+        .compactMap { CodexLoginAutomator.stringAttribute(element, $0) }
+        .map(Self.normalize)
+        .filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+
+    static func isProfileMenuControl(role: String, texts: [String]) -> Bool {
+        texts.contains { Self.isProfileMenuControl(role: role, text: $0) }
+    }
+
+    static func isSidebarLogoutControl(role: String, texts: [String]) -> Bool {
+        texts.contains { Self.isSidebarLogoutControl(role: role, text: $0) }
+    }
+
+    static func isLogoutCommand(role: String, texts: [String]) -> Bool {
+        texts.contains { Self.isLogoutCommand(role: role, text: $0) }
+    }
+
+    static func isLogoutConfirmationButton(role: String, texts: [String]) -> Bool {
+        texts.contains { Self.isLogoutConfirmationButton(role: role, text: $0) }
     }
 
     private static func normalize(_ text: String) -> String {

@@ -168,7 +168,7 @@ public struct CodexNativeLoginStarter: CodexNativeLoginStarting {
 
     /// 把登录控件所属窗口提升为 Codex 主窗口，避免坐标点击落到刚刚准备好的
     /// Chrome Profile 窗口。只操作从精确登录控件向上找到的 AXWindow。
-    private static func focusWindow(
+    static func focusWindow(
         containing element: AXUIElement,
         application: NSRunningApplication
     ) -> Bool {
@@ -211,7 +211,7 @@ public struct CodexNativeLoginStarter: CodexNativeLoginStarting {
 
     /// 判断 Codex 是否真的位于前台。NSRunningApplication.isActive 在 Electron
     /// 切窗动画期间可能滞后，因此以系统 frontmost 和 AXFrontmost 任一确认为准。
-    private static func isFrontmost(_ application: NSRunningApplication) -> Bool {
+    static func isFrontmost(_ application: NSRunningApplication) -> Bool {
         if application.isActive { return true }
         if NSWorkspace.shared.frontmostApplication?.processIdentifier
             == application.processIdentifier {
