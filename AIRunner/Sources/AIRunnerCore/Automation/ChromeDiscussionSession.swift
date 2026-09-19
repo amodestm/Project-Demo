@@ -434,12 +434,18 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
                 throw AppError.invalidRequest("无法填写文件路径：\(url.lastPathComponent)")
             }
         } else {
+            // OpenAndSavePanelService 的窗口可能仍在后台；向进程投递快捷键前先
+            // 激活它，否则 Command-Shift-G 会被 Chrome 主窗口吞掉。
+            AX.activateProcess(AX.pid(of: panel))
             AX.postCommandShiftG(to: AX.pid(of: panel))
             let gotoDeadline = Date().addingTimeInterval(3)
             var gotoField: AXUIElement?
             while Date() < gotoDeadline {
                 try Task.checkCancellation()
-                if let candidate = AX.findFileNameField(in: panel, allowFallback: true) {
+                // Command-Shift-G 会创建一个新的 AXSheet；原来的 panel AX 节点
+                // 不一定包含它的输入框，因此同时扫描面板服务的最新树。
+                if let candidate = AX.findFilePathField(for: application)
+                    ?? AX.findFileNameField(in: panel, allowFallback: true) {
                     gotoField = candidate
                     break
                 }
@@ -454,8 +460,9 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
             AX.postReturn(to: AX.pid(of: gotoField))
             try await Task.sleep(for: .milliseconds(350))
         }
+        let currentPanel = AX.findFileChooser(for: application) ?? panel
         guard let openButton = AX.findDialogButton(
-            in: panel,
+            in: currentPanel,
             hints: ["open", "choose", "select", "打开", "选择", "插入"]
         ), AX.pressOrClick(openButton) else {
             throw AppError.invalidRequest("无法确认文件选择：\(url.lastPathComponent)")
@@ -958,6 +965,12 @@ enum AX {
         return CodexLoginAutomator.clickCenter(element)
     }
 
+    static func activateProcess(_ pid: pid_t) {
+        guard pid > 0, let owner = NSRunningApplication(processIdentifier: pid) else { return }
+        _ = owner.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        Thread.sleep(forTimeInterval: 0.12)
+    }
+
     /// 当前 ChatGPT 的“从电脑上传”菜单行是 AXGroup，并提供 AXShowMenu
     /// 而不是 AXPress。优先使用语义动作，旧版网页再回退到 AXPress/坐标点击。
     static func showMenuOrPress(_ element: AXUIElement) -> Bool {
@@ -991,7 +1004,7 @@ enum AX {
     ) -> AXUIElement? {
         let fields = collect(in: panel, configuration: .default) { element in
             let role = string(element, kAXRoleAttribute) ?? ""
-            guard role == "AXTextField" || role == "AXTextArea" else { return false }
+            guard ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(role) else { return false }
             let text = searchableText(element)
             return text.contains("file") || text.contains("name") || text.contains("文件")
                 || text.contains("名称") || text.contains("名字")
@@ -1000,8 +1013,41 @@ enum AX {
         guard allowFallback else { return nil }
         return collect(in: panel, configuration: .default) { element in
             let role = string(element, kAXRoleAttribute) ?? ""
-            return role == "AXTextField" || role == "AXTextArea"
+            return ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(role)
         }.last
+    }
+
+    /// Command-Shift-G 打开的路径面板可能是 OpenAndSavePanelService 下的新 AXSheet，
+    /// 不再挂在第一次发现的 NSOpenPanel 节点上。优先扫描带有路径语义的字段，
+    /// 找不到时在面板服务进程中使用唯一的可编辑文本控件作为回退。
+    static func findFilePathField(for browserApplication: NSRunningApplication) -> AXUIElement? {
+        let helpers = NSWorkspace.shared.runningApplications.filter { app in
+            let identifier = (app.bundleIdentifier ?? "").lowercased()
+            return identifier.contains("openandsavepanelservice")
+                || identifier.contains("openandsavepanel")
+        }
+        for helper in helpers {
+            let root = AXUIElementCreateApplication(helper.processIdentifier)
+            let fields = collect(in: root, configuration: .default) { element in
+                let role = string(element, kAXRoleAttribute) ?? ""
+                guard ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(role) else { return false }
+                let text = searchableText(element)
+                return text.contains("go to") || text.contains("folder") || text.contains("path")
+                    || text.contains("前往") || text.contains("文件夹") || text.contains("路径")
+                    || text.contains("名称") || text.contains("name")
+            }
+            if let field = fields.last { return field }
+
+            let fallback = collect(in: root, configuration: .default) { element in
+                let role = string(element, kAXRoleAttribute) ?? ""
+                return ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(role)
+            }
+            if fallback.count == 1 { return fallback[0] }
+        }
+        return findFileNameField(
+            in: AXUIElementCreateApplication(browserApplication.processIdentifier),
+            allowFallback: true
+        )
     }
 
     static func findDialogButton(

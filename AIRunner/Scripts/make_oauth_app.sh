@@ -11,5 +11,5 @@ AIRUNNER_APP_NAME="AIRunner OAuth" \
 AIRUNNER_DISPLAY_NAME="AIRunner OAuth" \
 AIRUNNER_BUNDLE_ID="com.airunner.oauth" \
 AIRUNNER_SHORT_VERSION="1.5.68" \
-AIRUNNER_BUILD_VERSION="115" \
+AIRUNNER_BUILD_VERSION="116" \
     bash "${ROOT}/Scripts/make_app.sh" "${1:-release}"
