@@ -366,10 +366,12 @@ public final class ChromeDiscussionSession: DiscussionSessionDriving, @unchecked
             if let menuItem = AX.findAttachmentMenuItem(
                 in: window, near: composer, configuration: configuration
             ) {
-                _ = AX.pressOrClick(menuItem)
+                _ = AX.showMenuOrPress(menuItem)
                 if await waitForFileChooser(timeout: 2.0) != nil { return }
 
                 // 菜单项也可能发生 AXPress 假成功；只补点这一枚已定位的菜单项。
+                _ = AX.showMenuOrPress(menuItem)
+                if await waitForFileChooser(timeout: 3.0) != nil { return }
                 _ = AX.activateOwnerAndClick(menuItem)
                 if await waitForFileChooser(timeout: 3.0) != nil { return }
                 throw AppError.invalidRequest(
@@ -954,6 +956,15 @@ enum AX {
             Thread.sleep(forTimeInterval: 0.08)
         }
         return CodexLoginAutomator.clickCenter(element)
+    }
+
+    /// 当前 ChatGPT 的“从电脑上传”菜单行是 AXGroup，并提供 AXShowMenu
+    /// 而不是 AXPress。优先使用语义动作，旧版网页再回退到 AXPress/坐标点击。
+    static func showMenuOrPress(_ element: AXUIElement) -> Bool {
+        if AXUIElementPerformAction(element, kAXShowMenuAction as CFString) == .success {
+            return true
+        }
+        return pressOrClick(element)
     }
 
     /// Return text in the current composer subtree only.  A whole-window scan
