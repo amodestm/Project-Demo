@@ -7,6 +7,8 @@ final class DiscussionAttachmentTests: XCTestCase {
         XCTAssertTrue(AX.attachmentButtonTextMatches("添加文件等"))
         XCTAssertTrue(AX.attachmentButtonTextMatches("Add photos & files"))
         XCTAssertTrue(AX.attachmentMenuItemTextMatches("添加文件。登录后使用。"))
+        XCTAssertTrue(AX.attachmentMenuItemTextMatches("添加照片和文件 从电脑上传"))
+        XCTAssertTrue(AX.attachmentMenuItemTextMatches("Upload from computer"))
         XCTAssertTrue(AX.attachmentMenuItemTextMatches("Attach files"))
         XCTAssertFalse(AX.attachmentMenuItemTextMatches("添加照片"))
         XCTAssertFalse(AX.attachmentMenuItemTextMatches("Create image"))

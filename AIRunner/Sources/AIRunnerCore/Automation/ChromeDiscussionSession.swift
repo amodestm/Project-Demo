@@ -860,16 +860,21 @@ enum AX {
         let normalizedText = normalized(text)
         let hints = [
             "attach files", "attach a file", "attach file", "add files",
-            "upload files", "file upload", "添加文件", "上传文件", "上传附件",
-            "附加文件", "选择文件"
+            "upload files", "file upload", "添加文件", "添加照片和文件",
+            "从电脑上传", "upload from computer", "from computer", "上传文件",
+            "上传附件", "附加文件", "选择文件"
         ]
         guard hints.contains(where: { normalizedText.contains(normalized($0)) }) else {
             return false
         }
         // Do not mistake the sibling photo action for the document/file action.
-        return !normalizedText.contains("添加照片")
-            && !normalizedText.contains("photo")
-            && !normalizedText.contains("image")
+        let isCombinedFileAction = normalizedText.contains("添加照片和文件")
+            || normalizedText.contains("add photos & files")
+            || normalizedText.contains("add photos and files")
+        return isCombinedFileAction
+            || (!normalizedText.contains("添加照片")
+                && !normalizedText.contains("photo")
+                && !normalizedText.contains("image"))
     }
 
     static func findAttachmentMenuItem(
@@ -880,15 +885,29 @@ enum AX {
         let composerFrame = frame(composer)
         let candidates = collect(in: root, configuration: configuration) { element in
             let role = string(element, kAXRoleAttribute) ?? ""
-            guard ["AXButton", "AXMenuItem", "AXMenuButton"].contains(role),
+            // New ChatGPT builds expose the menu rows as AXGroup containers
+            // containing separate AXStaticText title/subtitle nodes rather than
+            // as AXMenuItem/AXButton.  Match the row's subtree text as well as
+            // its own attributes so both layouts are supported.
+            guard ["AXButton", "AXMenuItem", "AXMenuButton", "AXGroup", "AXListItem", "AXCell"].contains(role),
                   bool(element, kAXEnabledAttribute) != false else { return false }
-            guard attachmentMenuItemTextMatches(searchableText(element)) else { return false }
+            let subtreeText = ([searchableText(element)] + allTexts(
+                in: element, configuration: configuration
+            )).joined(separator: " ")
+            guard attachmentMenuItemTextMatches(subtreeText) else { return false }
             guard let composerFrame, let itemFrame = frame(element) else { return true }
             // The menu is rendered next to the composer.  This excludes similarly
             // named controls in the page header or an old conversation message.
             return composerFrame.insetBy(dx: -700, dy: -500).intersects(itemFrame)
         }
-        return candidates.last
+        // A parent menu group also contains the matching row text.  Choose the
+        // smallest matching frame so the click lands on the file row itself,
+        // not on the whole popup containing several unrelated actions.
+        return candidates.min { lhs, rhs in
+            let lhsArea = frame(lhs).map { max(1, $0.width * $0.height) } ?? .greatestFiniteMagnitude
+            let rhsArea = frame(rhs).map { max(1, $0.width * $0.height) } ?? .greatestFiniteMagnitude
+            return lhsArea < rhsArea
+        } ?? candidates.last
     }
 
     static func findFileChooser(in application: NSRunningApplication) -> AXUIElement? {
